@@ -1,6 +1,7 @@
+import history
 from World import generate_worldview
 from Character import generate_characters
-
+from history import main
 
 def main():
     print("欢迎来到社会模拟实验设定生成器")
@@ -35,3 +36,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    history.main()

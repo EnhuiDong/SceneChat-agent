@@ -7,14 +7,14 @@ load_dotenv()
 
 
 def generate_worldview(prompt: str) -> str:
-    api_key = os.getenv("api_key")
-    base_url = os.getenv("base_url")
-    model = os.getenv("DASHSCOPE_MODEL", "qwen-turbo")
+    api_key = os.getenv("LLM_API_KEY")
+    base_url = os.getenv("LLM_API_BASE")
+    model = os.getenv("LLM_MODEL")
 
     if not api_key:
-        raise ValueError("Missing DASHSCOPE_API_KEY in .env")
+        raise ValueError("Missing API_KEY in .env")
     if not base_url:
-        raise ValueError("Missing DASHSCOPE_BASE_URL in .env")
+        raise ValueError("Missing BASE_URL in .env")
 
     llm = ChatOpenAI(
         api_key=api_key,
@@ -133,13 +133,8 @@ def generate_worldview(prompt: str) -> str:
 
     result = response.content
 
-    with open("world.md", "w", encoding="utf-8") as f:
+    with open("data/world.md", "w", encoding="utf-8") as f:
         f.write(result)
 
     return result
 
-
-if __name__ == "__main__":
-    test_prompt = "我想做一个关于贫富差距不断扩大、政府依赖AI治理、普通人社会流动性极低的未来都市社会实验。"
-    result = generate_worldview(test_prompt)
-    print(result)
