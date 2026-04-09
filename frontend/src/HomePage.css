@@ -1,0 +1,233 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+.home-page {
+  min-height: 100vh;
+  position: relative;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 24px;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at top left, rgba(255, 245, 220, 0.18), transparent 30%),
+    radial-gradient(circle at bottom right, rgba(255, 230, 180, 0.14), transparent 30%),
+    linear-gradient(180deg, #2f2218 0%, #4c3626 45%, #24180f 100%);
+}
+
+.home-overlay {
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(rgba(255,255,255,0.02), rgba(255,255,255,0.01)),
+    repeating-linear-gradient(
+      90deg,
+      rgba(255,255,255,0.02) 0px,
+      rgba(255,255,255,0.02) 1px,
+      transparent 1px,
+      transparent 28px
+    );
+  pointer-events: none;
+}
+
+.home-card {
+  position: relative;
+  z-index: 1;
+  width: min(720px, 96vw);
+  padding: 36px;
+  border-radius: 28px;
+  background: rgba(255, 248, 235, 0.94);
+  box-shadow:
+    0 30px 80px rgba(0, 0, 0, 0.32),
+    inset 0 0 0 1px rgba(108, 77, 43, 0.14);
+  backdrop-filter: blur(10px);
+}
+
+.home-badge {
+  display: inline-block;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: #f0dfbe;
+  color: #7c5936;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  margin-bottom: 16px;
+}
+
+.home-title {
+  margin: 0 0 10px;
+  font-size: 34px;
+  color: #4e3624;
+}
+
+.home-subtitle {
+  margin: 0 0 26px;
+  font-size: 16px;
+  line-height: 1.8;
+  color: #75593f;
+}
+
+.home-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.home-label {
+  font-size: 14px;
+  font-weight: 700;
+  color: #5d4430;
+}
+
+.home-input,
+.home-textarea {
+  width: 100%;
+  border: 1px solid #d7c2a5;
+  border-radius: 16px;
+  padding: 14px 16px;
+  background: #fffdf8;
+  font-size: 16px;
+  color: #3d2b1f;
+  outline: none;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
+}
+
+.home-input:focus,
+.home-textarea:focus {
+  border-color: #b1814f;
+  box-shadow: 0 0 0 4px rgba(177, 129, 79, 0.12);
+}
+
+.home-textarea {
+  resize: vertical;
+  min-height: 140px;
+}
+
+.home-button {
+  margin-top: 14px;
+  border: none;
+  border-radius: 18px;
+  padding: 16px 18px;
+  background: linear-gradient(135deg, #8a613b, #6d4728);
+  color: white;
+  font-size: 17px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: transform 0.18s ease, opacity 0.18s ease, box-shadow 0.18s ease;
+  box-shadow: 0 14px 30px rgba(100, 67, 37, 0.28);
+}
+
+.home-button:hover:not(:disabled) {
+  transform: translateY(-2px);
+}
+
+.home-button:disabled {
+  opacity: 0.8;
+  cursor: not-allowed;
+}
+
+.home-button-loading {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.mini-spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(255,255,255,0.35);
+  border-top-color: #ffffff;
+  border-radius: 50%;
+  animation: homeSpin 0.8s linear infinite;
+}
+
+@keyframes homeSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 768px) {
+  .home-card {
+    padding: 24px 18px;
+    border-radius: 20px;
+  }
+
+  .home-title {
+    font-size: 26px;
+  }
+
+  .home-subtitle {
+    font-size: 14px;
+  }
+
+  .home-input,
+  .home-textarea,
+  .home-button {
+    font-size: 15px;
+  }
+}
+.home-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(37, 24, 14, 0.42);
+  backdrop-filter: blur(4px);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 1000;
+}
+
+.home-modal {
+  width: min(420px, 90vw);
+  background: rgba(255, 248, 235, 0.96);
+  border-radius: 24px;
+  box-shadow:
+    0 30px 80px rgba(0, 0, 0, 0.32),
+    inset 0 0 0 1px rgba(108, 77, 43, 0.14);
+  padding: 28px 24px 22px;
+  color: #4e3624;
+}
+
+.home-modal-title {
+  font-size: 24px;
+  font-weight: 700;
+  margin-bottom: 10px;
+}
+
+.home-modal-text {
+  font-size: 15px;
+  line-height: 1.8;
+  color: #75593f;
+  word-break: break-word;
+}
+
+.home-modal-actions {
+  margin-top: 22px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.home-modal-btn {
+  border: none;
+  border-radius: 16px;
+  padding: 12px 18px;
+  background: linear-gradient(135deg, #8a613b, #6d4728);
+  color: white;
+  font-size: 15px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: transform 0.18s ease, opacity 0.18s ease;
+  box-shadow: 0 10px 24px rgba(100, 67, 37, 0.22);
+}
+
+.home-modal-btn:hover {
+  transform: translateY(-1px);
+}
