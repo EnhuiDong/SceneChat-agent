@@ -15,20 +15,22 @@ function StoryPage() {
   const sessionId =
     location.state?.sessionId || localStorage.getItem("story_session_id") || "";
 
-  const savedPages = JSON.parse(localStorage.getItem("story_pages") || "null");
+  const savedPages = JSON.parse(localStorage.getItem("story_pages") || "[]");
   const savedIndex = localStorage.getItem("current_page_index");
 
-  const [pages, setPages] = useState(savedPages || []);
+  const [pages, setPages] = useState(savedPages);
   const [currentPageIndex, setCurrentPageIndex] = useState(
-    savedIndex ? Number(savedIndex) : 0
+    savedPages.length === 0 ? 0 : savedIndex ? Number(savedIndex) : 0
   );
   const [displayedMessages, setDisplayedMessages] = useState([]);
   const [isGenerating, setIsGenerating] = useState(false);
   const [isTypingPage, setIsTypingPage] = useState(false);
   const [showQuitModal, setShowQuitModal] = useState(false);
+  const [errorMessage, setErrorMessage] = useState("");
 
   const contentRef = useRef(null);
   const typingTokenRef = useRef(0);
+  const pageDoneRef = useRef(false);
 
   const currentPage = useMemo(() => {
     return pages[currentPageIndex] || { page: 1, isEnd: false, messages: [] };
@@ -43,27 +45,40 @@ function StoryPage() {
   }, [currentPageIndex]);
 
   useEffect(() => {
-    if (!userPrompt || !sessionId || !pages.length) {
+    if (!userPrompt || !sessionId) {
       navigate("/");
       return;
     }
-  }, [userPrompt, sessionId, pages.length, navigate]);
-
-  useEffect(() => {
-    if (!currentPage?.messages) return;
-
-    if (currentPage.hasPlayed) {
-      showFullPageImmediately(currentPage.messages);
-    } else {
-      playTypingForPage(currentPage.messages);
-    }
-  }, [currentPageIndex, currentPage]);
+  }, [userPrompt, sessionId, navigate]);
 
   useEffect(() => {
     if (contentRef.current) {
       contentRef.current.scrollTop = contentRef.current.scrollHeight;
     }
   }, [displayedMessages, isGenerating]);
+
+  useEffect(() => {
+    if (!sessionId || isGenerating) return;
+
+    // 没有任何页面时，自动生成第一页
+    if (pages.length === 0) {
+      handleGenerateStreamPage(0, 1);
+      return;
+    }
+
+    // 已存在页面时，切换到旧页直接显示完整内容
+    if (currentPage?.messages?.length) {
+      showFullPageImmediately(currentPage.messages);
+    }
+  }, [currentPageIndex, pages.length, sessionId]);
+
+  const openErrorModal = (message) => {
+    setErrorMessage(message);
+  };
+
+  const closeErrorModal = () => {
+    setErrorMessage("");
+  };
 
   const clearStoryCache = () => {
     localStorage.removeItem("story_prompt");
@@ -107,6 +122,20 @@ function StoryPage() {
 
   const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+  const randomBreathDelay = () => {
+    return 200 + Math.floor(Math.random() * 201); // 200 ~ 400ms
+  };
+
+  const createTypingPlaceholder = (msg, indexInPage) => {
+    return {
+      ...msg,
+      side: getAlternatingSide(indexInPage),
+      visibleText: "",
+      isTyping: true,
+      isPlaceholder: true,
+    };
+  };
+
   const typeText = async (fullText, speed, onUpdate, token) => {
     let current = "";
     for (let i = 0; i < fullText.length; i++) {
@@ -132,7 +161,7 @@ function StoryPage() {
     const fullMessages = messages.map((msg, idx) => ({
       ...msg,
       side: getAlternatingSide(idx),
-      visibleText: msg.text || "",
+      visibleText: msg.display_text || "",
       isTyping: false,
     }));
 
@@ -140,43 +169,52 @@ function StoryPage() {
     setIsTypingPage(false);
   };
 
-  const playTypingForPage = async (messages) => {
-    const token = Date.now();
-    typingTokenRef.current = token;
+  const appendTypingMessage = async (msg, indexInPage, pageIndex) => {
+      const token = typingTokenRef.current;
+      const side = getAlternatingSide(indexInPage);
+      const text = msg.display_text || "";
 
-    setIsTypingPage(true);
-    setDisplayedMessages([]);
+      // 1. 先显示“正在输入”的占位气泡
+      setDisplayedMessages((prev) => [
+        ...prev,
+        createTypingPlaceholder(msg, indexInPage),
+      ]);
 
-    for (let i = 0; i < messages.length; i++) {
+      // 2. 让占位气泡先存在一下，制造“对方正在输入”的感觉
+      await wait(350);
+
       if (typingTokenRef.current !== token) return;
 
-      const msg = messages[i];
-      const text = msg.text || "";
-      const side = getAlternatingSide(i);
-
-      const draft = {
-        ...msg,
-        side,
-        visibleText: "",
-        isTyping: true,
-      };
-
-      setDisplayedMessages((prev) => [...prev, draft]);
-
-      await wait(500);
+      // 3. 把占位气泡切换成真正消息，但先从空文本开始
+      setDisplayedMessages((prev) =>
+        prev.map((item) =>
+          item.id === msg.id
+            ? {
+                ...item,
+                side,
+                visibleText: "",
+                isTyping: true,
+                isPlaceholder: false,
+              }
+            : item
+        )
+      );
 
       const speed = getRoleSpeed(msg.speaker);
 
+      // 4. 逐字显示
       await typeText(
         text,
         speed,
         (partial) => {
           setDisplayedMessages((prev) =>
-            prev.map((item, idx) =>
-              idx === i
+            prev.map((item) =>
+              item.id === msg.id
                 ? {
                     ...item,
                     visibleText: partial,
+                    isTyping: true,
+                    isPlaceholder: false,
                   }
                 : item
             )
@@ -187,34 +225,147 @@ function StoryPage() {
 
       if (typingTokenRef.current !== token) return;
 
+      // 5. 打完后先保留光标闪一下，不要立刻停
       setDisplayedMessages((prev) =>
-        prev.map((item, idx) =>
-          idx === i
+        prev.map((item) =>
+          item.id === msg.id
             ? {
                 ...item,
                 visibleText: text,
-                isTyping: false,
+                isTyping: true,
+                isPlaceholder: false,
               }
             : item
         )
       );
 
-      await wait(250);
-    }
+      await wait(450);
 
-    if (typingTokenRef.current === token) {
-      setIsTypingPage(false);
+      if (typingTokenRef.current !== token) return;
 
-      setPages((prev) =>
-        prev.map((page, idx) =>
-          idx === currentPageIndex
+      // 6. 光标停止
+      setDisplayedMessages((prev) =>
+        prev.map((item) =>
+          item.id === msg.id
             ? {
-                ...page,
-                hasPlayed: true,
+                ...item,
+                visibleText: text,
+                isTyping: false,
+                isPlaceholder: false,
               }
-            : page
+            : item
         )
       );
+
+      // 7. 新句子之间加呼吸停顿
+      await wait(randomBreathDelay());
+
+      if (typingTokenRef.current !== token) return;
+
+      setPages((prev) =>
+        prev.map((page, idx) => {
+          if (idx !== pageIndex) return page;
+          return pageDoneRef.current ? { ...page, hasPlayed: true } : page;
+        })
+      );
+    };
+
+  const handleGenerateStreamPage = async (targetPageIndex, targetPageNumber) => {
+    if (isGenerating) return;
+
+    setIsGenerating(true);
+    setIsTypingPage(true);
+    pageDoneRef.current = false;
+    typingTokenRef.current = Date.now();
+
+    const emptyPage = {
+      page: targetPageNumber,
+      isEnd: false,
+      hasPlayed: false,
+      messages: [],
+    };
+
+    setPages((prev) => {
+      const updated = [...prev];
+      updated[targetPageIndex] = emptyPage;
+      return updated;
+    });
+
+    setCurrentPageIndex(targetPageIndex);
+    setDisplayedMessages([]);
+
+    try {
+      const response = await fetch("http://127.0.0.1:5000/api/story/next-stream", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          session_id: sessionId,
+          batch_size: 10,
+        }),
+      });
+
+      if (!response.ok || !response.body) {
+        throw new Error(`生成页面失败（${response.status}）`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buffer = "";
+      let messageIndex = 0;
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+
+          const event = JSON.parse(line);
+
+          if (event.type === "message") {
+            const newMsg = event.message;
+
+            setPages((prev) =>
+              prev.map((page, idx) =>
+                idx === targetPageIndex
+                  ? { ...page, messages: [...page.messages, newMsg] }
+                  : page
+              )
+            );
+
+            await appendTypingMessage(newMsg, messageIndex, targetPageIndex);
+            messageIndex += 1;
+          }
+
+          if (event.type === "page_done") {
+            pageDoneRef.current = true;
+
+            setPages((prev) =>
+              prev.map((page, idx) =>
+                idx === targetPageIndex
+                  ? {
+                      ...page,
+                      isEnd: event.isEnd,
+                      hasPlayed: true,
+                    }
+                  : page
+              )
+            );
+          }
+        }
+      }
+    } catch (error) {
+      console.error(error);
+      openErrorModal(error.message || "生成页面失败");
+    } finally {
+      setIsGenerating(false);
+      setIsTypingPage(false);
     }
   };
 
@@ -241,45 +392,7 @@ function StoryPage() {
       return;
     }
 
-    setIsGenerating(true);
-
-    try {
-      const response = await fetch("http://127.0.0.1:5000/api/story/next", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          session_id: sessionId,
-          batch_size: 5,
-        }),
-      });
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        alert(data.error || "生成下一页失败");
-        setIsGenerating(false);
-        return;
-      }
-
-      const messages = data.messages || [];
-
-      const newPage = {
-        page: data.page,
-        isEnd: data.isEnd,
-        hasPlayed: false,
-        messages: messages,
-      };
-
-      setPages((prev) => [...prev, newPage]);
-      setCurrentPageIndex(nextIndex);
-    } catch (error) {
-      console.error(error);
-      alert("生成下一页失败");
-    } finally {
-      setIsGenerating(false);
-    }
+    await handleGenerateStreamPage(nextIndex, currentPage.page + 1);
   };
 
   return (
@@ -300,18 +413,30 @@ function StoryPage() {
 
         <div className="book-content" ref={contentRef}>
           {displayedMessages.map((msg, idx) => (
-            <div key={`${currentPage.page}-${msg.id}-${idx}`} className={`message-row ${msg.side}`}>
+            <div
+              key={`${currentPage.page}-${msg.id}-${idx}`}
+              className={`message-row ${msg.side}`}
+            >
               <div className="message-meta">{msg.speaker}</div>
-              <div className="message-bubble">
-                <span>{msg.visibleText}</span>
-                {msg.isTyping && <span className="typing-caret">|</span>}
-              </div>
+
+              {msg.isPlaceholder ? (
+                <div className="message-bubble typing-placeholder-bubble">
+                  <span className="typing-placeholder-dot" />
+                  <span className="typing-placeholder-dot" />
+                  <span className="typing-placeholder-dot" />
+                </div>
+              ) : (
+                <div className="message-bubble">
+                  <span>{msg.visibleText}</span>
+                  {msg.isTyping && <span className="typing-caret">|</span>}
+                </div>
+              )}
             </div>
           ))}
 
-          {isGenerating && (
+          {isGenerating && displayedMessages.length === 0 && (
             <div className="page-loading-zone">
-              <div className="page-loading-text">正在生成下一页...</div>
+              <div className="page-loading-text">正在生成内容...</div>
               <div className="page-loading-dots">
                 <span />
                 <span />
@@ -332,7 +457,7 @@ function StoryPage() {
 
           <div className="page-indicator">
             {isGenerating
-              ? "正在书写下一页..."
+              ? "正在书写这一页..."
               : isTypingPage
               ? "文字显现中..."
               : currentPage.isEnd
@@ -363,6 +488,20 @@ function StoryPage() {
               </button>
               <button className="quit-modal-btn primary" onClick={confirmQuit}>
                 确定退出
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {errorMessage && (
+        <div className="quit-modal-overlay">
+          <div className="quit-modal">
+            <div className="quit-modal-title">提示</div>
+            <div className="quit-modal-text">{errorMessage}</div>
+            <div className="quit-modal-actions">
+              <button className="quit-modal-btn primary" onClick={closeErrorModal}>
+                我知道了
               </button>
             </div>
           </div>

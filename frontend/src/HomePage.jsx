@@ -40,10 +40,17 @@ function HomePage() {
         }),
       });
 
-      const data = await response.json();
+      const rawText = await response.text();
+      let data = null;
+
+      try {
+        data = rawText ? JSON.parse(rawText) : null;
+      } catch (e) {
+        data = null;
+      }
 
       if (!response.ok) {
-        openErrorModal(data.error || "启动故事失败");
+        openErrorModal(data?.error || "启动故事失败");
         return;
       }
 
@@ -53,17 +60,7 @@ function HomePage() {
       localStorage.setItem("story_scene", finalScene);
       localStorage.setItem("story_batch_size", "10");
       localStorage.setItem("story_session_id", data.session_id);
-      localStorage.setItem(
-        "story_pages",
-        JSON.stringify([
-          {
-            page: data.page,
-            isEnd: data.isEnd,
-            hasPlayed: false,
-            messages: data.messages,
-          },
-        ])
-      );
+      localStorage.setItem("story_pages", JSON.stringify([]));
       localStorage.setItem("current_page_index", "0");
 
       navigate("/story", {

@@ -1,9 +1,9 @@
 import os
 import uuid
-from dataclasses import asdict
-from typing import Dict, List
+import json
+from typing import Dict
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response, stream_with_context
 from flask_cors import CORS
 
 from World import generate_worldview
@@ -13,26 +13,23 @@ from history import get_index, SimulationState, simulate_next_turn, Message
 app = Flask(__name__)
 CORS(app)
 
-# 简单内存 session 存储
-# 以后可以换成 Redis / 数据库
 story_sessions: Dict[str, dict] = {}
 
 DEFAULT_BATCH_SIZE = 10
-MAX_TURNS = 30  # 你可以自己改成更长，或者改成让模型判断结束
+MAX_TURNS = 30
 
 
-def message_to_frontend(msg: Message, current_user_speaker: str = None):
-    """
-    把你的 Message 转成前端想要的格式
-    """
-    print( "id:", msg.turn,"speaker:",msg.speaker,"action:",msg.action,"text:", msg.speech,"turn:", msg.turn)
+
+def message_to_frontend(msg: Message):
     return {
         "id": msg.turn,
         "speaker": msg.speaker,
         "action": msg.action,
-        "text": msg.speech,
+        "speech": msg.speech,
+        "display_text": msg.speech,
         "turn": msg.turn,
     }
+
 
 @app.route("/api/story/start", methods=["POST"])
 def start_story():
@@ -50,10 +47,7 @@ def start_story():
         initial_scene = "清晨，星港医疗中心走廊"
 
     try:
-        # 1. 生成世界观
         worldview = generate_worldview(user_prompt)
-
-        # 2. 生成角色设定
         characters = generate_characters(user_prompt, worldview)
 
         os.makedirs("./data", exist_ok=True)
@@ -64,30 +58,11 @@ def start_story():
         with open("./data/character.md", "w", encoding="utf-8") as f:
             f.write(characters)
 
-        # 3. 加载索引
         index = get_index()
         rag_retriever = index.as_retriever(similarity_top_k=3)
 
-        # 4. 初始化故事状态
         state = SimulationState(initial_scene)
 
-        # 5. 先生成第一页（默认 5 轮）
-        batch_size = data.get("batch_size", DEFAULT_BATCH_SIZE)
-        try:
-            batch_size = int(batch_size)
-        except Exception:
-            batch_size = DEFAULT_BATCH_SIZE
-
-        page_messages: List[Message] = []
-
-        for _ in range(batch_size):
-            msg = simulate_next_turn(state, rag_retriever)
-            if msg is None:
-                continue
-            state.add_message(msg)
-            page_messages.append(msg)
-
-        # 6. 创建 session
         session_id = str(uuid.uuid4())
         story_sessions[session_id] = {
             "prompt": user_prompt,
@@ -96,29 +71,26 @@ def start_story():
             "characters": characters,
             "state": state,
             "rag_retriever": rag_retriever,
-            "page": 1,
+            "page": 0,         # 注意：现在从 0 开始，还没正式生成第一页
             "ended": False,
         }
 
-        # 7. 如果一开始就没生成出内容，也要返回
-        frontend_messages = [message_to_frontend(m) for m in page_messages]
-
         return jsonify({
             "session_id": session_id,
-            "page": 1,
+            "page": 0,
             "isEnd": False,
             "worldview": worldview,
             "characters": characters,
             "scene": initial_scene,
-            "messages": frontend_messages,
+            "messages": [],
         })
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/story/next", methods=["POST"])
-def next_story_page():
+@app.route("/api/story/next-stream", methods=["POST"])
+def next_story_page_stream():
     data = request.get_json()
     if not data:
         return jsonify({"error": "No JSON body provided"}), 400
@@ -137,45 +109,58 @@ def next_story_page():
             "page": session["page"],
             "isEnd": True,
             "messages": [],
-        })
+        }), 200
 
+    batch_size = data.get("batch_size", DEFAULT_BATCH_SIZE)
     try:
-        batch_size = data.get("batch_size", DEFAULT_BATCH_SIZE)
-        try:
-            batch_size = int(batch_size)
-        except Exception:
-            batch_size = DEFAULT_BATCH_SIZE
+        batch_size = int(batch_size)
+    except Exception:
+        batch_size = DEFAULT_BATCH_SIZE
 
-        state: SimulationState = session["state"]
-        rag_retriever = session["rag_retriever"]
+    state: SimulationState = session["state"]
+    rag_retriever = session["rag_retriever"]
+    next_page_number = session["page"] + 1
 
-        page_messages: List[Message] = []
+    def generate():
+        sent_count = 0
+
+        yield json.dumps({
+            "type": "page_start",
+            "page": next_page_number,
+            "session_id": session_id,
+        }, ensure_ascii=False) + "\n"
 
         for _ in range(batch_size):
             msg = simulate_next_turn(state, rag_retriever)
             if msg is None:
                 continue
+
             state.add_message(msg)
-            page_messages.append(msg)
+            sent_count += 1
 
-        session["page"] += 1
+            yield json.dumps({
+                "type": "message",
+                "page": next_page_number,
+                "message": message_to_frontend(msg),
+            }, ensure_ascii=False) + "\n"
 
-        # 暂时先用“轮数达到上限”判断故事结束
-        # 以后你可以改成模型返回 END
+        session["page"] = next_page_number
+
         is_end = state.turn_count >= MAX_TURNS
         session["ended"] = is_end
 
-        frontend_messages = [message_to_frontend(m) for m in page_messages]
-
-        return jsonify({
+        yield json.dumps({
+            "type": "page_done",
+            "page": next_page_number,
             "session_id": session_id,
-            "page": session["page"],
             "isEnd": is_end,
-            "messages": frontend_messages,
-        })
+            "count": sent_count,
+        }, ensure_ascii=False) + "\n"
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    return Response(
+        stream_with_context(generate()),
+        mimetype="application/x-ndjson"
+    )
 
 
 @app.route("/api/story/session/<session_id>", methods=["GET"])
