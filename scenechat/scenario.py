@@ -701,6 +701,63 @@ class ScenarioValidationError(ValueError):
         super().__init__("；".join(self.issues))
 
 
+def _phase_reference_key(value: str) -> str:
+    text = _text(value).lower()
+    text = re.sub(
+        r"^(?:第?[一二三四五六七八九十百\d]+(?:轮|阶段|幕|回合)?|phase\s*\d+|round\s*\d+)\s*[:：.、\-—_]*",
+        "",
+        text,
+    )
+    return re.sub(r"[\s:：.、,，;；\-—_（）()\[\]]+", "", text)
+
+
+def normalize_scenario_phase_references(package: ScenarioPackage) -> None:
+    """Resolve harmless display-name drift to the exact canonical phase names.
+
+    Models sometimes emit ``第一阶段：公开报价`` in one structure and
+    ``公开报价`` in another. The mapping only applies when one canonical phase
+    is an unambiguous normalized match; genuinely unknown references remain for
+    validation to reject.
+    """
+
+    phases = list(package.world.phases)
+    if not phases:
+        return
+    keyed = {phase: _phase_reference_key(phase) for phase in phases}
+
+    def resolve(value: str) -> str:
+        if value in keyed:
+            return value
+        key = _phase_reference_key(value)
+        if not key:
+            return value
+        candidates = [
+            phase
+            for phase, phase_key in keyed.items()
+            if key == phase_key
+            or (len(key) >= 3 and key in phase_key)
+            or (len(phase_key) >= 3 and phase_key in key)
+        ]
+        return candidates[0] if len(candidates) == 1 else value
+
+    for phase_spec in package.world.phase_specs:
+        phase_spec.name = resolve(phase_spec.name)
+        phase_spec.next_phase = resolve(phase_spec.next_phase)
+    for rule in package.world.rules:
+        rule.phases = [resolve(phase) for phase in rule.phases]
+
+    def normalize_termination(rule: TerminationRule) -> None:
+        rule.phases = [resolve(phase) for phase in rule.phases]
+        for child in rule.conditions:
+            normalize_termination(child)
+
+    for termination_rule in package.world.termination_rules:
+        normalize_termination(termination_rule)
+    for character in package.characters:
+        for ability in character.abilities:
+            ability.phases = [resolve(phase) for phase in ability.phases]
+
+
 def validate_scenario_package(package: ScenarioPackage) -> list[str]:
     issues: list[str] = []
     if not package.world.opening_scene:
@@ -834,6 +891,16 @@ def validate_scenario_package(package: ScenarioPackage) -> list[str]:
         for phase in package.world.phase_specs:
             if not phase.allowed_action_types and not phase.event_only:
                 issues.append(f"规则型阶段“{phase.name}”缺少 allowed_action_types")
+            if (
+                not phase.event_only
+                and phase.allowed_action_types
+                and not set(phase.allowed_action_types).intersection(
+                    {"pass", "observe", "speak", "act"}
+                )
+            ):
+                issues.append(
+                    f"规则型阶段“{phase.name}”缺少安全兜底行动 pass/observe/speak/act"
+                )
             if phase.next_phase and phase.next_phase not in package.world.phases:
                 issues.append(f"阶段“{phase.name}”引用未知 next_phase")
         compound_text = " ".join(package.world.termination_conditions)

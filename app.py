@@ -2,13 +2,20 @@ import uuid
 import json
 import threading
 import time
+from dataclasses import asdict
 from typing import Dict
 
 from flask import Flask, jsonify, request, Response, stream_with_context
 from flask_cors import CORS
 
 from scenechat.errors import SceneChatError, stage_error
-from scenechat.generation import generate_scenario_package
+from scenechat.generation import (
+    generate_character_specs,
+    generate_scenario_package,
+    generate_scenario_brief,
+    generate_world_spec,
+    repair_scenario_package,
+)
 from scenechat.knowledge import build_experiment_knowledge_base, requires_vector_index
 from scenechat.models import Message, SimulationState
 from scenechat.preflight import (
@@ -16,7 +23,13 @@ from scenechat.preflight import (
     validate_generation_model_availability,
 )
 from scenechat.providers import get_simulation_llm
-from scenechat.scenario import agents_from_character_specs
+from scenechat.scenario import (
+    ScenarioPackage,
+    ScenarioValidationError,
+    agents_from_character_specs,
+    normalize_scenario_phase_references,
+    validate_scenario_package,
+)
 from scenechat.simulation import simulate_next_event
 from scenechat.storage import save_experiment_documents
 
@@ -74,6 +87,259 @@ def run_stage(session_id: str, stage: str, label: str, operation):
         int((time.perf_counter() - started_at) * 1000),
     )
     return result
+
+
+BUILD_STAGE_LABELS = {
+    "generation_preflight": "检查生成模型",
+    "brief": "理解用户设定",
+    "world": "构建世界与规则",
+    "characters": "生成角色档案",
+    "validation": "校验一致性",
+    "embedding_preflight": "检查向量模型",
+    "runtime": "准备模拟环境",
+    "storage": "保存实验档案",
+}
+
+
+def build_progress_event(stage: str, status: str, **details):
+    return {
+        "type": "build_progress",
+        "stage": stage,
+        "label": BUILD_STAGE_LABELS[stage],
+        "status": status,
+        **details,
+    }
+
+
+def public_scenario_payload(package: ScenarioPackage, state: SimulationState):
+    public_constraints = [
+        asdict(item)
+        for item in package.brief.constraints
+        if item.visibility == "public"
+    ]
+    protected_count = len(package.brief.constraints) - len(public_constraints)
+    locked_constraints = [
+        item for item in package.brief.constraints if item.locked and item.content
+    ]
+    covered_ids = set(package.world.covered_constraint_ids)
+    for fact in package.world.facts:
+        covered_ids.update(fact.covered_constraint_ids)
+    for character in package.characters:
+        covered_ids.update(character.covered_constraint_ids)
+
+    return {
+        "title": package.world.title,
+        "brief": {
+            **package.brief.public_dict(),
+            "assumptions": list(package.brief.assumptions),
+            "contradictions": list(package.brief.contradictions),
+        },
+        "constraint_summary": {
+            "total": len(package.brief.constraints),
+            "public": len(public_constraints),
+            "protected": protected_count,
+            "locked": len(locked_constraints),
+            "covered": sum(1 for item in locked_constraints if item.id in covered_ids),
+        },
+        "public_rules": package.world.public_rules,
+        "phases": package.world.phases,
+        "locations": package.world.locations,
+        "scheduler": package.world.scheduler,
+        "initial_state": state.public_world_state(),
+        "termination_conditions": package.world.termination_conditions,
+        "warnings": package.warnings,
+        "characters": [
+            {
+                "id": character.id,
+                "name": character.name,
+                "public_identity": character.public_identity,
+                "public_traits": character.public_traits,
+                "public_background": character.public_background,
+                "initial_location": character.initial_location,
+                "has_private_context": bool(
+                    character.private_identity.strip()
+                    or character.goals
+                    or character.knowledge
+                    or character.abilities
+                ),
+            }
+            for character in package.characters
+        ],
+    }
+
+
+def story_ready_payload(
+    session_id: str,
+    package: ScenarioPackage,
+    state: SimulationState,
+    scene: str,
+):
+    return {
+        "session_id": session_id,
+        "page": 0,
+        "isEnd": False,
+        "worldview": package.public_worldview_markdown,
+        "characters": package.public_characters_markdown,
+        "scene": scene,
+        "scenario": public_scenario_payload(package, state),
+        "messages": [],
+    }
+
+
+def build_story_events(user_prompt: str, scene_override: str, session_id: str):
+    yield build_progress_event("generation_preflight", "started")
+    run_stage(
+        session_id,
+        "preflight",
+        BUILD_STAGE_LABELS["generation_preflight"],
+        validate_generation_model_availability,
+    )
+    yield build_progress_event("generation_preflight", "completed")
+
+    yield build_progress_event("brief", "started")
+    brief = run_stage(
+        session_id,
+        "scenario_generation",
+        BUILD_STAGE_LABELS["brief"],
+        lambda: generate_scenario_brief(user_prompt, scene_override),
+    )
+    yield build_progress_event(
+        "brief",
+        "completed",
+        input_mode=brief.input_mode,
+        constraint_count=len(brief.constraints),
+    )
+
+    yield build_progress_event("world", "started")
+    world = run_stage(
+        session_id,
+        "scenario_generation",
+        BUILD_STAGE_LABELS["world"],
+        lambda: generate_world_spec(user_prompt, brief),
+    )
+    yield build_progress_event("world", "completed", title=world.title)
+
+    yield build_progress_event("characters", "started")
+    characters = run_stage(
+        session_id,
+        "scenario_generation",
+        BUILD_STAGE_LABELS["characters"],
+        lambda: generate_character_specs(user_prompt, brief, world),
+    )
+    yield build_progress_event(
+        "characters", "completed", character_count=len(characters)
+    )
+
+    yield build_progress_event("validation", "started")
+    package = ScenarioPackage(brief=brief, world=world, characters=characters)
+    normalize_scenario_phase_references(package)
+    issues = validate_scenario_package(package)
+    repaired = False
+    if issues:
+        repaired = True
+        package = run_stage(
+            session_id,
+            "scenario_generation",
+            "结构化场景局部修复",
+            lambda: repair_scenario_package(user_prompt, package, issues),
+        )
+        normalize_scenario_phase_references(package)
+        issues = validate_scenario_package(package)
+    if issues:
+        raise stage_error("scenario_generation", ScenarioValidationError(issues))
+    yield build_progress_event(
+        "validation",
+        "completed",
+        repaired=repaired,
+        warning_count=len(package.warnings),
+    )
+
+    public_worldview = package.public_worldview_markdown
+    characters_markdown = package.characters_markdown
+    public_characters = package.public_characters_markdown
+    initial_scene = scene_override or package.world.opening_scene
+
+    needs_vector_index = requires_vector_index(
+        public_worldview,
+        characters_markdown,
+        package.world.director_notes_markdown,
+        package.world.facts,
+    )
+    yield build_progress_event(
+        "embedding_preflight",
+        "started" if needs_vector_index else "skipped",
+        reason="长背景需要语义索引" if needs_vector_index else "当前设定可直接注入",
+    )
+    if needs_vector_index:
+        run_stage(
+            session_id,
+            "preflight",
+            BUILD_STAGE_LABELS["embedding_preflight"],
+            validate_embedding_model_availability,
+        )
+        yield build_progress_event("embedding_preflight", "completed")
+
+    yield build_progress_event("runtime", "started")
+    agents = run_stage(
+        session_id,
+        "character_parsing",
+        "角色状态准备",
+        lambda: agents_from_character_specs(package.characters),
+    )
+    state = SimulationState(initial_scene, agents, world_spec=package.world)
+    knowledge_base = run_stage(
+        session_id,
+        "index",
+        "知识库创建",
+        lambda: build_experiment_knowledge_base(
+            public_worldview,
+            characters_markdown,
+            session_id.replace("-", ""),
+            director_notes=package.world.director_notes_markdown,
+            facts=package.world.facts,
+        ),
+    )
+    simulation_llm = run_stage(
+        session_id,
+        "simulation_client",
+        "推演客户端准备",
+        get_simulation_llm,
+    )
+    yield build_progress_event("runtime", "completed")
+
+    yield build_progress_event("storage", "started")
+    run_stage(
+        session_id,
+        "storage",
+        BUILD_STAGE_LABELS["storage"],
+        lambda: save_experiment_documents(
+            session_id,
+            package.worldview_markdown,
+            characters_markdown,
+            scenario_payload=package.to_dict(),
+        ),
+    )
+    story_sessions[session_id] = {
+        "prompt": user_prompt,
+        "scene": initial_scene,
+        "worldview": public_worldview,
+        "characters": public_characters,
+        "public_characters": public_characters,
+        "state": state,
+        "knowledge_base": knowledge_base,
+        "scenario": package,
+        "simulation_llm": simulation_llm,
+        "page": 0,
+        "ended": False,
+        "page_requests": {},
+        "stream_lock": threading.Lock(),
+    }
+    yield build_progress_event("storage", "completed")
+    app.logger.info("story.start status=completed session=%s", session_id)
+    yield {
+        "type": "story_ready",
+        "data": story_ready_payload(session_id, package, state, initial_scene),
+    }
 
 
 
@@ -145,36 +411,34 @@ def start_story():
         run_stage(
             session_id,
             "preflight",
-            "模型预检",
+            BUILD_STAGE_LABELS["generation_preflight"],
             validate_generation_model_availability,
         )
         package = run_stage(
             session_id,
             "scenario_generation",
-            "结构化场景生成与校验",
+            "生成并校验结构化场景",
             lambda: generate_scenario_package(user_prompt, scene_override),
         )
-        worldview = package.worldview_markdown
         public_worldview = package.public_worldview_markdown
-        characters = package.characters_markdown
-        public_characters = package.public_characters_markdown
+        characters_markdown = package.characters_markdown
         initial_scene = scene_override or package.world.opening_scene
         if requires_vector_index(
             public_worldview,
-            characters,
+            characters_markdown,
             package.world.director_notes_markdown,
             package.world.facts,
         ):
             run_stage(
                 session_id,
                 "preflight",
-                "向量模型预检",
+                BUILD_STAGE_LABELS["embedding_preflight"],
                 validate_embedding_model_availability,
             )
         agents = run_stage(
             session_id,
             "character_parsing",
-            "角色解析",
+            "角色状态准备",
             lambda: agents_from_character_specs(package.characters),
         )
         state = SimulationState(initial_scene, agents, world_spec=package.world)
@@ -184,7 +448,7 @@ def start_story():
             "知识库创建",
             lambda: build_experiment_knowledge_base(
                 public_worldview,
-                characters,
+                characters_markdown,
                 session_id.replace("-", ""),
                 director_notes=package.world.director_notes_markdown,
                 facts=package.world.facts,
@@ -199,15 +463,15 @@ def start_story():
         run_stage(
             session_id,
             "storage",
-            "实验归档",
+            BUILD_STAGE_LABELS["storage"],
             lambda: save_experiment_documents(
                 session_id,
-                worldview,
-                characters,
+                package.worldview_markdown,
+                characters_markdown,
                 scenario_payload=package.to_dict(),
             ),
         )
-
+        public_characters = package.public_characters_markdown
         story_sessions[session_id] = {
             "prompt": user_prompt,
             "scene": initial_scene,
@@ -218,31 +482,12 @@ def start_story():
             "knowledge_base": knowledge_base,
             "scenario": package,
             "simulation_llm": simulation_llm,
-            "page": 0,         # 注意：现在从 0 开始，还没正式生成第一页
+            "page": 0,
             "ended": False,
             "page_requests": {},
             "stream_lock": threading.Lock(),
         }
-
-        app.logger.info("story.start status=completed session=%s", session_id)
-        return jsonify({
-            "session_id": session_id,
-            "page": 0,
-            "isEnd": False,
-            "worldview": public_worldview,
-            "characters": public_characters,
-            "scene": initial_scene,
-            "scenario": {
-                "title": package.world.title,
-                "brief": package.brief.public_dict(),
-                "public_rules": package.world.public_rules,
-                "phases": package.world.phases,
-                "initial_state": state.public_world_state(),
-                "termination_conditions": package.world.termination_conditions,
-                "warnings": package.warnings,
-            },
-            "messages": [],
-        })
+        return jsonify(story_ready_payload(session_id, package, state, initial_scene))
 
     except SceneChatError as error:
         return error_response(error)
@@ -254,6 +499,56 @@ def start_story():
             error.code,
         )
         return error_response(error)
+
+
+@app.route("/api/story/start-stream", methods=["POST"])
+def start_story_stream():
+    data = request.get_json(silent=True)
+    if not data:
+        return request_error(
+            "request_body_missing",
+            "请求内容为空，请填写实验设定后重试。",
+        )
+
+    user_prompt = (data.get("prompt") or "").strip()
+    scene_override = (data.get("scene") or "").strip()
+    if not user_prompt:
+        return request_error("prompt_missing", "请输入实验设定后再开始生成。")
+
+    session_id = str(uuid.uuid4())
+    app.logger.info("story.start status=received session=%s", session_id)
+
+    def generate():
+        try:
+            for event in build_story_events(user_prompt, scene_override, session_id):
+                yield json.dumps(event, ensure_ascii=False) + "\n"
+        except SceneChatError as error:
+            yield json.dumps(
+                {
+                    "type": "error",
+                    "error": error.to_payload()["error"],
+                },
+                ensure_ascii=False,
+            ) + "\n"
+        except Exception as exc:
+            error = stage_error("internal", exc)
+            app.logger.exception(
+                "story.start status=failed session=%s code=%s",
+                session_id,
+                error.code,
+            )
+            yield json.dumps(
+                {
+                    "type": "error",
+                    "error": error.to_payload()["error"],
+                },
+                ensure_ascii=False,
+            ) + "\n"
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="application/x-ndjson",
+    )
 
 
 @app.route("/api/story/next-stream", methods=["POST"])
@@ -466,6 +761,7 @@ def get_story_session(session_id):
         "scene": session["scene"],
         "worldview": session["scenario"].public_worldview_markdown,
         "characters": session["public_characters"],
+        "scenario": public_scenario_payload(session["scenario"], state),
         "turn_count": state.turn_count,
         "current_phase": state.current_phase,
         "world_state": state.public_world_state(),
@@ -476,28 +772,24 @@ def get_story_session(session_id):
         "public_state": state.public_state_summary(),
         "agents": [
             {
+                "id": agent.id,
                 "name": agent.name,
                 "public_profile": agent.public_profile,
                 "active": agent.active,
                 "alive": agent.alive,
+                "current_location": agent.current_location,
             }
             for agent in state.agents.values()
         ],
-        "history": [
-            {
-                "speaker": msg.speaker,
-                "action": msg.action,
-                "speech": msg.speech,
-                "turn": msg.turn,
-                "kind": msg.kind,
-                "visibility": msg.visibility,
-                "visibility_scopes": msg.scopes,
-                "location": msg.location,
-                "state_updates": msg.state_updates,
-            }
-            for msg in state.history
-        ],
+        "history": [message_to_frontend(msg) for msg in state.history],
     })
+
+
+@app.route("/api/story/session/<session_id>", methods=["DELETE"])
+def delete_story_session(session_id):
+    """Release an in-memory simulation when the user returns to edit."""
+    deleted = story_sessions.pop(session_id, None) is not None
+    return jsonify({"session_id": session_id, "deleted": deleted})
 
 
 if __name__ == "__main__":

@@ -1,596 +1,249 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { useLocation, useNavigate } from "react-router-dom";
-import "./StoryPage.css";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { getApiErrorMessage, readApiError } from "./apiErrors";
+import { clearStoryStorage, loadStoredScenario } from "./scenarioStorage";
+import { deleteStorySession, fetchStorySession } from "./storyApi";
 import { loadPageIndex, loadStoryPages } from "./storyStorage";
+import "./StoryPage.css";
+
+const ROLE_COLORS = ["#44705a", "#8a5d3b", "#596b98", "#8b536b", "#6f6740", "#4f7180", "#795487", "#89704c"];
+
+function roleColor(name = "") {
+  const hash = [...name].reduce((sum, character) => sum + character.charCodeAt(0), 0);
+  return ROLE_COLORS[hash % ROLE_COLORS.length];
+}
+
+function MessageCard({ message, skipToken }) {
+  const fullText = message.display_text || "";
+  const instant = Boolean(message.replayed || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches || !fullText);
+  const [visibleText, setVisibleText] = useState(instant ? fullText : "");
+  const [initialSkipToken] = useState(skipToken);
+
+  useEffect(() => {
+    if (instant) return undefined;
+    let index = 0;
+    const timer = window.setInterval(() => {
+      index = Math.min(index + 2, fullText.length);
+      setVisibleText(fullText.slice(0, index));
+      if (index >= fullText.length) window.clearInterval(timer);
+    }, 18);
+    return () => window.clearInterval(timer);
+  }, [fullText, message.id, instant]);
+
+  const renderedText = skipToken !== initialSkipToken ? fullText : visibleText;
+
+  const narration = message.kind === "narration";
+  return (
+    <article className={`timeline-message ${narration ? "narration" : "dialogue"}`} style={{ "--role-color": roleColor(message.speaker) }}>
+      <header><span className="speaker-dot" /> <strong>{message.speaker || "旁白"}</strong>{message.kind ? <small>{message.kind}</small> : null}</header>
+      {message.action ? <p className="message-action">{message.action}</p> : null}
+      <p>{renderedText}{renderedText.length < fullText.length ? <span className="typing-caret" /> : null}</p>
+    </article>
+  );
+}
 
 function StoryPage() {
-  const location = useLocation();
   const navigate = useNavigate();
-
-  const userPrompt =
-    location.state?.prompt || localStorage.getItem("story_prompt") || "";
-
-  const scene =
-    location.state?.scene || localStorage.getItem("story_scene") || "";
-
-  const sessionId =
-    location.state?.sessionId || localStorage.getItem("story_session_id") || "";
-
-  const scenario = (() => {
-    try {
-      return JSON.parse(localStorage.getItem("story_scenario") || "{}");
-    } catch {
-      return {};
-    }
-  })();
-
-  const savedPages = loadStoryPages(localStorage);
-
-  const [pages, setPages] = useState(savedPages);
-  const [currentPageIndex, setCurrentPageIndex] = useState(
-    loadPageIndex(localStorage, savedPages.length)
-  );
-  const [displayedMessages, setDisplayedMessages] = useState([]);
+  const sessionId = localStorage.getItem("story_session_id") || "";
+  const prompt = localStorage.getItem("story_prompt") || "";
+  const scene = localStorage.getItem("story_scene") || "";
+  const storedScenario = useMemo(() => loadStoredScenario(localStorage), []);
+  const initialPages = useMemo(() => loadStoryPages(localStorage), []);
+  const [pages, setPages] = useState(initialPages);
+  const [currentPageIndex, setCurrentPageIndex] = useState(() => loadPageIndex(localStorage, initialPages.length));
+  const [snapshot, setSnapshot] = useState({ scenario: storedScenario, agents: storedScenario.characters || [], world_state: storedScenario.initial_state || {}, current_phase: storedScenario.phases?.[0] || "准备", turn_count: 0, run_status: "running" });
   const [isGenerating, setIsGenerating] = useState(false);
-  const [isTypingPage, setIsTypingPage] = useState(false);
-  const [showQuitModal, setShowQuitModal] = useState(false);
+  const [pausedPage, setPausedPage] = useState(null);
   const [errorMessage, setErrorMessage] = useState("");
-  const [failedPage, setFailedPage] = useState(null);
-
-  const contentRef = useRef(null);
-  const typingTokenRef = useRef(0);
-  const pageDoneRef = useRef(false);
-  const initialGenerationStartedRef = useRef(false);
+  const [showQuitModal, setShowQuitModal] = useState(false);
+  const [skipToken, setSkipToken] = useState(0);
+  const [autoAdvance, setAutoAdvance] = useState(false);
+  const [batchSize, setBatchSize] = useState(() => Number(localStorage.getItem("story_batch_size")) || 6);
   const streamAbortRef = useRef(null);
+  const streamReaderRef = useRef(null);
+  const intentionalAbortRef = useRef(false);
+  const initialRunRef = useRef(false);
+  const contentRef = useRef(null);
 
-  const currentPage = useMemo(() => {
-    return pages[currentPageIndex] || { page: 1, isEnd: false, messages: [] };
-  }, [pages, currentPageIndex]);
+  const currentPage = pages[currentPageIndex] || { page: 1, messages: [], isEnd: false };
+  const scenario = snapshot.scenario || storedScenario;
+  const agents = snapshot.agents || scenario.characters || [];
+
+  useEffect(() => { localStorage.setItem("story_pages", JSON.stringify(pages)); }, [pages]);
+  useEffect(() => { localStorage.setItem("current_page_index", String(currentPageIndex)); }, [currentPageIndex]);
+  useEffect(() => { localStorage.setItem("story_batch_size", String(batchSize)); }, [batchSize]);
+  useEffect(() => { contentRef.current?.scrollTo({ top: contentRef.current.scrollHeight, behavior: "smooth" }); }, [currentPage.messages?.length, isGenerating]);
+
+  const syncSnapshot = useCallback(async () => {
+    if (!sessionId) return;
+    try {
+      setSnapshot(await fetchStorySession(sessionId));
+    } catch (error) {
+      console.warn("Unable to refresh public session snapshot", error);
+    }
+  }, [sessionId]);
 
   useEffect(() => {
-    localStorage.setItem("story_pages", JSON.stringify(pages));
-  }, [pages]);
-
-  useEffect(() => {
-    localStorage.setItem("current_page_index", String(currentPageIndex));
-  }, [currentPageIndex]);
-
-  useEffect(() => {
-    if (!userPrompt || !sessionId) {
-      navigate("/");
+    if (!sessionId || !prompt) {
+      navigate("/", { replace: true });
       return;
     }
-  }, [userPrompt, sessionId, navigate]);
+    syncSnapshot();
+  }, [navigate, prompt, sessionId, syncSnapshot]);
 
-  useEffect(() => {
-    if (contentRef.current) {
-      contentRef.current.scrollTop = contentRef.current.scrollHeight;
-    }
-  }, [displayedMessages, isGenerating]);
-
-  const openErrorModal = (message) => {
-    setErrorMessage(message);
-  };
-
-  const closeErrorModal = () => {
-    setErrorMessage("");
-  };
-
-  const clearStoryCache = () => {
-    localStorage.removeItem("story_prompt");
-    localStorage.removeItem("story_scene");
-    localStorage.removeItem("story_batch_size");
-    localStorage.removeItem("story_session_id");
-    localStorage.removeItem("story_scenario");
-    localStorage.removeItem("story_pages");
-    localStorage.removeItem("current_page_index");
-    localStorage.removeItem("story_pending_page_request");
-  };
-
-  const getAlternatingSide = (index) => {
-    return index % 2 === 0 ? "left" : "right";
-  };
-
-  const getMessageSide = (message, index) => {
-    if (message.kind === "narration") return "narration";
-    const speaker = message.speaker || String(index);
-    const hash = [...speaker].reduce((total, char) => total + char.charCodeAt(0), 0);
-    return getAlternatingSide(hash);
-  };
-
-  const openQuitModal = () => {
-    setShowQuitModal(true);
-  };
-
-  const closeQuitModal = () => {
-    setShowQuitModal(false);
-  };
-
-  const confirmQuit = () => {
-    clearStoryCache();
-    setShowQuitModal(false);
-    navigate("/");
-  };
-
-  const getRoleSpeed = (speaker) => {
-    const speedMap = {
-      广播: 22,
-      系统: 20,
-      旁白: 24,
-    };
-
-    if (speedMap[speaker]) return speedMap[speaker];
-
-    const hash = [...speaker].reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
-    return 28 + (hash % 18);
-  };
-
-  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-  const randomBreathDelay = () => {
-    return 200 + Math.floor(Math.random() * 201); // 200 ~ 400ms
-  };
-
-  const createTypingPlaceholder = (msg, indexInPage) => {
-    return {
-      ...msg,
-      side: getMessageSide(msg, indexInPage),
-      visibleText: "",
-      isTyping: true,
-      isPlaceholder: true,
-    };
-  };
-
-  const typeText = async (fullText, speed, onUpdate, token) => {
-    let current = "";
-    for (let i = 0; i < fullText.length; i++) {
-      if (typingTokenRef.current !== token) return;
-
-      current += fullText[i];
-      onUpdate(current);
-
-      const char = fullText[i];
-      let delay = speed;
-
-      if ("，。！？；：,.!?".includes(char)) {
-        delay += 120;
-      } else if ("…".includes(char)) {
-        delay += 180;
-      }
-
-      await wait(delay);
-    }
-  };
-
-  const showFullPageImmediately = (messages) => {
-    const fullMessages = messages.map((msg, idx) => ({
-      ...msg,
-      side: getMessageSide(msg, idx),
-      visibleText: msg.display_text || "",
-      isTyping: false,
-    }));
-
-    setDisplayedMessages(fullMessages);
-    setIsTypingPage(false);
-  };
-
-  const appendTypingMessage = async (msg, indexInPage, pageIndex) => {
-      const token = typingTokenRef.current;
-      const side = getMessageSide(msg, indexInPage);
-      const text = msg.display_text || "";
-
-      // 1. 先显示“正在输入”的占位气泡
-      setDisplayedMessages((prev) => [
-        ...prev,
-        createTypingPlaceholder(msg, indexInPage),
-      ]);
-
-      // 2. 让占位气泡先存在一下，制造“对方正在输入”的感觉
-      await wait(350);
-
-      if (typingTokenRef.current !== token) return;
-
-      // 3. 把占位气泡切换成真正消息，但先从空文本开始
-      setDisplayedMessages((prev) =>
-        prev.map((item) =>
-          item.id === msg.id
-            ? {
-                ...item,
-                side,
-                visibleText: "",
-                isTyping: true,
-                isPlaceholder: false,
-              }
-            : item
-        )
-      );
-
-      const speed = getRoleSpeed(msg.speaker);
-
-      // 4. 逐字显示
-      await typeText(
-        text,
-        speed,
-        (partial) => {
-          setDisplayedMessages((prev) =>
-            prev.map((item) =>
-              item.id === msg.id
-                ? {
-                    ...item,
-                    visibleText: partial,
-                    isTyping: true,
-                    isPlaceholder: false,
-                  }
-                : item
-            )
-          );
-        },
-        token
-      );
-
-      if (typingTokenRef.current !== token) return;
-
-      // 5. 打完后先保留光标闪一下，不要立刻停
-      setDisplayedMessages((prev) =>
-        prev.map((item) =>
-          item.id === msg.id
-            ? {
-                ...item,
-                visibleText: text,
-                isTyping: true,
-                isPlaceholder: false,
-              }
-            : item
-        )
-      );
-
-      await wait(450);
-
-      if (typingTokenRef.current !== token) return;
-
-      // 6. 光标停止
-      setDisplayedMessages((prev) =>
-        prev.map((item) =>
-          item.id === msg.id
-            ? {
-                ...item,
-                visibleText: text,
-                isTyping: false,
-                isPlaceholder: false,
-              }
-            : item
-        )
-      );
-
-      // 7. 新句子之间加呼吸停顿
-      await wait(randomBreathDelay());
-
-      if (typingTokenRef.current !== token) return;
-
-      setPages((prev) =>
-        prev.map((page, idx) => {
-          if (idx !== pageIndex) return page;
-          return pageDoneRef.current ? { ...page, hasPlayed: true } : page;
-        })
-      );
-    };
-
-  const handleGenerateStreamPage = async (targetPageIndex, targetPageNumber) => {
-    if (isGenerating) return;
-
+  const generatePage = useCallback(async (targetIndex, pageNumber) => {
+    if (isGenerating || !sessionId) return;
     setIsGenerating(true);
-    setIsTypingPage(true);
-    pageDoneRef.current = false;
-    typingTokenRef.current = Date.now();
+    setErrorMessage("");
+    setPausedPage(null);
+    intentionalAbortRef.current = false;
 
-    const previousPage = pages[targetPageIndex];
-    const requestId =
-      previousPage?.requestId ||
-      globalThis.crypto?.randomUUID?.() ||
-      `${sessionId}-${targetPageNumber}-${Date.now()}`;
-    const emptyPage = {
-      page: targetPageNumber,
-      isEnd: false,
-      hasPlayed: false,
-      messages: previousPage?.messages || [],
-      requestId,
-    };
-
-    setPages((prev) => {
-      const updated = [...prev];
-      updated[targetPageIndex] = emptyPage;
-      return updated;
-    });
-
-    setCurrentPageIndex(targetPageIndex);
-    showFullPageImmediately(emptyPage.messages);
-    localStorage.setItem(
-      "story_pending_page_request",
-      JSON.stringify({ requestId, page: targetPageNumber })
-    );
+    const existingPage = pages[targetIndex];
+    const requestId = existingPage?.requestId || globalThis.crypto?.randomUUID?.() || `${sessionId}-${pageNumber}-${Date.now()}`;
+    const baseMessages = existingPage?.messages || [];
+    const pendingPage = { page: pageNumber, messages: baseMessages, isEnd: false, requestId, runStatus: "running" };
+    setPages((previous) => { const next = [...previous]; next[targetIndex] = pendingPage; return next; });
+    setCurrentPageIndex(targetIndex);
+    localStorage.setItem("story_pending_page_request", JSON.stringify({ requestId, page: pageNumber }));
 
     try {
-      streamAbortRef.current?.abort();
       const controller = new AbortController();
       streamAbortRef.current = controller;
       const response = await fetch("/api/story/next-stream", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          session_id: sessionId,
-          batch_size: 10,
-          request_id: requestId,
-          expected_page: targetPageNumber,
-        }),
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId, batch_size: batchSize, request_id: requestId, expected_page: pageNumber }),
         signal: controller.signal,
       });
-
-      if (!response.ok) {
-        throw new Error(await readApiError(response, "生成页面失败，请稍后重试。"));
-      }
-      if (!response.body) {
-        throw new Error("后端没有返回可读取的故事内容，请稍后重试。");
-      }
-
+      if (!response.ok) throw new Error(await readApiError(response, "继续推演失败，请稍后重试。"));
+      if (!response.body) throw new Error("后端没有返回可读取的推演流。");
       const reader = response.body.getReader();
+      streamReaderRef.current = reader;
       const decoder = new TextDecoder("utf-8");
       let buffer = "";
-      let messageIndex = emptyPage.messages.length;
-
+      const consume = (line) => {
+        if (!line.trim()) return;
+        const event = JSON.parse(line);
+        if (event.type === "error") throw new Error(getApiErrorMessage(event, "推演中断。"));
+        if (event.type === "message") {
+          const nextMessage = { ...event.message, replayed: Boolean(event.replayed) };
+          setPages((previous) => previous.map((page, index) => index !== targetIndex ? page : page.messages.some((item) => (item.event_id && item.event_id === nextMessage.event_id) || (!item.event_id && item.id === nextMessage.id)) ? page : { ...page, messages: [...page.messages, nextMessage] }));
+        }
+        if (event.type === "page_done") {
+          localStorage.removeItem("story_pending_page_request");
+          setPages((previous) => previous.map((page, index) => index === targetIndex ? { ...page, isEnd: event.isEnd, endReason: event.end_reason || "", endKind: event.end_kind || "", runStatus: event.run_status || "running" } : page));
+        }
+      };
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
-
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split("\n");
         buffer = lines.pop() || "";
-
-        for (const line of lines) {
-          if (!line.trim()) continue;
-
-          const event = JSON.parse(line);
-
-          if (event.type === "error") {
-            throw new Error(
-              getApiErrorMessage(event, "生成页面失败，请稍后重试。")
-            );
-          }
-
-          if (event.type === "message") {
-            const newMsg = event.message;
-
-            setPages((prev) =>
-              prev.map((page, idx) =>
-                idx === targetPageIndex
-                  ? page.messages.some(
-                      (message) =>
-                        (message.event_id && message.event_id === newMsg.event_id) ||
-                        (!message.event_id && message.id === newMsg.id)
-                    )
-                    ? page
-                    : { ...page, messages: [...page.messages, newMsg] }
-                  : page
-              )
-            );
-
-            if (!event.replayed || !emptyPage.messages.some(
-              (message) =>
-                (message.event_id && message.event_id === newMsg.event_id) ||
-                (!message.event_id && message.id === newMsg.id)
-            )) {
-              await appendTypingMessage(newMsg, messageIndex, targetPageIndex);
-              messageIndex += 1;
-            }
-          }
-
-          if (event.type === "page_done") {
-            pageDoneRef.current = true;
-            localStorage.removeItem("story_pending_page_request");
-            setFailedPage(null);
-
-            setPages((prev) =>
-              prev.map((page, idx) =>
-                idx === targetPageIndex
-                  ? {
-                      ...page,
-                      isEnd: event.isEnd,
-                      hasPlayed: true,
-                      endReason: event.end_reason || "",
-                      endKind: event.end_kind || "",
-                      runStatus: event.run_status || "running",
-                    }
-                  : page
-              )
-            );
-          }
-        }
+        lines.forEach(consume);
       }
+      if (buffer.trim()) consume(buffer);
+      await syncSnapshot();
     } catch (error) {
-      console.error(error);
-      setFailedPage({ index: targetPageIndex, page: targetPageNumber });
-      openErrorModal(error.message || "生成页面失败");
+      if (error.name === "AbortError" && intentionalAbortRef.current) {
+        setPausedPage({ index: targetIndex, page: pageNumber });
+      } else {
+        console.error(error);
+        setPausedPage({ index: targetIndex, page: pageNumber });
+        setErrorMessage(error.message || "推演中断，请继续或重试。");
+      }
     } finally {
+      streamReaderRef.current = null;
       streamAbortRef.current = null;
       setIsGenerating(false);
-      setIsTypingPage(false);
     }
-  };
-
-  const retryFailedPage = async () => {
-    if (!failedPage || isGenerating) return;
-    setErrorMessage("");
-    await handleGenerateStreamPage(failedPage.index, failedPage.page);
-  };
+  }, [batchSize, isGenerating, pages, sessionId, syncSnapshot]);
 
   useEffect(() => {
-    if (!sessionId || isGenerating) return;
+    if (!sessionId || pages.length || initialRunRef.current) return;
+    initialRunRef.current = true;
+    generatePage(0, 1);
+  }, [generatePage, pages.length, sessionId]);
 
-    if (pages.length === 0) {
-      if (initialGenerationStartedRef.current) return;
-      initialGenerationStartedRef.current = true;
-      handleGenerateStreamPage(0, 1);
-      return;
-    }
+  useEffect(() => {
+    if (!autoAdvance || isGenerating || pausedPage || !currentPage.messages?.length || currentPage.isEnd) return undefined;
+    const timer = window.setTimeout(() => generatePage(currentPageIndex + 1, currentPage.page + 1), 1100);
+    return () => window.clearTimeout(timer);
+  }, [autoAdvance, currentPage.isEnd, currentPage.messages?.length, currentPage.page, currentPageIndex, generatePage, isGenerating, pausedPage]);
 
-    if (currentPage?.messages?.length) {
-      showFullPageImmediately(currentPage.messages);
-    }
-    // Page generation intentionally runs only on navigation/page-count changes.
-    // Streaming message updates must not restart the typewriter animation.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentPageIndex, pages.length, sessionId, isGenerating]);
-
-  const handlePrevPage = () => {
-    if (currentPageIndex === 0 || isGenerating || isTypingPage) return;
-    typingTokenRef.current += 1;
-    setCurrentPageIndex((prev) => prev - 1);
+  const pauseGeneration = () => {
+    intentionalAbortRef.current = true;
+    setPausedPage({ index: currentPageIndex, page: currentPage.page });
+    setIsGenerating(false);
+    streamReaderRef.current?.cancel().catch(() => {});
+    streamAbortRef.current?.abort();
   };
 
-  const handleNextPage = async () => {
-    if (isGenerating || isTypingPage) return;
-
-    if (currentPage.isEnd) {
-      clearStoryCache();
-      navigate("/");
-      return;
-    }
-
-    const nextIndex = currentPageIndex + 1;
-
-    if (pages[nextIndex]) {
-      typingTokenRef.current += 1;
-      setCurrentPageIndex(nextIndex);
-      return;
-    }
-
-    await handleGenerateStreamPage(nextIndex, currentPage.page + 1);
+  const nextPage = () => {
+    if (isGenerating) return;
+    if (pages[currentPageIndex + 1]) setCurrentPageIndex((value) => value + 1);
+    else if (!currentPage.isEnd) generatePage(currentPageIndex + 1, currentPage.page + 1);
   };
+
+  const confirmQuit = async () => {
+    streamAbortRef.current?.abort();
+    await deleteStorySession(sessionId);
+    clearStoryStorage(localStorage);
+    navigate("/", { replace: true });
+  };
+
+  const visibleWorldState = Object.entries(snapshot.world_state || scenario.initial_state || {});
 
   return (
-    <div className="story-page">
-      <div className="book-shell">
-        <button className="quit-btn" onClick={openQuitModal} title="退出故事">
-          ×
-        </button>
+    <main className="simulation-page">
+      <header className="simulation-header">
+        <div><span className="sim-eyebrow">LIVE SIMULATION</span><h1>{scenario.title || "场景模拟"}</h1></div>
+        <div className="sim-status-strip"><span><i className={isGenerating ? "live" : ""} />{isGenerating ? "推演中" : pausedPage ? "已暂停" : currentPage.isEnd ? "已结束" : "等待继续"}</span><span>阶段 · {snapshot.current_phase || "自由互动"}</span><span>回合 · {snapshot.turn_count || 0}</span></div>
+        <button className="icon-button" type="button" onClick={() => setShowQuitModal(true)} aria-label="退出模拟">×</button>
+      </header>
 
-        <div className="book-header">
-          <div className="book-title">{scenario.title || "场景模拟"}</div>
-          <div className="book-subtitle">
-            第 {currentPage.page} 页
-            {scene ? ` ｜ 场景：${scene}` : ""}
-          </div>
-          {userPrompt ? <div className="book-prompt">设定：{userPrompt}</div> : null}
-        </div>
+      <section className="mobile-context">
+        <details><summary>角色与世界状态</summary><div className="mobile-panels"><Roster agents={agents} /><WorldPanel entries={visibleWorldState} scenario={scenario} /></div></details>
+      </section>
 
-        <div className="book-content" ref={contentRef}>
-          {displayedMessages.map((msg, idx) => (
-            <div
-              key={`${currentPage.page}-${msg.id}-${idx}`}
-              className={`message-row ${msg.side}`}
-            >
-              <div className="message-meta">{msg.speaker}</div>
+      <div className="simulation-grid">
+        <aside className="sim-sidebar left-panel"><Roster agents={agents} /></aside>
 
-              {msg.isPlaceholder ? (
-                <div className="message-bubble typing-placeholder-bubble">
-                  <span className="typing-placeholder-dot" />
-                  <span className="typing-placeholder-dot" />
-                  <span className="typing-placeholder-dot" />
-                </div>
-              ) : (
-                <div className="message-bubble">
-                  {msg.action ? (
-                    <span className="message-action">{msg.action}</span>
-                  ) : null}
-                  <span>{msg.visibleText}</span>
-                  {msg.isTyping && <span className="typing-caret">|</span>}
-                </div>
-              )}
-            </div>
-          ))}
-
-          {isGenerating && displayedMessages.length === 0 && (
-            <div className="page-loading-zone">
-              <div className="page-loading-text">正在生成内容...</div>
-              <div className="page-loading-dots">
-                <span />
-                <span />
-                <span />
-              </div>
-            </div>
-          )}
-        </div>
-
-        <div className="book-footer">
-          <button
-            className={`nav-btn left-btn ${currentPageIndex === 0 ? "hidden-btn" : ""}`}
-            onClick={handlePrevPage}
-            disabled={currentPageIndex === 0 || isGenerating || isTypingPage}
-          >
-            ←
-          </button>
-
-          <div className="page-indicator">
-            {isGenerating
-              ? "正在书写这一页..."
-              : isTypingPage
-              ? "文字显现中..."
-              : currentPage.isEnd
-              ? "故事已结束"
-              : "继续阅读"}
+        <section className="timeline-panel">
+          <div className="timeline-context"><span>第 {currentPage.page || 1} 幕</span><p>{scene || scenario.brief?.premise || prompt}</p></div>
+          <div className="timeline-content" ref={contentRef} aria-live="polite">
+            {currentPage.messages?.length ? currentPage.messages.map((message, index) => <MessageCard key={`${message.event_id || message.id}-${index}`} message={message} skipToken={skipToken} />) : <div className="timeline-empty"><span className="scene-loader" /><strong>角色正在进入场景</strong><p>第一轮行动会从公开场景和各自掌握的信息开始。</p></div>}
+            {currentPage.isEnd ? <div className="ending-card"><strong>本次模拟已收束</strong><p>{currentPage.endReason || snapshot.end_reason || "场景达到自然结束条件。"}</p>{snapshot.winner ? <span>结果：{snapshot.winner}</span> : null}</div> : null}
           </div>
 
-          <button
-            className="nav-btn right-btn"
-            onClick={handleNextPage}
-            disabled={isGenerating || isTypingPage}
-          >
-            {currentPage.isEnd ? "End" : "→"}
-          </button>
-        </div>
+          {errorMessage ? <div className="stream-error" role="alert"><span>{errorMessage}</span><button type="button" onClick={() => setErrorMessage("")}>关闭</button></div> : null}
+
+          <footer className="simulation-controls">
+            <div className="page-navigation"><button type="button" onClick={() => setCurrentPageIndex((value) => Math.max(0, value - 1))} disabled={currentPageIndex === 0 || isGenerating}>←</button><span>{currentPageIndex + 1} / {pages.length || 1}</span><button type="button" onClick={nextPage} disabled={isGenerating || currentPage.isEnd}>→</button></div>
+            <div className="control-actions">
+              <button type="button" onClick={() => setSkipToken((value) => value + 1)}>跳过打字</button>
+              {isGenerating ? <button type="button" className="pause-button" onClick={pauseGeneration}>暂停生成</button> : pausedPage ? <button type="button" className="primary-control" onClick={() => generatePage(pausedPage.index, pausedPage.page)}>继续生成</button> : !currentPage.isEnd ? <button type="button" className="primary-control" onClick={nextPage}>继续推演</button> : null}
+            </div>
+          </footer>
+        </section>
+
+        <aside className="sim-sidebar right-panel">
+          <WorldPanel entries={visibleWorldState} scenario={scenario} />
+          <section className="control-panel"><h2>推演控制</h2><label>每幕行动数<select value={batchSize} onChange={(event) => setBatchSize(Number(event.target.value))} disabled={isGenerating}><option value="3">3 · 精细</option><option value="6">6 · 均衡</option><option value="10">10 · 快速</option></select></label><label className="toggle-row"><span>自动继续</span><input type="checkbox" checked={autoAdvance} onChange={(event) => setAutoAdvance(event.target.checked)} /></label><small>自动继续会持续生成，直到满足结束条件或安全上限。</small></section>
+        </aside>
       </div>
 
-      {showQuitModal && (
-        <div className="quit-modal-overlay">
-          <div className="quit-modal">
-            <div className="quit-modal-title">结束当前故事？</div>
-            <div className="quit-modal-text">
-              退出后将返回首页，当前阅读进度会被清除。
-            </div>
-            <div className="quit-modal-actions">
-              <button className="quit-modal-btn secondary" onClick={closeQuitModal}>
-                取消
-              </button>
-              <button className="quit-modal-btn primary" onClick={confirmQuit}>
-                确定退出
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {errorMessage && (
-        <div className="quit-modal-overlay">
-          <div className="quit-modal">
-            <div className="quit-modal-title">提示</div>
-            <div className="quit-modal-text">{errorMessage}</div>
-            <div className="quit-modal-actions">
-              <button className="quit-modal-btn primary" onClick={closeErrorModal}>
-                关闭
-              </button>
-              {failedPage ? (
-                <button className="quit-modal-btn primary" onClick={retryFailedPage}>
-                  重试当前页
-                </button>
-              ) : null}
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
+      {showQuitModal ? <div className="quit-modal-overlay" onClick={() => setShowQuitModal(false)}><div className="quit-modal" role="dialog" aria-modal="true" aria-labelledby="quit-title" onClick={(event) => event.stopPropagation()}><h2 id="quit-title">退出这次模拟？</h2><p>当前浏览器中的场景和已生成内容将被清除。</p><div><button type="button" onClick={() => setShowQuitModal(false)}>继续留在这里</button><button type="button" className="danger" onClick={confirmQuit}>退出并清除</button></div></div></div> : null}
+    </main>
   );
+}
+
+function Roster({ agents }) {
+  return <section className="roster-panel"><div className="panel-heading"><span>CAST</span><h2>角色阵容</h2></div><div className="roster-list">{agents.map((agent) => <article className={!agent.active || agent.alive === false ? "inactive" : ""} key={agent.id || agent.name} style={{ "--role-color": roleColor(agent.name) }}><div className="roster-avatar">{agent.name?.slice(0, 1)}</div><div><strong>{agent.name}</strong><small>{agent.public_identity || agent.public_profile || "参与者"}</small><span>{agent.alive === false ? "已离场" : agent.current_location || agent.initial_location || "场景中"}</span></div></article>)}</div></section>;
+}
+
+function WorldPanel({ entries, scenario }) {
+  return <section className="world-panel"><div className="panel-heading"><span>WORLD STATE</span><h2>公开状态</h2></div><dl>{entries.length ? entries.map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{typeof value === "object" ? JSON.stringify(value) : String(value)}</dd></div>) : <p>暂无公开状态变化。</p>}</dl>{scenario.locations?.length ? <><h3>场景地点</h3><div className="location-tags">{scenario.locations.map((location) => <span key={location}>{location}</span>)}</div></> : null}</section>;
 }
 
 export default StoryPage;

@@ -181,8 +181,12 @@ class IntentResolver:
                 patch.add("set_phase", value=getattr(phase, "next_phase", ""))
         # Structured rule scenarios end only through deterministic termination
         # rules. Free-form scenes may still use a director-judged natural end.
+        has_deterministic_termination = any(
+            getattr(rule, "kind", "manual") != "manual"
+            for rule in state.termination_rules
+        )
         allow_natural_end = bool(
-            end_signal and end_reason.strip() and not state.termination_rules
+            end_signal and end_reason.strip() and not has_deterministic_termination
         )
         safe_location = location if (not location or not state.locations or location in state.locations) else ""
         return Resolution(

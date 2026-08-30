@@ -15,6 +15,7 @@ from .scenario import (
     ScenarioValidationError,
     WorldSpec,
     extract_json_object,
+    normalize_scenario_phase_references,
     validate_scenario_package,
 )
 
@@ -86,6 +87,10 @@ WORLD_JSON_INSTRUCTION = """在遵守上方所有世界设计规则的同时，�
 }
 
 多个条件必须同时成立时，使用一个 kind=all_of 的顶层规则，把原子规则放入 conditions；任选其一时使用 any_of。不得把“且/全部/同时”条件拆成多个并列顶层规则，因为顶层规则之间按任一满足处理。
+
+运行时已经内置 move、vote、inspect、protect、eliminate、poison、heal 的标准效果和能力次数扣减。此类 rule 的 effects 应留空，不能重复填写淘汰、查验、保护、投票、移动或 consume_ability；只有题材额外要求的世界状态、资源、目标或关系变化才写入 effects。普通 speak、observe、pass、act 规则也不得借 effects 越权执行专用行动。
+
+每个非 event_only 阶段的 allowed_action_types 必须至少包含 pass、observe、speak、act 之一作为安全兜底，即使该阶段主要执行投票、查验或自定义行动；兜底行动用于模型连续提交非法 Intent 时保持阶段可推进，不能省略。
 有夜间技能、治疗、反制或结算顺序时，termination rule 必须用 phases 限制到结算/公布阶段，不能在中间行动后提前判胜。
 
 状态 effect 仅允许 set_world、increment_world、move_agent、set_agent_status、set_resource、consume_resource、set_goal_status、set_relationship、record_vote、clear_votes、set_phase、add_known_fact、protect_agent、clear_protections。模板中的 $actor、$target、$value 会在运行时由 Resolver 安全替换。
@@ -238,7 +243,7 @@ def generate_character_specs(
     ]
 
 
-def _repair_package(
+def repair_scenario_package(
     user_prompt: str,
     package: ScenarioPackage,
     issues: list[str],
@@ -250,7 +255,7 @@ def _repair_package(
   "warnings": ["必要的非阻断说明"]
 }
 所有 covered_constraint_ids 必须真实对应其落实位置。公共世界仍不得包含导演秘密。
-如果错误涉及规则运行时，必须补全 phase_specs、rules、state_schema 和 termination_rules；effect 只能使用 set_world、increment_world、move_agent、set_agent_status、set_resource、consume_resource、consume_ability、set_goal_status、set_relationship、record_vote、clear_votes、set_phase、add_known_fact。不要退回自然语言规则代替结构化字段。"""
+如果错误涉及规则运行时，必须补全 phase_specs、rules、state_schema 和 termination_rules。每个非 event_only 阶段必须在 allowed_action_types 中保留 pass、observe、speak、act 至少一种安全兜底。move、vote、inspect、protect、eliminate、poison、heal 的标准效果以及能力次数扣减由 Resolver 内置执行，对应 rule/ability 的 effects 留空；只有额外的题材状态变化才能使用与行动类型匹配的 set_world、increment_world、set_resource、consume_resource、set_goal_status、set_relationship 等 effect。不要退回自然语言规则代替结构化字段。"""
     payload = _invoke_json(
         repair_prompt,
         "【用户原始输入】\n"
@@ -284,9 +289,11 @@ def generate_scenario_package(user_prompt: str, scene_override: str = "") -> Sce
     world = generate_world_spec(user_prompt, brief)
     characters = generate_character_specs(user_prompt, brief, world)
     package = ScenarioPackage(brief=brief, world=world, characters=characters)
+    normalize_scenario_phase_references(package)
     issues = validate_scenario_package(package)
     if issues:
-        package = _repair_package(user_prompt, package, issues)
+        package = repair_scenario_package(user_prompt, package, issues)
+        normalize_scenario_phase_references(package)
         issues = validate_scenario_package(package)
     if issues:
         raise ScenarioValidationError(issues)

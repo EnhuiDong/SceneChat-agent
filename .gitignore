@@ -10,5 +10,8 @@ tests/
 frontend/tests/
 storage_chroma/
 data/experiments/
+data/evaluations/
+evaluation/
 frontend/node_modules/
 frontend/dist/
+.pnpm-store/

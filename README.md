@@ -15,6 +15,8 @@ SceneChat-Agent 是一个共享大模型、角色上下文隔离的社会情境�
 7. 角色模型只提交 `Intent`。`IntentResolver` 校验阶段、能力、次数、目标、地点与 effect 白名单后才生成权威 `StatePatch`；模型提交的任意 patch 不会直接执行。
 8. 阶段、位置、资源、技能、关系、目标、投票、淘汰、定向认知和组合结束条件随推演更新。自然结束、连续失败阻断与 `MAX_TURNS` 安全上限彼此区分。
 
+Web 界面按“写下设定 → 真实构建进度 → 公开信息审阅 → 实时模拟”组织。审阅页提供约束覆盖、运行阶段、公开规则和角色卡，但不会返回导演信息或角色秘密；模拟工作台提供角色阵容、公开世界状态、批量行动数、暂停/恢复、跳过打字和可选自动推进。
+
 启动实验前先通过与正式生成相同的 JSON 路径探测生成模型。生成结构化设定后，只有背景长度达到 RAG 阈值时才探测向量模型并建立索引；短场景不会因为 Embedding 不可用而无法运行。
 
 文本生成统一通过 OpenAI Python Client 的 Chat Completions 接口调用，可使用 OpenAI、DashScope 或其他实现该协议的兼容服务。向量模型独立配置：兼容服务通过项目内的 LlamaIndex `BaseEmbedding` 适配器接入，DashScope 原生 Embedding 保留为兜底。
@@ -33,6 +35,7 @@ SceneChat-Agent 是一个共享大模型、角色上下文隔离的社会情境�
 │   ├── context.py                 # AgentView 与导演上下文
 │   ├── embeddings.py              # OpenAI 兼容向量的 LlamaIndex 适配器
 │   ├── errors.py                  # 稳定错误码与对外错误信息
+│   ├── evaluation.py              # 场景与推演轨迹的确定性质量指标
 │   ├── generation.py              # 约束账本、世界、角色的分阶段生成
 │   ├── knowledge.py               # 实验级隔离索引与角色过滤检索
 │   ├── models.py                  # AgentState / Message / SimulationState
