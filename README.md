@@ -15,9 +15,9 @@ SceneChat-Agent 是一个共享大模型、角色上下文隔离的社会情境�
 7. 角色模型只提交 `Intent`。`IntentResolver` 校验阶段、能力、次数、目标、地点与 effect 白名单后才生成权威 `StatePatch`；模型提交的任意 patch 不会直接执行。
 8. 阶段、位置、资源、技能、关系、目标、投票、淘汰、定向认知和组合结束条件随推演更新。自然结束、连续失败阻断与 `MAX_TURNS` 安全上限彼此区分。
 
-启动实验前先探测生成模型。生成结构化设定后，只有背景长度达到 RAG 阈值时才探测向量模型并建立索引；短场景不会因为 Embedding 不可用而无法运行。
+启动实验前先通过与正式生成相同的 JSON 路径探测生成模型。生成结构化设定后，只有背景长度达到 RAG 阈值时才探测向量模型并建立索引；短场景不会因为 Embedding 不可用而无法运行。
 
-DashScope 文本向量接口每批最多接受 20 条内容。项目在 Embedding 客户端和索引插入层都将批次固定限制为 20，较大的角色/世界文档会自动拆成多批处理。
+文本生成统一通过 OpenAI Python Client 的 Chat Completions 接口调用，可使用 OpenAI、DashScope 或其他实现该协议的兼容服务。向量模型独立配置：兼容服务通过项目内的 LlamaIndex `BaseEmbedding` 适配器接入，DashScope 原生 Embedding 保留为兜底。
 
 ## 项目结构
 
@@ -31,10 +31,12 @@ DashScope 文本向量接口每批最多接受 20 条内容。项目在 Embeddin
 ├── scenechat/
 │   ├── character_parser.py        # Markdown 角色档案解析
 │   ├── context.py                 # AgentView 与导演上下文
+│   ├── embeddings.py              # OpenAI 兼容向量的 LlamaIndex 适配器
 │   ├── errors.py                  # 稳定错误码与对外错误信息
 │   ├── generation.py              # 约束账本、世界、角色的分阶段生成
 │   ├── knowledge.py               # 实验级隔离索引与角色过滤检索
 │   ├── models.py                  # AgentState / Message / SimulationState
+│   ├── openai_compat.py           # OpenAI 兼容传输和 Chat 模型接口
 │   ├── preflight.py               # 模型与向量服务启动前探测
 │   ├── providers.py               # 模型与 Embedding 提供商
 │   ├── runtime.py                 # Intent / Resolver / StatePatch
@@ -52,23 +54,38 @@ DashScope 文本向量接口每批最多接受 20 条内容。项目在 Embeddin
 需要 Python 3.10+ 和 Node.js。复制 `.env.example` 为 `.env`，然后填写模型配置：
 
 ```dotenv
+# dashscope | openai | openai_compatible
+LLM_PROVIDER=dashscope
 LLM_API_KEY=your_api_key
 LLM_API_BASE=https://dashscope.aliyuncs.com/compatible-mode/v1
 LLM_MODEL=qwen-plus
-MODEL_PROVIDER=dashscope
-
-EMBEDDING_API_KEY=your_api_key
-EMBEDDING_MODEL=text-embedding-v2
-EMBEDDING_PROVIDER=dashscope
-
 LLM_REQUEST_TIMEOUT_SECONDS=180
 LLM_MAX_RETRIES=1
+LLM_JSON_MODE=auto
+LLM_TOKEN_LIMIT_PARAMETER=max_tokens
 LLM_ENABLE_THINKING=false
 SIMULATION_PARSE_RETRIES=1
+
+# dashscope | dashscope_native | dashscope_compatible | openai | openai_compatible
+EMBEDDING_PROVIDER=dashscope
+EMBEDDING_API_KEY=your_api_key
+EMBEDDING_API_BASE=
+EMBEDDING_MODEL=text-embedding-v2
+EMBEDDING_BATCH_SIZE=20
+EMBEDDING_REQUEST_TIMEOUT_SECONDS=180
+EMBEDDING_MAX_RETRIES=1
 ```
 
-当前推演和 Embedding 提供商实现为 DashScope；世界观和角色生成通过其 OpenAI 兼容接口调用。
-结构化长文本生成默认关闭 thinking，避免推理 token 占满输出预算而截断 JSON；只有确认所用模型和额度适合时才应显式开启。
+文本模型与向量模型可以使用不同的供应商、地址和 API Key。`openai` 使用 OpenAI 默认地址；`openai_compatible` 必须填写对应的 `*_API_BASE`。`MODEL_PROVIDER` 仍作为旧 `.env` 的兼容别名，但新配置应使用 `LLM_PROVIDER`。
+
+| 配置值 | 文本生成 | 向量生成 |
+| --- | --- | --- |
+| `dashscope` | OpenAI 兼容接口，并支持 `LLM_ENABLE_THINKING` | DashScope 原生 LlamaIndex 适配器，批次不超过 20 |
+| `openai` | OpenAI 默认或自定义地址 | OpenAI `/embeddings` |
+| `openai_compatible` | 自定义兼容地址 | 自定义兼容 `/embeddings` 地址 |
+| `dashscope_compatible` | — | 用 OpenAI Client 调用 DashScope 兼容地址 |
+
+`LLM_JSON_MODE=auto` 时，OpenAI 与 DashScope 使用原生 JSON Mode，未知兼容服务只依赖严格 Prompt 和本地 JSON 校验；确认服务支持 `response_format` 后可改为 `native`。结构化长文本默认关闭 DashScope thinking，避免推理 token 占满输出预算而截断 JSON。
 
 ## 运行
 

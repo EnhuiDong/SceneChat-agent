@@ -7,7 +7,7 @@ from .providers import get_embedding_model
 from .visibility import ViewerContext, access_keys_for, normalize_scopes
 
 
-EMBEDDING_INSERT_BATCH_SIZE = 20
+DEFAULT_EMBEDDING_INSERT_BATCH_SIZE = 20
 RAG_MIN_DOCUMENT_CHARS = 800
 
 
@@ -199,11 +199,19 @@ def build_experiment_knowledge_base(
     collection = client.create_collection(f"scenechat-{experiment_id}")
     vector_store = ChromaVectorStore(chroma_collection=collection)
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
+    active_embed_model = embed_model or get_embedding_model()
+    insert_batch_size = int(
+        getattr(
+            active_embed_model,
+            "embed_batch_size",
+            DEFAULT_EMBEDDING_INSERT_BATCH_SIZE,
+        )
+    )
     index = VectorStoreIndex(
         nodes,
         storage_context=storage_context,
-        embed_model=embed_model or get_embedding_model(),
-        insert_batch_size=EMBEDDING_INSERT_BATCH_SIZE,
+        embed_model=active_embed_model,
+        insert_batch_size=max(1, insert_batch_size),
     )
     return ExperimentKnowledgeBase(experiment_id, client, index, documents)
 

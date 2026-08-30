@@ -1,13 +1,26 @@
 from dataclasses import dataclass
 
 from .errors import SceneChatError, classify_provider_error
+from .openai_compat import response_content
 from .providers import get_embedding_model, get_generation_chat_model
+from .scenario import extract_json_object
 
 
 @dataclass(frozen=True)
 class ModelPreflightResult:
     generation_model: str
     embedding_model: str
+
+
+def _probe_generation_model(generation_model) -> None:
+    response = generation_model.invoke(
+        [("user", '只输出这个 JSON 对象：{"ok":true}')],
+        max_tokens=12,
+        response_format={"type": "json_object"},
+    )
+    payload = extract_json_object(response_content(response))
+    if payload.get("ok") is not True:
+        raise ValueError("生成模型没有按要求返回 JSON")
 
 
 def validate_model_availability() -> ModelPreflightResult:
@@ -31,10 +44,7 @@ def validate_model_availability() -> ModelPreflightResult:
         raise classify_provider_error(exc, service="向量模型") from exc
 
     try:
-        generation_model.invoke(
-            [("user", "仅回复：OK")],
-            max_tokens=2,
-        )
+        _probe_generation_model(generation_model)
     except SceneChatError:
         raise
     except Exception as exc:
@@ -47,10 +57,10 @@ def validate_model_availability() -> ModelPreflightResult:
 
 
 def validate_generation_model_availability() -> str:
-    """Probe only the generation model for short scenarios that need no RAG."""
-    generation_model = get_generation_chat_model(temperature=0, max_tokens=2)
+    """Probe the same JSON path used by scenario and simulation generation."""
+    generation_model = get_generation_chat_model(temperature=0, max_tokens=12)
     try:
-        generation_model.invoke([("user", "仅回复：OK")], max_tokens=2)
+        _probe_generation_model(generation_model)
     except SceneChatError:
         raise
     except Exception as exc:
