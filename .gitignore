@@ -12,6 +12,9 @@ storage_chroma/
 data/experiments/
 data/evaluations/
 evaluation/
+data/*.db
+data/*.db-shm
+data/*.db-wal
 frontend/node_modules/
 frontend/dist/
 .pnpm-store/

@@ -6,8 +6,9 @@ export function saveStorySetup(storage, prompt, ready) {
   storage.setItem("story_scenario", JSON.stringify(ready.scenario || {}));
   storage.setItem("story_worldview", ready.worldview || "");
   storage.setItem("story_public_characters", ready.characters || "");
-  storage.setItem("story_pages", JSON.stringify([]));
-  storage.setItem("current_page_index", "0");
+  const pages = Array.isArray(ready.pages) ? ready.pages : [];
+  storage.setItem("story_pages", JSON.stringify(pages));
+  storage.setItem("current_page_index", String(Math.max(0, pages.length - 1)));
   storage.removeItem("story_pending_page_request");
 }
 

@@ -1,5 +1,7 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
+import { clearStoryStorage, saveStorySetup } from "./scenarioStorage";
+import { clearStorySessions, deleteStorySession, fetchStorySession, listStorySessions } from "./storyApi";
 import "./HomePage.css";
 
 const EXAMPLES = [
@@ -17,6 +19,10 @@ function HomePage() {
   const [prompt, setPrompt] = useState(initialPrompt);
   const [scene, setScene] = useState(initialScene);
   const [modalMessage, setModalMessage] = useState("");
+  const [history, setHistory] = useState([]);
+  const [historyLoading, setHistoryLoading] = useState(true);
+  const [historyBusy, setHistoryBusy] = useState("");
+  const [confirmAction, setConfirmAction] = useState(null);
   const navigate = useNavigate();
   const inputMode = useMemo(() => {
     const trimmed = prompt.trim();
@@ -24,6 +30,15 @@ function HomePage() {
       ? "完整设定"
       : "概念设定";
   }, [prompt]);
+
+  useEffect(() => {
+    let active = true;
+    listStorySessions()
+      .then((items) => { if (active) setHistory(items); })
+      .catch((error) => { if (active) setModalMessage(error.message); })
+      .finally(() => { if (active) setHistoryLoading(false); });
+    return () => { active = false; };
+  }, []);
 
   const openErrorModal = (message) => {
     setModalMessage(message);
@@ -49,6 +64,44 @@ function HomePage() {
     if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
       event.preventDefault();
       handleSubmit();
+    }
+  };
+
+  const continueStory = async (item) => {
+    if (historyBusy) return;
+    setHistoryBusy(item.id);
+    try {
+      const snapshot = await fetchStorySession(item.id);
+      saveStorySetup(localStorage, snapshot.prompt, snapshot);
+      navigate(snapshot.page > 0 ? "/story" : "/review");
+    } catch (error) {
+      openErrorModal(error.message || "恢复推演失败。");
+    } finally {
+      setHistoryBusy("");
+    }
+  };
+
+  const runConfirmedAction = async () => {
+    if (!confirmAction || historyBusy) return;
+    const action = confirmAction;
+    setConfirmAction(null);
+    setHistoryBusy(action.type === "clear" ? "all" : action.session.id);
+    try {
+      if (action.type === "clear") {
+        await clearStorySessions();
+        clearStoryStorage(localStorage);
+        setHistory([]);
+      } else {
+        await deleteStorySession(action.session.id);
+        if (localStorage.getItem("story_session_id") === action.session.id) {
+          clearStoryStorage(localStorage);
+        }
+        setHistory((items) => items.filter((item) => item.id !== action.session.id));
+      }
+    } catch (error) {
+      openErrorModal(error.message || "操作失败，请稍后重试。");
+    } finally {
+      setHistoryBusy("");
     }
   };
 
@@ -118,6 +171,18 @@ function HomePage() {
           </button>
           <small className="home-shortcut">Ctrl / ⌘ + Enter 快速开始</small>
         </form>
+
+        <section className="story-library" aria-labelledby="story-library-title">
+          <header><div><span>LOCAL ARCHIVE</span><h2 id="story-library-title">历史推演</h2></div>{history.length ? <button type="button" className="clear-history" onClick={() => setConfirmAction({ type: "clear" })}>清除全部</button> : null}</header>
+          {historyLoading ? <p className="library-empty">正在读取本机记录…</p> : history.length ? (
+            <div className="story-history-list">{history.map((item) => (
+              <article key={item.id}>
+                <div className="history-copy"><strong>{item.title}</strong><p>{item.prompt}</p><span>{item.turn_count} 回合 · {item.status === "ended" ? "已结束" : item.status === "blocked" ? "已中断" : "可继续"} · {new Date(item.updated_at).toLocaleString()}</span></div>
+                <div className="history-actions"><button type="button" onClick={() => continueStory(item)} disabled={Boolean(historyBusy)}>{historyBusy === item.id ? "载入中…" : "继续"}</button><button type="button" className="delete-history" onClick={() => setConfirmAction({ type: "delete", session: item })} disabled={Boolean(historyBusy)} aria-label={`删除 ${item.title}`}>删除</button></div>
+              </article>
+            ))}</div>
+          ) : <p className="library-empty">还没有保存的推演。创建后会自动保存在这台设备上。</p>}
+        </section>
       </section>
 
       {modalMessage && (
@@ -130,6 +195,16 @@ function HomePage() {
                 我知道了
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {confirmAction && (
+        <div className="home-modal-overlay" onClick={() => setConfirmAction(null)}>
+          <div className="home-modal" role="alertdialog" aria-modal="true" aria-labelledby="confirm-modal-title" onClick={(event) => event.stopPropagation()}>
+            <div className="home-modal-title" id="confirm-modal-title">{confirmAction.type === "clear" ? "清除全部推演？" : "删除这次推演？"}</div>
+            <div className="home-modal-text">{confirmAction.type === "clear" ? "所有历史推演、人物状态和事件记录都会从本机删除，且无法撤销。" : `“${confirmAction.session.title}”及其全部人物和历史记录会被永久删除。`}</div>
+            <div className="home-modal-actions confirm-actions"><button type="button" className="cancel-confirm" onClick={() => setConfirmAction(null)}>取消</button><button type="button" className="danger-confirm" onClick={runConfirmedAction}>确认删除</button></div>
           </div>
         </div>
       )}

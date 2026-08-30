@@ -24,6 +24,7 @@ from scenechat.preflight import (
     validate_embedding_model_availability,
     validate_generation_model_availability,
 )
+from scenechat.persistence import SessionStore, runtime_session_from_export
 from scenechat.providers import get_simulation_llm
 from scenechat.scenario import (
     ScenarioPackage,
@@ -36,9 +37,18 @@ from scenechat.simulation import simulate_next_event
 from scenechat.storage import save_experiment_documents
 
 app = Flask(__name__)
-CORS(app)
+cors_origins = [
+    item.strip()
+    for item in os.getenv(
+        "SCENECHAT_CORS_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",")
+    if item.strip()
+]
+CORS(app, resources={r"/api/*": {"origins": cors_origins}})
 
 story_sessions: Dict[str, dict] = {}
+session_store = SessionStore(os.getenv("SCENECHAT_DB_PATH", "data/scenechat.db"))
 
 DEFAULT_BATCH_SIZE = 10
 MAX_BATCH_SIZE = 10
@@ -61,6 +71,32 @@ def positive_int_env(name: str, default: int, *, maximum: int) -> int:
 
 
 MAX_TURNS = positive_int_env("SCENECHAT_MAX_TURNS", 120, maximum=1000)
+
+
+def load_story_session(session_id: str) -> dict | None:
+    session = story_sessions.get(session_id)
+    if session is not None:
+        return session
+    try:
+        payload = session_store.load(session_id)
+        if payload is None:
+            return None
+        session = runtime_session_from_export(payload)
+        session["stream_lock"] = threading.Lock()
+        story_sessions[session_id] = session
+        return session
+    except Exception:
+        app.logger.exception("story.restore status=failed session=%s", session_id)
+        return None
+
+
+def persist_story_session(session_id: str, session: dict) -> None:
+    if session.get("deleted"):
+        return
+    try:
+        session_store.save(full_session_export(session_id, session))
+    except Exception:
+        app.logger.exception("story.persist status=failed session=%s", session_id)
 
 
 def error_response(error: SceneChatError):
@@ -356,6 +392,7 @@ def build_story_events(user_prompt: str, scene_override: str, session_id: str):
         "page_requests": {},
         "stream_lock": threading.Lock(),
     }
+    persist_story_session(session_id, story_sessions[session_id])
     yield build_progress_event("storage", "completed")
     app.logger.info("story.start status=completed session=%s", session_id)
     yield {
@@ -510,6 +547,7 @@ def start_story():
             "page_requests": {},
             "stream_lock": threading.Lock(),
         }
+        persist_story_session(session_id, story_sessions[session_id])
         return jsonify(story_ready_payload(session_id, package, state, initial_scene))
 
     except SceneChatError as error:
@@ -590,7 +628,7 @@ def next_story_page_stream():
             "故事会话信息缺失，请返回首页重新开始。",
         )
 
-    session = story_sessions.get(session_id)
+    session = load_story_session(session_id)
     if not session:
         return request_error(
             "session_not_found",
@@ -756,6 +794,7 @@ def next_story_page_stream():
         }
         page_request["done"] = done_event
         page_request["status"] = "completed"
+        persist_story_session(session_id, session)
         yield json.dumps(done_event, ensure_ascii=False) + "\n"
 
     return Response(
@@ -766,7 +805,7 @@ def next_story_page_stream():
 
 @app.route("/api/story/session/<session_id>", methods=["GET"])
 def get_story_session(session_id):
-    session = story_sessions.get(session_id)
+    session = load_story_session(session_id)
     if not session:
         return request_error(
             "session_not_found",
@@ -775,6 +814,24 @@ def get_story_session(session_id):
         )
 
     state: SimulationState = session["state"]
+
+    pages = []
+    completed_requests = [
+        item
+        for item in session.get("page_requests", {}).values()
+        if item.get("status") == "completed"
+    ]
+    for page_request in sorted(completed_requests, key=lambda item: item.get("page") or 0):
+        done = page_request.get("done") or {}
+        pages.append({
+            "page": page_request.get("page"),
+            "messages": list(page_request.get("messages") or []),
+            "isEnd": bool(done.get("isEnd", False)),
+            "endReason": done.get("end_reason", ""),
+            "endKind": done.get("end_kind", ""),
+            "runStatus": done.get("run_status", "running"),
+            "requestId": done.get("request_id"),
+        })
 
     return jsonify({
         "session_id": session_id,
@@ -794,6 +851,7 @@ def get_story_session(session_id):
         "run_status": getattr(state, "run_status", "running"),
         "winner": getattr(state, "winner", ""),
         "public_state": state.public_state_summary(),
+        "pages": pages,
         "agents": [
             {
                 "id": agent.id,
@@ -872,7 +930,7 @@ def full_session_export(session_id: str, session: dict) -> dict:
 
 @app.route("/api/story/session/<session_id>/export", methods=["GET"])
 def export_story_session(session_id):
-    session = story_sessions.get(session_id)
+    session = load_story_session(session_id)
     if not session:
         return request_error(
             "session_not_found",
@@ -898,9 +956,26 @@ def export_story_session(session_id):
 
 @app.route("/api/story/session/<session_id>", methods=["DELETE"])
 def delete_story_session(session_id):
-    """Release an in-memory simulation when the user returns to edit."""
-    deleted = story_sessions.pop(session_id, None) is not None
+    """Delete one user-owned simulation from memory and SQLite."""
+    session = story_sessions.pop(session_id, None)
+    if session is not None:
+        session["deleted"] = True
+    deleted = session_store.delete(session_id) or session is not None
     return jsonify({"session_id": session_id, "deleted": deleted})
+
+
+@app.route("/api/story/sessions", methods=["GET"])
+def list_story_sessions():
+    return jsonify({"sessions": session_store.list()})
+
+
+@app.route("/api/story/sessions", methods=["DELETE"])
+def clear_story_sessions():
+    for session in story_sessions.values():
+        session["deleted"] = True
+    story_sessions.clear()
+    deleted_count = session_store.clear()
+    return jsonify({"deleted_count": deleted_count})
 
 
 if __name__ == "__main__":

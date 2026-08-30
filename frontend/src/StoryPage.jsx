@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { getApiErrorMessage, readApiError } from "./apiErrors";
 import { clearStoryStorage, loadStoredScenario } from "./scenarioStorage";
-import { deleteStorySession, fetchStoryExport, fetchStorySession } from "./storyApi";
+import { fetchStoryExport, fetchStorySession } from "./storyApi";
 import { loadPageIndex, loadStoryPages } from "./storyStorage";
 import "./StoryPage.css";
 
@@ -57,6 +57,7 @@ function StoryPage() {
   const [pausedPage, setPausedPage] = useState(null);
   const [errorMessage, setErrorMessage] = useState("");
   const [showQuitModal, setShowQuitModal] = useState(false);
+  const [selectedCharacterId, setSelectedCharacterId] = useState("");
   const [skipToken, setSkipToken] = useState(0);
   const [autoAdvance, setAutoAdvance] = useState(false);
   const [batchSize, setBatchSize] = useState(() => Number(localStorage.getItem("story_batch_size")) || 6);
@@ -68,7 +69,15 @@ function StoryPage() {
 
   const currentPage = pages[currentPageIndex] || { page: 1, messages: [], isEnd: false };
   const scenario = snapshot.scenario || storedScenario;
-  const agents = snapshot.agents || scenario.characters || [];
+  const agents = useMemo(() => {
+    const publicCharacters = scenario.characters || [];
+    const runtimeAgents = snapshot.agents?.length ? snapshot.agents : publicCharacters;
+    return runtimeAgents.map((agent) => ({
+      ...publicCharacters.find((character) => character.id === agent.id || character.name === agent.name),
+      ...agent,
+    }));
+  }, [scenario.characters, snapshot.agents]);
+  const selectedCharacter = agents.find((agent) => (agent.id || agent.name) === selectedCharacterId);
 
   useEffect(() => { localStorage.setItem("story_pages", JSON.stringify(pages)); }, [pages]);
   useEffect(() => { localStorage.setItem("current_page_index", String(currentPageIndex)); }, [currentPageIndex]);
@@ -188,7 +197,6 @@ function StoryPage() {
 
   const confirmQuit = async () => {
     streamAbortRef.current?.abort();
-    await deleteStorySession(sessionId);
     clearStoryStorage(localStorage);
     navigate("/", { replace: true });
   };
@@ -225,11 +233,11 @@ function StoryPage() {
       </header>
 
       <section className="mobile-context">
-        <details><summary>角色与世界状态</summary><div className="mobile-panels"><Roster agents={agents} /><WorldPanel entries={visibleWorldState} scenario={scenario} /></div></details>
+        <details><summary>角色与世界状态</summary><div className="mobile-panels"><Roster agents={agents} onSelect={(agent) => setSelectedCharacterId(agent.id || agent.name)} /><WorldPanel entries={visibleWorldState} scenario={scenario} /></div></details>
       </section>
 
       <div className="simulation-grid">
-        <aside className="sim-sidebar left-panel"><Roster agents={agents} /></aside>
+        <aside className="sim-sidebar left-panel"><Roster agents={agents} onSelect={(agent) => setSelectedCharacterId(agent.id || agent.name)} /></aside>
 
         <section className="timeline-panel">
           <div className="timeline-context"><span>第 {currentPage.page || 1} 幕</span><p>{scene || scenario.brief?.premise || prompt}</p></div>
@@ -256,13 +264,14 @@ function StoryPage() {
         </aside>
       </div>
 
-      {showQuitModal ? <div className="quit-modal-overlay" onClick={() => setShowQuitModal(false)}><div className="quit-modal" role="dialog" aria-modal="true" aria-labelledby="quit-title" onClick={(event) => event.stopPropagation()}><h2 id="quit-title">退出这次模拟？</h2><p>当前浏览器中的场景和已生成内容将被清除。</p><div><button type="button" onClick={() => setShowQuitModal(false)}>继续留在这里</button><button type="button" className="danger" onClick={confirmQuit}>退出并清除</button></div></div></div> : null}
+      {showQuitModal ? <div className="quit-modal-overlay" onClick={() => setShowQuitModal(false)}><div className="quit-modal" role="dialog" aria-modal="true" aria-labelledby="quit-title" onClick={(event) => event.stopPropagation()}><h2 id="quit-title">保存并退出？</h2><p>已经完成的推演会保存在本机历史中，之后可以继续。</p><div><button type="button" onClick={() => setShowQuitModal(false)}>继续留在这里</button><button type="button" className="primary-exit" onClick={confirmQuit}>保存并退出</button></div></div></div> : null}
+      {selectedCharacter ? <div className="character-modal-overlay" onClick={() => setSelectedCharacterId("")}><section className="character-modal" role="dialog" aria-modal="true" aria-labelledby="character-modal-title" onClick={(event) => event.stopPropagation()} style={{ "--role-color": roleColor(selectedCharacter.name) }}><button type="button" className="character-modal-close" onClick={() => setSelectedCharacterId("")} aria-label="关闭人物详情">×</button><div className="character-modal-avatar">{selectedCharacter.name?.slice(0, 1)}</div><span className="character-modal-eyebrow">PUBLIC CHARACTER PROFILE</span><h2 id="character-modal-title">{selectedCharacter.name}</h2><strong>{selectedCharacter.public_identity || selectedCharacter.public_profile || "参与者"}</strong><dl><div><dt>公开背景</dt><dd>{selectedCharacter.public_background || "暂无额外公开背景。"}</dd></div><div><dt>形象与特征</dt><dd>{selectedCharacter.public_traits || "暂无额外公开特征。"}</dd></div><div><dt>当前位置</dt><dd>{selectedCharacter.current_location || selectedCharacter.initial_location || "场景中"}</dd></div><div><dt>当前状态</dt><dd>{selectedCharacter.alive === false ? "已离场" : selectedCharacter.active === false ? "暂不可行动" : "在场并可行动"}</dd></div></dl>{selectedCharacter.has_private_context ? <p className="private-context-note">此人物还有仅供自身与导演使用的私密动机，公开详情不会泄露这些内容。</p> : null}</section></div> : null}
     </main>
   );
 }
 
-function Roster({ agents }) {
-  return <section className="roster-panel"><div className="panel-heading"><span>CAST</span><h2>角色阵容</h2></div><div className="roster-list">{agents.map((agent) => <article className={!agent.active || agent.alive === false ? "inactive" : ""} key={agent.id || agent.name} style={{ "--role-color": roleColor(agent.name) }}><div className="roster-avatar">{agent.name?.slice(0, 1)}</div><div><strong>{agent.name}</strong><small>{agent.public_identity || agent.public_profile || "参与者"}</small><span>{agent.alive === false ? "已离场" : agent.current_location || agent.initial_location || "场景中"}</span></div></article>)}</div></section>;
+function Roster({ agents, onSelect }) {
+  return <section className="roster-panel"><div className="panel-heading"><span>CAST</span><h2>角色阵容</h2></div><div className="roster-list">{agents.map((agent) => <button type="button" className={`roster-card ${!agent.active || agent.alive === false ? "inactive" : ""}`} key={agent.id || agent.name} style={{ "--role-color": roleColor(agent.name) }} onClick={() => onSelect(agent)}><div className="roster-avatar">{agent.name?.slice(0, 1)}</div><div><strong>{agent.name}</strong><small>{agent.public_identity || agent.public_profile || "参与者"}</small><span>{agent.alive === false ? "已离场" : agent.current_location || agent.initial_location || "场景中"}</span></div><b aria-hidden="true">›</b></button>)}</div></section>;
 }
 
 function WorldPanel({ entries, scenario }) {

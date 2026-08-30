@@ -54,6 +54,23 @@ export async function fetchStorySession(sessionId) {
   return response.json();
 }
 
+export async function listStorySessions() {
+  const response = await fetch("/api/story/sessions");
+  if (!response.ok) {
+    throw new Error(await readApiError(response, "读取历史推演失败。"));
+  }
+  const payload = await response.json();
+  return payload.sessions || [];
+}
+
+export async function clearStorySessions() {
+  const response = await fetch("/api/story/sessions", { method: "DELETE" });
+  if (!response.ok) {
+    throw new Error(await readApiError(response, "清除历史推演失败。"));
+  }
+  return response.json();
+}
+
 export async function fetchStoryExport(sessionId) {
   const response = await fetch(`/api/story/session/${encodeURIComponent(sessionId)}/export`);
   if (!response.ok) {
@@ -69,7 +86,11 @@ export async function fetchStoryExport(sessionId) {
 
 export async function deleteStorySession(sessionId) {
   if (!sessionId) return;
-  await fetch(`/api/story/session/${encodeURIComponent(sessionId)}`, {
+  const response = await fetch(`/api/story/session/${encodeURIComponent(sessionId)}`, {
     method: "DELETE",
   });
+  if (!response.ok) {
+    throw new Error(await readApiError(response, "删除推演失败。"));
+  }
+  return response.json();
 }
