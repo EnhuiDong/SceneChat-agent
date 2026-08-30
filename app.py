@@ -24,7 +24,7 @@ from scenechat.preflight import (
     validate_embedding_model_availability,
     validate_generation_model_availability,
 )
-from scenechat.persistence import SessionStore, runtime_session_from_export
+from scenechat.persistence import SCHEMA_VERSION, SessionStore, runtime_session_from_export
 from scenechat.providers import get_simulation_llm
 from scenechat.scenario import (
     ScenarioPackage,
@@ -83,6 +83,7 @@ def load_story_session(session_id: str) -> dict | None:
             return None
         session = runtime_session_from_export(payload)
         session["stream_lock"] = threading.Lock()
+        session["operation_lock"] = threading.Lock()
         story_sessions[session_id] = session
         return session
     except Exception:
@@ -234,6 +235,7 @@ def story_ready_payload(
         "session_id": session_id,
         "page": 0,
         "isEnd": False,
+        "revision": state.revision,
         "max_turns": MAX_TURNS,
         "worldview": package.public_worldview_markdown,
         "characters": package.public_characters_markdown,
@@ -391,6 +393,7 @@ def build_story_events(user_prompt: str, scene_override: str, session_id: str):
         "ended": False,
         "page_requests": {},
         "stream_lock": threading.Lock(),
+        "operation_lock": threading.Lock(),
     }
     persist_story_session(session_id, story_sessions[session_id])
     yield build_progress_event("storage", "completed")
@@ -546,6 +549,7 @@ def start_story():
             "ended": False,
             "page_requests": {},
             "stream_lock": threading.Lock(),
+            "operation_lock": threading.Lock(),
         }
         persist_story_session(session_id, story_sessions[session_id])
         return jsonify(story_ready_payload(session_id, package, state, initial_scene))
@@ -657,6 +661,13 @@ def next_story_page_stream():
         expected_page = int(expected_page) if expected_page is not None else session["page"] + 1
     except (TypeError, ValueError):
         return request_error("page_number_invalid", "页面序号无效，请同步会话后重试。")
+    expected_revision = data.get("expected_revision")
+    try:
+        expected_revision = (
+            int(expected_revision) if expected_revision is not None else None
+        )
+    except (TypeError, ValueError):
+        return request_error("state_revision_invalid", "状态版本无效，请同步会话后重试。")
 
     batch_size = data.get("batch_size", DEFAULT_BATCH_SIZE)
     try:
@@ -670,6 +681,7 @@ def next_story_page_stream():
     simulation_llm = session.get("simulation_llm")
     page_requests = session.setdefault("page_requests", {})
     stream_lock = session.setdefault("stream_lock", threading.Lock())
+    operation_lock = session.setdefault("operation_lock", threading.Lock())
     with stream_lock:
         page_request = page_requests.get(request_id)
         if page_request is not None and page_request["status"] == "in_progress":
@@ -678,7 +690,21 @@ def next_story_page_stream():
                 "当前页面仍在生成，请稍候；不要重复推进。",
                 status_code=409,
             )
+        if page_request is not None and page_request["status"] == "completed":
+            return replay_page_response(page_request, session_id)
+        if operation_lock.locked():
+            return request_error(
+                "session_operation_in_progress",
+                "当前会话正在执行另一项操作，请等待本幕完成后重试。",
+                status_code=409,
+            )
         if page_request is None:
+            if expected_revision is not None and expected_revision != getattr(state, "revision", 0):
+                return request_error(
+                    "state_revision_conflict",
+                    "剧情状态已经更新，请同步最新内容后再继续。",
+                    status_code=409,
+                )
             if expected_page != session["page"] + 1:
                 return request_error(
                     "page_state_conflict",
@@ -694,11 +720,16 @@ def next_story_page_stream():
                 "done": None,
             }
             page_requests[request_id] = page_request
-        elif page_request["status"] == "completed":
-            return replay_page_response(page_request, session_id)
         else:
             # A retryable request resumes after its already committed messages.
             page_request["status"] = "in_progress"
+        if not operation_lock.acquire(blocking=False):
+            page_request["status"] = "retryable"
+            return request_error(
+                "session_operation_in_progress",
+                "当前会话正在执行另一项操作，请稍后重试。",
+                status_code=409,
+            )
 
     next_page_number = page_request["page"]
 
@@ -711,6 +742,7 @@ def next_story_page_stream():
             "session_id": session_id,
             "request_id": request_id,
             "resumed_count": len(page_request["messages"]),
+            "revision": getattr(state, "revision", 0),
         }, ensure_ascii=False) + "\n"
 
         for cached_message in page_request["messages"]:
@@ -791,14 +823,22 @@ def next_story_page_stream():
                     "已达到安全轮次上限。" if state.turn_count >= MAX_TURNS else ""
                 )
             ),
+            "revision": getattr(state, "revision", 0),
         }
         page_request["done"] = done_event
         page_request["status"] = "completed"
         persist_story_session(session_id, session)
         yield json.dumps(done_event, ensure_ascii=False) + "\n"
 
+    def locked_generate():
+        try:
+            yield from generate()
+        finally:
+            if operation_lock.locked():
+                operation_lock.release()
+
     return Response(
-        stream_with_context(generate()),
+        stream_with_context(locked_generate()),
         mimetype="application/x-ndjson"
     )
 
@@ -843,6 +883,13 @@ def get_story_session(session_id):
         "characters": session["public_characters"],
         "scenario": public_scenario_payload(session["scenario"], state),
         "max_turns": MAX_TURNS,
+        "revision": state.revision,
+        "arc_state": {
+            "pace": state.arc_state.pace,
+            "progress": state.arc_state.progress,
+            "tension": state.arc_state.tension,
+            "target_end_turn": state.arc_state.target_end_turn,
+        },
         "turn_count": state.turn_count,
         "current_phase": state.current_phase,
         "world_state": state.public_world_state(),
@@ -883,7 +930,7 @@ def full_session_export(session_id: str, session: dict) -> dict:
         })
 
     return {
-        "schema_version": 1,
+        "schema_version": SCHEMA_VERSION,
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "session": {
             "id": session_id,
@@ -902,6 +949,7 @@ def full_session_export(session_id: str, session: dict) -> dict:
             "public_characters_markdown": package.public_characters_markdown,
         },
         "simulation": {
+            "revision": state.revision,
             "turn_count": state.turn_count,
             "agent_turn_count": state.agent_turn_count,
             "narration_count": state.narration_count,
@@ -919,6 +967,8 @@ def full_session_export(session_id: str, session: dict) -> dict:
             "failed_generation_count": state.failed_generation_count,
             "votes": state.votes,
             "pending_events": state.pending_events,
+            "interventions": [asdict(item) for item in state.interventions],
+            "arc_state": asdict(state.arc_state),
             "protected_agents": sorted(state.protected_agents),
             "agent_order": state.agent_order,
             "agents": [asdict(agent) for agent in state.agents.values()],

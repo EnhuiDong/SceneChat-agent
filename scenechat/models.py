@@ -10,6 +10,114 @@ MAX_AGENT_OBSERVATIONS = 30
 
 
 @dataclass
+class Intervention:
+    """Persisted director input; applying it remains a separate validated step."""
+
+    raw_text: str
+    mode: str
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    scope: str = "next_scene"
+    created_at_turn: int = 0
+    effective_after_turn: int = 0
+    status: str = "preview"
+    normalized_directive: str = ""
+    conflicts: List[Dict[str, Any]] = field(default_factory=list)
+    proposed_patch: List[Dict[str, Any]] = field(default_factory=list)
+    expires_after_turns: int | None = 1
+    applied_at_turn: int | None = None
+
+    @classmethod
+    def from_mapping(cls, data: Dict[str, Any]) -> "Intervention":
+        mode = str(data.get("mode") or "guidance")
+        if mode not in {"guidance", "event", "override"}:
+            mode = "guidance"
+        scope = str(data.get("scope") or "next_scene")
+        if scope not in {"next_scene", "turns", "persistent"}:
+            scope = "next_scene"
+        status = str(data.get("status") or "preview")
+        if status not in {"preview", "pending", "applied", "cancelled", "rejected"}:
+            status = "preview"
+
+        def optional_int(key: str, default: int | None) -> int | None:
+            raw_value = data.get(key, default)
+            if raw_value in (None, ""):
+                return None
+            try:
+                return max(0, int(raw_value))
+            except (TypeError, ValueError):
+                return default
+
+        return cls(
+            id=str(data.get("id") or uuid.uuid4().hex),
+            raw_text=str(data.get("raw_text") or "").strip(),
+            mode=mode,
+            scope=scope,
+            created_at_turn=optional_int("created_at_turn", 0) or 0,
+            effective_after_turn=optional_int("effective_after_turn", 0) or 0,
+            status=status,
+            normalized_directive=str(data.get("normalized_directive") or "").strip(),
+            conflicts=[
+                item for item in data.get("conflicts") or [] if isinstance(item, dict)
+            ],
+            proposed_patch=[
+                item for item in data.get("proposed_patch") or [] if isinstance(item, dict)
+            ],
+            expires_after_turns=optional_int("expires_after_turns", 1),
+            applied_at_turn=optional_int("applied_at_turn", None),
+        )
+
+
+@dataclass
+class ArcState:
+    """Future-facing pacing state; progress is measured separately from pace."""
+
+    pace: int = 50
+    progress: float = 0.0
+    tension: float = 0.0
+    target_end_turn: int | None = None
+    turns_since_progress: int = 0
+    active_beat_ids: List[str] = field(default_factory=list)
+    resolved_beat_ids: List[str] = field(default_factory=list)
+    skipped_beat_ids: List[str] = field(default_factory=list)
+
+    @classmethod
+    def from_mapping(cls, data: Dict[str, Any] | None) -> "ArcState":
+        source = data if isinstance(data, dict) else {}
+        try:
+            pace = max(0, min(int(source.get("pace", 50)), 100))
+        except (TypeError, ValueError):
+            pace = 50
+
+        def bounded_float(key: str) -> float:
+            try:
+                return max(0.0, min(float(source.get(key, 0.0)), 1.0))
+            except (TypeError, ValueError):
+                return 0.0
+
+        raw_target = source.get("target_end_turn")
+        try:
+            target = int(raw_target) if raw_target not in (None, "") else None
+        except (TypeError, ValueError):
+            target = None
+        try:
+            turns_since_progress = max(
+                0, int(source.get("turns_since_progress", 0) or 0)
+            )
+        except (TypeError, ValueError):
+            turns_since_progress = 0
+        return cls(
+            pace=pace,
+            progress=bounded_float("progress"),
+            tension=bounded_float("tension"),
+            target_end_turn=target,
+            turns_since_progress=turns_since_progress,
+            active_beat_ids=[str(item) for item in source.get("active_beat_ids") or []],
+            resolved_beat_ids=[str(item) for item in source.get("resolved_beat_ids") or []],
+            skipped_beat_ids=[str(item) for item in source.get("skipped_beat_ids") or []],
+        )
+
+
+@dataclass
 class Message:
     speaker: str
     action: str
@@ -171,6 +279,7 @@ class SimulationState:
         self.turn_count = 0
         self.agent_turn_count = 0
         self.narration_count = 0
+        self.revision = 0
         self._scheduler_index = 0
         self.world_spec = world_spec
         self.phase_sequence = list(getattr(world_spec, "phases", []) or [])
@@ -198,6 +307,8 @@ class SimulationState:
         self.phase_action_log: set[str] = set()
         self.votes: Dict[str, str] = {}
         self.pending_events: List[Dict[str, Any]] = []
+        self.interventions: List[Intervention] = []
+        self.arc_state = ArcState()
         self.protected_agents: set[str] = set()
         self.failed_generation_count = 0
         self.run_status = "running"
@@ -266,6 +377,19 @@ class SimulationState:
             self.run_status = "ended"
 
         self.evaluate_termination()
+        self.bump_revision()
+
+    def bump_revision(self) -> int:
+        self.revision += 1
+        return self.revision
+
+    def register_intervention(self, intervention: Intervention) -> None:
+        self.interventions.append(intervention)
+        self.bump_revision()
+
+    def set_pace(self, value: int) -> None:
+        self.arc_state.pace = max(0, min(int(value), 100))
+        self.bump_revision()
 
     def _agent_can_observe(self, agent: AgentState, msg: Message) -> bool:
         if agent.name in msg.individual_observations:

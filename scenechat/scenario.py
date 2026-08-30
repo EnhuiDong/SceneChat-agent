@@ -376,6 +376,38 @@ class TerminationRule:
 
 
 @dataclass
+class BeatSpec:
+    """A stable story milestone that pacing can track without forcing choices."""
+
+    id: str
+    description: str
+    required: bool = False
+    weight: int = 1
+    prerequisites: list[str] = field(default_factory=list)
+    phase_hint: str = ""
+    resolution_signals: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_value(cls, value: Any, index: int) -> "BeatSpec":
+        if isinstance(value, str):
+            return cls(id=f"beat-{index}", description=_text(value))
+        data = value if isinstance(value, dict) else {}
+        try:
+            weight = max(1, min(int(data.get("weight", 1)), 10))
+        except (TypeError, ValueError):
+            weight = 1
+        return cls(
+            id=_text(data.get("id"), f"beat-{index}"),
+            description=_text(data.get("description")),
+            required=bool(data.get("required", False)),
+            weight=weight,
+            prerequisites=_string_list(data.get("prerequisites")),
+            phase_hint=_text(data.get("phase_hint")),
+            resolution_signals=_string_list(data.get("resolution_signals")),
+        )
+
+
+@dataclass
 class WorldSpec:
     title: str
     opening_scene: str
@@ -387,6 +419,7 @@ class WorldSpec:
     termination_conditions: list[str] = field(default_factory=list)
     fixed_canon: list[str] = field(default_factory=list)
     target_beats: list[str] = field(default_factory=list)
+    beat_specs: list[BeatSpec] = field(default_factory=list)
     covered_constraint_ids: list[str] = field(default_factory=list)
     locations: list[str] = field(default_factory=list)
     facts: list[FactSpec] = field(default_factory=list)
@@ -395,6 +428,15 @@ class WorldSpec:
     phase_specs: list[PhaseSpec] = field(default_factory=list)
     rules: list[RuleSpec] = field(default_factory=list)
     termination_rules: list[TerminationRule] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.beat_specs and self.target_beats:
+            self.beat_specs = [
+                BeatSpec.from_value(item, index)
+                for index, item in enumerate(self.target_beats, start=1)
+            ]
+        if not self.target_beats and self.beat_specs:
+            self.target_beats = [beat.description for beat in self.beat_specs]
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> "WorldSpec":
@@ -423,6 +465,13 @@ class WorldSpec:
             for key, value in (data.get("state_schema") or {}).items()
             if _text(key)
         } if isinstance(data.get("state_schema"), dict) else {}
+        target_beats = _string_list(data.get("target_beats"))
+        raw_beat_specs = data.get("beat_specs") or target_beats
+        beat_specs = [
+            BeatSpec.from_value(item, index)
+            for index, item in enumerate(raw_beat_specs, start=1)
+            if isinstance(item, (str, dict))
+        ]
         return cls(
             title=_text(data.get("title"), "未命名互动场景"),
             opening_scene=_text(data.get("opening_scene")),
@@ -433,7 +482,8 @@ class WorldSpec:
             initial_state=_state_dict(data.get("initial_state")),
             termination_conditions=_string_list(data.get("termination_conditions")),
             fixed_canon=_string_list(data.get("fixed_canon")),
-            target_beats=_string_list(data.get("target_beats")),
+            target_beats=target_beats,
+            beat_specs=beat_specs,
             covered_constraint_ids=_string_list(data.get("covered_constraint_ids")),
             locations=_string_list(data.get("locations")),
             facts=[
@@ -745,6 +795,8 @@ def normalize_scenario_phase_references(package: ScenarioPackage) -> None:
         phase_spec.next_phase = resolve(phase_spec.next_phase)
     for rule in package.world.rules:
         rule.phases = [resolve(phase) for phase in rule.phases]
+    for beat in package.world.beat_specs:
+        beat.phase_hint = resolve(beat.phase_hint) if beat.phase_hint else ""
 
     def normalize_termination(rule: TerminationRule) -> None:
         rule.phases = [resolve(phase) for phase in rule.phases]
@@ -839,6 +891,39 @@ def validate_scenario_package(package: ScenarioPackage) -> list[str]:
     fact_ids = [fact.id for fact in package.world.facts]
     if len(set(fact_ids)) != len(fact_ids):
         issues.append("世界事实 ID 不唯一")
+
+    beat_ids = [beat.id for beat in package.world.beat_specs]
+    if len(set(beat_ids)) != len(beat_ids):
+        issues.append("剧情节拍 ID 不唯一")
+    known_beat_ids = set(beat_ids)
+    for beat in package.world.beat_specs:
+        if not beat.description:
+            issues.append(f"剧情节拍“{beat.id}”缺少描述")
+        unknown_prerequisites = set(beat.prerequisites) - known_beat_ids
+        if unknown_prerequisites:
+            issues.append(f"剧情节拍“{beat.id}”引用未知前置节拍")
+        if beat.phase_hint and beat.phase_hint not in package.world.phases:
+            issues.append(f"剧情节拍“{beat.id}”引用未知阶段")
+    beat_dependencies = {
+        beat.id: [item for item in beat.prerequisites if item in known_beat_ids]
+        for beat in package.world.beat_specs
+    }
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def has_beat_cycle(beat_id: str) -> bool:
+        if beat_id in visiting:
+            return True
+        if beat_id in visited:
+            return False
+        visiting.add(beat_id)
+        cycle = any(has_beat_cycle(item) for item in beat_dependencies.get(beat_id, []))
+        visiting.remove(beat_id)
+        visited.add(beat_id)
+        return cycle
+
+    if any(has_beat_cycle(beat_id) for beat_id in beat_dependencies):
+        issues.append("剧情节拍的前置关系存在循环依赖")
 
     valid_termination_kinds = {
         "faction_eliminated",

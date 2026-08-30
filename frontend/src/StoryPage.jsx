@@ -51,7 +51,7 @@ function StoryPage() {
   const initialPages = useMemo(() => loadStoryPages(localStorage), []);
   const [pages, setPages] = useState(initialPages);
   const [currentPageIndex, setCurrentPageIndex] = useState(() => loadPageIndex(localStorage, initialPages.length));
-  const [snapshot, setSnapshot] = useState({ scenario: storedScenario, agents: storedScenario.characters || [], world_state: storedScenario.initial_state || {}, current_phase: storedScenario.phases?.[0] || "准备", turn_count: 0, run_status: "running" });
+  const [snapshot, setSnapshot] = useState({ scenario: storedScenario, agents: storedScenario.characters || [], world_state: storedScenario.initial_state || {}, current_phase: storedScenario.phases?.[0] || "准备", turn_count: 0, revision: 0, run_status: "running" });
   const [isGenerating, setIsGenerating] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [pausedPage, setPausedPage] = useState(null);
@@ -122,7 +122,7 @@ function StoryPage() {
       const response = await fetch("/api/story/next-stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: sessionId, batch_size: batchSize, request_id: requestId, expected_page: pageNumber }),
+        body: JSON.stringify({ session_id: sessionId, batch_size: batchSize, request_id: requestId, expected_page: pageNumber, expected_revision: snapshot.revision }),
         signal: controller.signal,
       });
       if (!response.ok) throw new Error(await readApiError(response, "继续推演失败，请稍后重试。"));
@@ -167,7 +167,7 @@ function StoryPage() {
       streamAbortRef.current = null;
       setIsGenerating(false);
     }
-  }, [batchSize, isGenerating, pages, sessionId, syncSnapshot]);
+  }, [batchSize, isGenerating, pages, sessionId, snapshot.revision, syncSnapshot]);
 
   useEffect(() => {
     if (!sessionId || pages.length || initialRunRef.current) return;

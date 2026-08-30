@@ -8,11 +8,19 @@ from pathlib import Path
 from typing import Any
 
 from .knowledge import ExperimentKnowledgeBase, build_knowledge_documents
-from .models import AbilityState, AgentState, MemoryRecord, Message, SimulationState
+from .models import (
+    AbilityState,
+    AgentState,
+    ArcState,
+    Intervention,
+    MemoryRecord,
+    Message,
+    SimulationState,
+)
 from .scenario import CharacterSpec, ScenarioBrief, ScenarioPackage, WorldSpec
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def utc_now() -> str:
@@ -56,6 +64,7 @@ class SessionStore:
                 "CREATE INDEX IF NOT EXISTS idx_story_sessions_updated_at "
                 "ON story_sessions(updated_at DESC)"
             )
+            connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     def save(self, payload: dict[str, Any]) -> None:
         session = payload["session"]
@@ -183,6 +192,7 @@ def state_from_dict(
     state.turn_count = int(data.get("turn_count", len(state.history)))
     state.agent_turn_count = int(data.get("agent_turn_count", 0))
     state.narration_count = int(data.get("narration_count", 0))
+    state.revision = int(data.get("revision", state.turn_count))
     state._scheduler_index = int(data.get("scheduler_index", 0))
     state.current_phase = str(data.get("current_phase") or state.current_phase)
     state.phase_action_log = set(data.get("phase_action_log") or [])
@@ -199,6 +209,12 @@ def state_from_dict(
     state.failed_generation_count = int(data.get("failed_generation_count", 0))
     state.votes = dict(data.get("votes") or {})
     state.pending_events = list(data.get("pending_events") or [])
+    state.interventions = [
+        Intervention.from_mapping(item)
+        for item in data.get("interventions") or []
+        if isinstance(item, dict)
+    ]
+    state.arc_state = ArcState.from_mapping(data.get("arc_state"))
     state.protected_agents = set(data.get("protected_agents") or [])
     requested_order = [str(item) for item in data.get("agent_order") or []]
     state.agent_order = [name for name in requested_order if name in state.agents]
