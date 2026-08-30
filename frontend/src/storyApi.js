@@ -54,6 +54,19 @@ export async function fetchStorySession(sessionId) {
   return response.json();
 }
 
+export async function fetchStoryExport(sessionId) {
+  const response = await fetch(`/api/story/session/${encodeURIComponent(sessionId)}/export`);
+  if (!response.ok) {
+    throw new Error(await readApiError(response, "导出完整档案失败。"));
+  }
+  const disposition = response.headers.get("content-disposition") || "";
+  const match = disposition.match(/filename="?([^";]+)"?/i);
+  return {
+    blob: await response.blob(),
+    filename: match?.[1] || `scenechat-${sessionId}.json`,
+  };
+}
+
 export async function deleteStorySession(sessionId) {
   if (!sessionId) return;
   await fetch(`/api/story/session/${encodeURIComponent(sessionId)}`, {

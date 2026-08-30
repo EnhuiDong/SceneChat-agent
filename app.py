@@ -1,8 +1,10 @@
 import uuid
 import json
+import os
 import threading
 import time
 from dataclasses import asdict
+from datetime import datetime, timezone
 from typing import Dict
 
 from flask import Flask, jsonify, request, Response, stream_with_context
@@ -40,7 +42,25 @@ story_sessions: Dict[str, dict] = {}
 
 DEFAULT_BATCH_SIZE = 10
 MAX_BATCH_SIZE = 10
-MAX_TURNS = 30
+
+
+def positive_int_env(name: str, default: int, *, maximum: int) -> int:
+    """Read a bounded positive integer without making startup fragile."""
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError:
+        app.logger.warning("config.invalid name=%s value=%r fallback=%s", name, raw_value, default)
+        return default
+    if value < 1 or value > maximum:
+        app.logger.warning("config.out_of_range name=%s value=%s fallback=%s", name, value, default)
+        return default
+    return value
+
+
+MAX_TURNS = positive_int_env("SCENECHAT_MAX_TURNS", 120, maximum=1000)
 
 
 def error_response(error: SceneChatError):
@@ -178,6 +198,7 @@ def story_ready_payload(
         "session_id": session_id,
         "page": 0,
         "isEnd": False,
+        "max_turns": MAX_TURNS,
         "worldview": package.public_worldview_markdown,
         "characters": package.public_characters_markdown,
         "scene": scene,
@@ -320,6 +341,7 @@ def build_story_events(user_prompt: str, scene_override: str, session_id: str):
         ),
     )
     story_sessions[session_id] = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "prompt": user_prompt,
         "scene": initial_scene,
         "worldview": public_worldview,
@@ -473,6 +495,7 @@ def start_story():
         )
         public_characters = package.public_characters_markdown
         story_sessions[session_id] = {
+            "created_at": datetime.now(timezone.utc).isoformat(),
             "prompt": user_prompt,
             "scene": initial_scene,
             "worldview": public_worldview,
@@ -762,6 +785,7 @@ def get_story_session(session_id):
         "worldview": session["scenario"].public_worldview_markdown,
         "characters": session["public_characters"],
         "scenario": public_scenario_payload(session["scenario"], state),
+        "max_turns": MAX_TURNS,
         "turn_count": state.turn_count,
         "current_phase": state.current_phase,
         "world_state": state.public_world_state(),
@@ -783,6 +807,93 @@ def get_story_session(session_id):
         ],
         "history": [message_to_frontend(msg) for msg in state.history],
     })
+
+
+def full_session_export(session_id: str, session: dict) -> dict:
+    """Build an explicit owner export, including private scenario and agent state."""
+    state: SimulationState = session["state"]
+    package: ScenarioPackage = session["scenario"]
+    page_requests = []
+    for request_id, page_request in session.get("page_requests", {}).items():
+        page_requests.append({
+            "request_id": request_id,
+            "page": page_request.get("page"),
+            "status": page_request.get("status"),
+            "batch_size": page_request.get("batch_size"),
+            "messages": list(page_request.get("messages", [])),
+            "done": page_request.get("done"),
+        })
+
+    return {
+        "schema_version": 1,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "session": {
+            "id": session_id,
+            "created_at": session.get("created_at", ""),
+            "prompt": session["prompt"],
+            "scene": session["scene"],
+            "page": session["page"],
+            "ended": session["ended"],
+            "max_turns": MAX_TURNS,
+        },
+        "scenario": package.to_dict(),
+        "documents": {
+            "worldview_markdown": package.worldview_markdown,
+            "characters_markdown": package.characters_markdown,
+            "public_worldview_markdown": package.public_worldview_markdown,
+            "public_characters_markdown": package.public_characters_markdown,
+        },
+        "simulation": {
+            "turn_count": state.turn_count,
+            "agent_turn_count": state.agent_turn_count,
+            "narration_count": state.narration_count,
+            "scheduler_index": state._scheduler_index,
+            "current_phase": state.current_phase,
+            "phase_action_log": sorted(state.phase_action_log),
+            "world_state": state.world_state,
+            "public_rules": state.public_rules,
+            "termination_conditions": state.termination_conditions,
+            "ended": state.ended,
+            "end_reason": state.end_reason,
+            "end_kind": state.end_kind,
+            "winner": state.winner,
+            "run_status": state.run_status,
+            "failed_generation_count": state.failed_generation_count,
+            "votes": state.votes,
+            "pending_events": state.pending_events,
+            "protected_agents": sorted(state.protected_agents),
+            "agent_order": state.agent_order,
+            "agents": [asdict(agent) for agent in state.agents.values()],
+            "history": [asdict(message) for message in state.history],
+        },
+        "page_requests": page_requests,
+    }
+
+
+@app.route("/api/story/session/<session_id>/export", methods=["GET"])
+def export_story_session(session_id):
+    session = story_sessions.get(session_id)
+    if not session:
+        return request_error(
+            "session_not_found",
+            "故事会话不存在或已经失效，无法导出。",
+            status_code=404,
+        )
+
+    content = json.dumps(
+        full_session_export(session_id, session),
+        ensure_ascii=False,
+        indent=2,
+    )
+    return Response(
+        content,
+        mimetype="application/json",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="scenechat-{session_id}.json"'
+            )
+        },
+    )
 
 
 @app.route("/api/story/session/<session_id>", methods=["DELETE"])

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { getApiErrorMessage, readApiError } from "./apiErrors";
 import { clearStoryStorage, loadStoredScenario } from "./scenarioStorage";
-import { deleteStorySession, fetchStorySession } from "./storyApi";
+import { deleteStorySession, fetchStoryExport, fetchStorySession } from "./storyApi";
 import { loadPageIndex, loadStoryPages } from "./storyStorage";
 import "./StoryPage.css";
 
@@ -53,6 +53,7 @@ function StoryPage() {
   const [currentPageIndex, setCurrentPageIndex] = useState(() => loadPageIndex(localStorage, initialPages.length));
   const [snapshot, setSnapshot] = useState({ scenario: storedScenario, agents: storedScenario.characters || [], world_state: storedScenario.initial_state || {}, current_phase: storedScenario.phases?.[0] || "准备", turn_count: 0, run_status: "running" });
   const [isGenerating, setIsGenerating] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
   const [pausedPage, setPausedPage] = useState(null);
   const [errorMessage, setErrorMessage] = useState("");
   const [showQuitModal, setShowQuitModal] = useState(false);
@@ -192,13 +193,34 @@ function StoryPage() {
     navigate("/", { replace: true });
   };
 
+  const exportStory = async () => {
+    if (!sessionId || isExporting) return;
+    setIsExporting(true);
+    setErrorMessage("");
+    try {
+      const { blob, filename } = await fetchStoryExport(sessionId);
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      setErrorMessage(error.message || "导出完整档案失败。");
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
   const visibleWorldState = Object.entries(snapshot.world_state || scenario.initial_state || {});
 
   return (
     <main className="simulation-page">
       <header className="simulation-header">
         <div><span className="sim-eyebrow">LIVE SIMULATION</span><h1>{scenario.title || "场景模拟"}</h1></div>
-        <div className="sim-status-strip"><span><i className={isGenerating ? "live" : ""} />{isGenerating ? "推演中" : pausedPage ? "已暂停" : currentPage.isEnd ? "已结束" : "等待继续"}</span><span>阶段 · {snapshot.current_phase || "自由互动"}</span><span>回合 · {snapshot.turn_count || 0}</span></div>
+        <div className="sim-status-strip"><span><i className={isGenerating ? "live" : ""} />{isGenerating ? "推演中" : pausedPage ? "已暂停" : currentPage.isEnd ? "已结束" : "等待继续"}</span><span>阶段 · {snapshot.current_phase || "自由互动"}</span><span>回合 · {snapshot.turn_count || 0}/{snapshot.max_turns || "—"}</span></div>
         <button className="icon-button" type="button" onClick={() => setShowQuitModal(true)} aria-label="退出模拟">×</button>
       </header>
 
@@ -221,6 +243,7 @@ function StoryPage() {
           <footer className="simulation-controls">
             <div className="page-navigation"><button type="button" onClick={() => setCurrentPageIndex((value) => Math.max(0, value - 1))} disabled={currentPageIndex === 0 || isGenerating}>←</button><span>{currentPageIndex + 1} / {pages.length || 1}</span><button type="button" onClick={nextPage} disabled={isGenerating || currentPage.isEnd}>→</button></div>
             <div className="control-actions">
+              <button type="button" className="export-control" onClick={exportStory} disabled={isExporting} title="包含完整人物设定、角色秘密、运行状态和全部历史">{isExporting ? "正在导出…" : "导出完整档案"}</button>
               <button type="button" onClick={() => setSkipToken((value) => value + 1)}>跳过打字</button>
               {isGenerating ? <button type="button" className="pause-button" onClick={pauseGeneration}>暂停生成</button> : pausedPage ? <button type="button" className="primary-control" onClick={() => generatePage(pausedPage.index, pausedPage.page)}>继续生成</button> : !currentPage.isEnd ? <button type="button" className="primary-control" onClick={nextPage}>继续推演</button> : null}
             </div>
