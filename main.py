@@ -1,7 +1,13 @@
 import history
-from World import generate_worldview
-from Character import generate_characters
-from history import main
+import uuid
+from scenechat.errors import SceneChatError, stage_error
+from scenechat.generation import generate_scenario_package
+from scenechat.knowledge import requires_vector_index
+from scenechat.preflight import (
+    validate_embedding_model_availability,
+    validate_generation_model_availability,
+)
+from scenechat.storage import save_experiment_documents
 
 def main():
     print("欢迎来到社会模拟实验设定生成器")
@@ -14,26 +20,59 @@ def main():
         return
 
     try:
-        print("\n正在生成世界观，请稍等...\n")
-        worldview = generate_worldview(user_prompt)
+        print("\n正在检查生成模型...")
+        validate_generation_model_availability()
+        print("生成模型检查通过。")
+    except SceneChatError as error:
+        print(f"\n{error.public_message}")
+        return
+    except Exception as exc:
+        print(f"\n{stage_error('preflight', exc).public_message}")
+        return
+
+    try:
+        print("\n正在理解约束并生成结构化场景，请稍等...\n")
+        package = generate_scenario_package(user_prompt)
+        worldview = package.worldview_markdown
 
         print("=" * 60)
         print("【生成的世界观】")
         print("=" * 60)
         print(worldview)
 
-        print("\n正在基于世界观生成角色设定，请稍等...\n")
-        characters = generate_characters(user_prompt, worldview)
+        characters = package.characters_markdown
+
+        if requires_vector_index(
+            package.public_worldview_markdown,
+            characters,
+            package.world.director_notes_markdown,
+            package.world.facts,
+        ):
+            print("\n检测到长背景，正在检查向量模型...")
+            validate_embedding_model_availability()
 
         print("=" * 60)
         print("【生成的角色设定】")
         print("=" * 60)
         print(characters)
 
-    except Exception as e:
-        print(f"\n发生错误：{e}")
+        experiment_id = uuid.uuid4().hex
+        save_experiment_documents(
+            experiment_id,
+            worldview,
+            characters,
+            scenario_payload=package.to_dict(),
+        )
+
+    except Exception as exc:
+        # Keep CLI feedback consistent with the Web API and never print raw
+        # provider payloads as the primary user-facing error.
+        stage = "scenario_generation"
+        print(f"\n{stage_error(stage, exc).public_message}")
+        return
+
+    history.main(worldview, characters, scenario_package=package)
 
 
 if __name__ == "__main__":
     main()
-    history.main()

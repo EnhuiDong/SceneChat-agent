@@ -1,0 +1,321 @@
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from typing import Any
+
+from .models import AgentState, SimulationState
+
+
+SAFE_FREE_ACTIONS = {"speak", "act", "observe", "pass"}
+TARGETED_ACTIONS = {"vote", "eliminate", "inspect", "protect", "heal", "poison"}
+
+
+@dataclass
+class Intent:
+    actor: str
+    action_type: str
+    action: str
+    speech: str = ""
+    target: str = ""
+    ability: str = ""
+    private_reason: str = ""
+    expected_effect: str = ""
+    proposed_patch: list[dict[str, Any]] = field(default_factory=list)
+    relationship_updates: dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def from_mapping(cls, actor: str, data: dict[str, Any]) -> "Intent":
+        proposed = data.get("proposed_patch") or data.get("state_patch") or []
+        return cls(
+            actor=actor,
+            action_type=str(data.get("action_type") or "speak").strip(),
+            action=str(data.get("action") or "观察局势").strip(),
+            speech=str(data.get("speech") or "").strip(),
+            target=str(data.get("target") or "").strip(),
+            ability=str(data.get("ability") or "").strip(),
+            private_reason=str(data.get("private_reason") or "").strip(),
+            expected_effect=str(data.get("expected_effect") or "").strip(),
+            proposed_patch=[item for item in proposed if isinstance(item, dict)]
+            if isinstance(proposed, list)
+            else [],
+            relationship_updates={
+                str(key): str(value)
+                for key, value in (data.get("relationship_updates") or {}).items()
+            } if isinstance(data.get("relationship_updates"), dict) else {},
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class StatePatch:
+    operations: list[dict[str, Any]] = field(default_factory=list)
+
+    def add(self, op: str, **values: Any) -> None:
+        self.operations.append({"op": op, **values})
+
+    def public_updates(self) -> dict[str, str]:
+        updates: dict[str, str] = {}
+        for item in self.operations:
+            op = item.get("op")
+            if op in {"set_world", "increment_world"}:
+                updates[str(item.get("key") or "状态")] = str(
+                    item.get("value", item.get("amount", "已更新"))
+                )
+            elif op == "move_agent":
+                updates[f"{item.get('target')}位置"] = str(item.get("value") or "")
+            elif op == "set_agent_status":
+                updates[f"{item.get('target')}状态"] = f"{item.get('key')}={item.get('value')}"
+            elif op == "record_vote":
+                updates[f"{item.get('actor')}投票"] = str(item.get("target") or "")
+            elif op == "set_phase":
+                updates["phase"] = str(item.get("value") or "")
+        return updates
+
+
+@dataclass
+class Resolution:
+    accepted: bool
+    reason: str
+    intent: Intent
+    patch: StatePatch = field(default_factory=StatePatch)
+    visibility: str = "public"
+    visibility_scopes: list[str] = field(default_factory=lambda: ["public"])
+    location: str = ""
+    participants: list[str] = field(default_factory=list)
+    individual_observations: dict[str, str] = field(default_factory=dict)
+    narration: str = ""
+    end_signal: bool = False
+    end_reason: str = ""
+
+
+class IntentResolver:
+    """Validate model intents and produce the only authoritative state patch."""
+
+    def resolve(self, state: SimulationState, intent: Intent) -> Resolution:
+        actor = state.agents.get(intent.actor)
+        if actor is None:
+            return Resolution(False, "行动者不存在", intent)
+        if not actor.eligible:
+            return Resolution(False, "行动者已经离场或失去行动资格", intent)
+
+        phase = state.phase_specs.get(state.current_phase)
+        allowed_actions = list(getattr(phase, "allowed_action_types", []) or [])
+        if allowed_actions and intent.action_type not in allowed_actions:
+            return Resolution(
+                False,
+                f"当前阶段“{state.current_phase}”不允许 {intent.action_type}",
+                intent,
+            )
+
+        ability = actor.ability_by_reference(intent.ability) if intent.ability else None
+        if intent.ability and ability is None:
+            return Resolution(False, "角色不具备所声明的能力", intent)
+        if ability is not None:
+            if not ability.available:
+                return Resolution(False, f"能力“{ability.name}”已经没有剩余次数", intent)
+            if ability.phases and state.current_phase not in ability.phases:
+                return Resolution(False, f"能力“{ability.name}”不能在当前阶段使用", intent)
+            if ability.action_type not in {"act", intent.action_type}:
+                return Resolution(False, f"能力“{ability.name}”与行动类型不匹配", intent)
+
+        rule = self._matching_rule(state, actor, intent)
+        if intent.action_type not in SAFE_FREE_ACTIONS and ability is None and rule is None:
+            return Resolution(False, "该行动没有对应的角色能力或场景规则", intent)
+
+        target_error = self._validate_target(state, actor, intent, ability, rule)
+        if target_error:
+            return Resolution(False, target_error, intent)
+
+        patch = StatePatch()
+        observations: dict[str, str] = {}
+        if ability is not None:
+            patch.add("consume_ability", target=actor.name, key=ability.id, amount=1)
+            for effect in ability.effects:
+                self._expand_effect(patch, effect, intent)
+        if rule is not None:
+            for effect in rule.effects:
+                self._expand_effect(patch, asdict(effect), intent)
+
+        self._apply_builtin_effects(state, actor, intent, patch, observations)
+        self._append_phase_transition(state, actor, intent, patch)
+        scopes = list(
+            getattr(ability, "visibility", [])
+            or getattr(rule, "visibility", [])
+            or ["public"]
+        )
+        return Resolution(
+            True,
+            "行动已通过规则校验",
+            intent,
+            patch=patch,
+            visibility=scopes[0] if len(scopes) == 1 else "scoped",
+            visibility_scopes=scopes,
+            location=actor.current_location,
+            individual_observations=observations,
+        )
+
+    def resolve_director_event(
+        self,
+        state: SimulationState,
+        *,
+        narration: str,
+        visibility: str,
+        proposed_updates: dict[str, Any],
+        end_signal: bool = False,
+        end_reason: str = "",
+        location: str = "",
+    ) -> Resolution:
+        intent = Intent("旁白", "director_event", "场景推进", narration)
+        patch = StatePatch()
+        if visibility == "public":
+            for key, value in list(proposed_updates.items())[:30]:
+                if state._valid_world_value(str(key), value):
+                    patch.add("set_world", key=str(key), value=value)
+            phase = state.phase_specs.get(state.current_phase)
+            if phase is not None and (
+                getattr(phase, "event_only", False)
+                or getattr(phase, "advance_when", "") == "after_event"
+            ):
+                patch.add("set_phase", value=getattr(phase, "next_phase", ""))
+        # Structured rule scenarios end only through deterministic termination
+        # rules. Free-form scenes may still use a director-judged natural end.
+        allow_natural_end = bool(
+            end_signal and end_reason.strip() and not state.termination_rules
+        )
+        safe_location = location if (not location or not state.locations or location in state.locations) else ""
+        return Resolution(
+            True,
+            "导演事件已校验",
+            intent,
+            patch=patch,
+            visibility=visibility,
+            visibility_scopes=[visibility],
+            location=safe_location,
+            narration=narration,
+            end_signal=allow_natural_end,
+            end_reason=end_reason.strip() if allow_natural_end else "",
+        )
+
+    @staticmethod
+    def _matching_rule(state: SimulationState, actor: AgentState, intent: Intent):
+        for rule in state.rules:
+            if rule.action_type != intent.action_type:
+                continue
+            if rule.phases and state.current_phase not in rule.phases:
+                continue
+            if rule.allowed_roles and actor.role not in rule.allowed_roles:
+                continue
+            return rule
+        return None
+
+    @staticmethod
+    def _validate_target(state, actor, intent, ability, rule) -> str:
+        if intent.action_type == "move":
+            if not intent.target:
+                return "移动行动需要指定目标地点"
+            if state.locations and intent.target not in state.locations:
+                return "目标地点不在场景允许地点中"
+            return ""
+        scope = getattr(ability, "target_scope", "") or getattr(rule, "target_scope", "") or "none"
+        if intent.action_type in TARGETED_ACTIONS and not intent.target:
+            return "该行动需要指定目标"
+        if scope == "none":
+            return ""
+        if scope == "self":
+            return "" if intent.target in {"", actor.name} else "该能力只能以自己为目标"
+        target = state.agents.get(intent.target)
+        if target is None:
+            return "目标角色不存在"
+        if not target.eligible and intent.action_type not in {"heal"}:
+            return "目标已经离场或不可行动"
+        if scope == "same_location" and target.current_location != actor.current_location:
+            return "目标不在行动者所在地点"
+        return ""
+
+    @staticmethod
+    def _expand_effect(patch: StatePatch, effect: dict[str, Any], intent: Intent) -> None:
+        op = str(effect.get("op") or "")
+        if not op:
+            return
+        values = {}
+        for key in ("key", "value", "target", "amount"):
+            value = effect.get(key)
+            if value == "$actor":
+                value = intent.actor
+            elif value == "$target":
+                value = intent.target
+            elif value == "$value":
+                value = intent.expected_effect
+            values[key] = value
+        patch.add(op, **values)
+
+    @staticmethod
+    def _apply_builtin_effects(
+        state: SimulationState,
+        actor: AgentState,
+        intent: Intent,
+        patch: StatePatch,
+        observations: dict[str, str],
+    ) -> None:
+        if intent.action_type == "move":
+            patch.add("move_agent", target=actor.name, value=intent.target)
+        elif intent.action_type == "vote":
+            patch.add("record_vote", actor=actor.name, target=intent.target)
+            prospective = dict(state.votes)
+            prospective[actor.name] = intent.target
+            eligible_names = {item.name for item in state.agents.values() if item.eligible}
+            if eligible_names and eligible_names.issubset(prospective):
+                tally: dict[str, int] = {}
+                for target in prospective.values():
+                    tally[target] = tally.get(target, 0) + 1
+                highest = max(tally.values())
+                winners = [name for name, count in tally.items() if count == highest]
+                if len(winners) == 1:
+                    patch.add("set_agent_status", target=winners[0], key="alive", value=False)
+                patch.add("clear_votes")
+        elif intent.action_type == "eliminate":
+            if intent.target not in state.protected_agents:
+                patch.add("set_agent_status", target=intent.target, key="alive", value=False)
+            else:
+                observations[actor.name] = "你的袭击没有使目标出局。"
+        elif intent.action_type == "poison":
+            patch.add("set_agent_status", target=intent.target, key="alive", value=False)
+        elif intent.action_type == "protect":
+            patch.add("protect_agent", target=intent.target)
+        elif intent.action_type == "heal":
+            patch.add("set_agent_status", target=intent.target, key="alive", value=True)
+            patch.add("set_agent_status", target=intent.target, key="active", value=True)
+        elif intent.action_type == "inspect":
+            target = state.agents[intent.target]
+            fact_id = f"inspection:{state.turn_count + 1}:{target.id or target.name}"
+            content = f"查验结果：{target.name}的阵营是“{target.faction or target.role}”。"
+            patch.add("add_known_fact", target=actor.name, key=fact_id, value=content)
+            observations[actor.name] = content
+
+    @staticmethod
+    def _append_phase_transition(
+        state: SimulationState,
+        actor: AgentState,
+        intent: Intent,
+        patch: StatePatch,
+    ) -> None:
+        phase = state.phase_specs.get(state.current_phase)
+        if phase is None or phase.advance_when == "manual":
+            return
+        eligible = [
+            item.name
+            for item in state.agents.values()
+            if item.eligible and (not phase.actor_roles or item.role in phase.actor_roles)
+        ]
+        acted = set(state.phase_action_log)
+        acted.add(actor.name)
+        should_advance = phase.advance_when == "all_eligible_acted" and set(eligible).issubset(acted)
+        if phase.advance_when == "all_active_voted":
+            prospective = set(state.votes)
+            if intent.action_type == "vote":
+                prospective.add(actor.name)
+            should_advance = set(eligible).issubset(prospective)
+        if should_advance:
+            patch.add("set_phase", value=phase.next_phase or "")

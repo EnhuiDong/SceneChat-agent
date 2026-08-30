@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import "./StoryPage.css";
+import { getApiErrorMessage, readApiError } from "./apiErrors";
+import { loadPageIndex, loadStoryPages } from "./storyStorage";
 
 function StoryPage() {
   const location = useLocation();
@@ -15,22 +17,32 @@ function StoryPage() {
   const sessionId =
     location.state?.sessionId || localStorage.getItem("story_session_id") || "";
 
-  const savedPages = JSON.parse(localStorage.getItem("story_pages") || "[]");
-  const savedIndex = localStorage.getItem("current_page_index");
+  const scenario = (() => {
+    try {
+      return JSON.parse(localStorage.getItem("story_scenario") || "{}");
+    } catch {
+      return {};
+    }
+  })();
+
+  const savedPages = loadStoryPages(localStorage);
 
   const [pages, setPages] = useState(savedPages);
   const [currentPageIndex, setCurrentPageIndex] = useState(
-    savedPages.length === 0 ? 0 : savedIndex ? Number(savedIndex) : 0
+    loadPageIndex(localStorage, savedPages.length)
   );
   const [displayedMessages, setDisplayedMessages] = useState([]);
   const [isGenerating, setIsGenerating] = useState(false);
   const [isTypingPage, setIsTypingPage] = useState(false);
   const [showQuitModal, setShowQuitModal] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
+  const [failedPage, setFailedPage] = useState(null);
 
   const contentRef = useRef(null);
   const typingTokenRef = useRef(0);
   const pageDoneRef = useRef(false);
+  const initialGenerationStartedRef = useRef(false);
+  const streamAbortRef = useRef(null);
 
   const currentPage = useMemo(() => {
     return pages[currentPageIndex] || { page: 1, isEnd: false, messages: [] };
@@ -57,21 +69,6 @@ function StoryPage() {
     }
   }, [displayedMessages, isGenerating]);
 
-  useEffect(() => {
-    if (!sessionId || isGenerating) return;
-
-    // 没有任何页面时，自动生成第一页
-    if (pages.length === 0) {
-      handleGenerateStreamPage(0, 1);
-      return;
-    }
-
-    // 已存在页面时，切换到旧页直接显示完整内容
-    if (currentPage?.messages?.length) {
-      showFullPageImmediately(currentPage.messages);
-    }
-  }, [currentPageIndex, pages.length, sessionId]);
-
   const openErrorModal = (message) => {
     setErrorMessage(message);
   };
@@ -85,12 +82,21 @@ function StoryPage() {
     localStorage.removeItem("story_scene");
     localStorage.removeItem("story_batch_size");
     localStorage.removeItem("story_session_id");
+    localStorage.removeItem("story_scenario");
     localStorage.removeItem("story_pages");
     localStorage.removeItem("current_page_index");
+    localStorage.removeItem("story_pending_page_request");
   };
 
   const getAlternatingSide = (index) => {
     return index % 2 === 0 ? "left" : "right";
+  };
+
+  const getMessageSide = (message, index) => {
+    if (message.kind === "narration") return "narration";
+    const speaker = message.speaker || String(index);
+    const hash = [...speaker].reduce((total, char) => total + char.charCodeAt(0), 0);
+    return getAlternatingSide(hash);
   };
 
   const openQuitModal = () => {
@@ -129,7 +135,7 @@ function StoryPage() {
   const createTypingPlaceholder = (msg, indexInPage) => {
     return {
       ...msg,
-      side: getAlternatingSide(indexInPage),
+      side: getMessageSide(msg, indexInPage),
       visibleText: "",
       isTyping: true,
       isPlaceholder: true,
@@ -160,7 +166,7 @@ function StoryPage() {
   const showFullPageImmediately = (messages) => {
     const fullMessages = messages.map((msg, idx) => ({
       ...msg,
-      side: getAlternatingSide(idx),
+      side: getMessageSide(msg, idx),
       visibleText: msg.display_text || "",
       isTyping: false,
     }));
@@ -171,7 +177,7 @@ function StoryPage() {
 
   const appendTypingMessage = async (msg, indexInPage, pageIndex) => {
       const token = typingTokenRef.current;
-      const side = getAlternatingSide(indexInPage);
+      const side = getMessageSide(msg, indexInPage);
       const text = msg.display_text || "";
 
       // 1. 先显示“正在输入”的占位气泡
@@ -278,11 +284,17 @@ function StoryPage() {
     pageDoneRef.current = false;
     typingTokenRef.current = Date.now();
 
+    const previousPage = pages[targetPageIndex];
+    const requestId =
+      previousPage?.requestId ||
+      globalThis.crypto?.randomUUID?.() ||
+      `${sessionId}-${targetPageNumber}-${Date.now()}`;
     const emptyPage = {
       page: targetPageNumber,
       isEnd: false,
       hasPlayed: false,
-      messages: [],
+      messages: previousPage?.messages || [],
+      requestId,
     };
 
     setPages((prev) => {
@@ -292,10 +304,17 @@ function StoryPage() {
     });
 
     setCurrentPageIndex(targetPageIndex);
-    setDisplayedMessages([]);
+    showFullPageImmediately(emptyPage.messages);
+    localStorage.setItem(
+      "story_pending_page_request",
+      JSON.stringify({ requestId, page: targetPageNumber })
+    );
 
     try {
-      const response = await fetch("http://127.0.0.1:5000/api/story/next-stream", {
+      streamAbortRef.current?.abort();
+      const controller = new AbortController();
+      streamAbortRef.current = controller;
+      const response = await fetch("/api/story/next-stream", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -303,17 +322,23 @@ function StoryPage() {
         body: JSON.stringify({
           session_id: sessionId,
           batch_size: 10,
+          request_id: requestId,
+          expected_page: targetPageNumber,
         }),
+        signal: controller.signal,
       });
 
-      if (!response.ok || !response.body) {
-        throw new Error(`生成页面失败（${response.status}）`);
+      if (!response.ok) {
+        throw new Error(await readApiError(response, "生成页面失败，请稍后重试。"));
+      }
+      if (!response.body) {
+        throw new Error("后端没有返回可读取的故事内容，请稍后重试。");
       }
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder("utf-8");
       let buffer = "";
-      let messageIndex = 0;
+      let messageIndex = emptyPage.messages.length;
 
       while (true) {
         const { value, done } = await reader.read();
@@ -328,23 +353,43 @@ function StoryPage() {
 
           const event = JSON.parse(line);
 
+          if (event.type === "error") {
+            throw new Error(
+              getApiErrorMessage(event, "生成页面失败，请稍后重试。")
+            );
+          }
+
           if (event.type === "message") {
             const newMsg = event.message;
 
             setPages((prev) =>
               prev.map((page, idx) =>
                 idx === targetPageIndex
-                  ? { ...page, messages: [...page.messages, newMsg] }
+                  ? page.messages.some(
+                      (message) =>
+                        (message.event_id && message.event_id === newMsg.event_id) ||
+                        (!message.event_id && message.id === newMsg.id)
+                    )
+                    ? page
+                    : { ...page, messages: [...page.messages, newMsg] }
                   : page
               )
             );
 
-            await appendTypingMessage(newMsg, messageIndex, targetPageIndex);
-            messageIndex += 1;
+            if (!event.replayed || !emptyPage.messages.some(
+              (message) =>
+                (message.event_id && message.event_id === newMsg.event_id) ||
+                (!message.event_id && message.id === newMsg.id)
+            )) {
+              await appendTypingMessage(newMsg, messageIndex, targetPageIndex);
+              messageIndex += 1;
+            }
           }
 
           if (event.type === "page_done") {
             pageDoneRef.current = true;
+            localStorage.removeItem("story_pending_page_request");
+            setFailedPage(null);
 
             setPages((prev) =>
               prev.map((page, idx) =>
@@ -353,6 +398,9 @@ function StoryPage() {
                       ...page,
                       isEnd: event.isEnd,
                       hasPlayed: true,
+                      endReason: event.end_reason || "",
+                      endKind: event.end_kind || "",
+                      runStatus: event.run_status || "running",
                     }
                   : page
               )
@@ -362,12 +410,38 @@ function StoryPage() {
       }
     } catch (error) {
       console.error(error);
+      setFailedPage({ index: targetPageIndex, page: targetPageNumber });
       openErrorModal(error.message || "生成页面失败");
     } finally {
+      streamAbortRef.current = null;
       setIsGenerating(false);
       setIsTypingPage(false);
     }
   };
+
+  const retryFailedPage = async () => {
+    if (!failedPage || isGenerating) return;
+    setErrorMessage("");
+    await handleGenerateStreamPage(failedPage.index, failedPage.page);
+  };
+
+  useEffect(() => {
+    if (!sessionId || isGenerating) return;
+
+    if (pages.length === 0) {
+      if (initialGenerationStartedRef.current) return;
+      initialGenerationStartedRef.current = true;
+      handleGenerateStreamPage(0, 1);
+      return;
+    }
+
+    if (currentPage?.messages?.length) {
+      showFullPageImmediately(currentPage.messages);
+    }
+    // Page generation intentionally runs only on navigation/page-count changes.
+    // Streaming message updates must not restart the typewriter animation.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentPageIndex, pages.length, sessionId, isGenerating]);
 
   const handlePrevPage = () => {
     if (currentPageIndex === 0 || isGenerating || isTypingPage) return;
@@ -403,7 +477,7 @@ function StoryPage() {
         </button>
 
         <div className="book-header">
-          <div className="book-title">社会模拟实验</div>
+          <div className="book-title">{scenario.title || "场景模拟"}</div>
           <div className="book-subtitle">
             第 {currentPage.page} 页
             {scene ? ` ｜ 场景：${scene}` : ""}
@@ -427,6 +501,9 @@ function StoryPage() {
                 </div>
               ) : (
                 <div className="message-bubble">
+                  {msg.action ? (
+                    <span className="message-action">{msg.action}</span>
+                  ) : null}
                   <span>{msg.visibleText}</span>
                   {msg.isTyping && <span className="typing-caret">|</span>}
                 </div>
@@ -501,8 +578,13 @@ function StoryPage() {
             <div className="quit-modal-text">{errorMessage}</div>
             <div className="quit-modal-actions">
               <button className="quit-modal-btn primary" onClick={closeErrorModal}>
-                我知道了
+                关闭
               </button>
+              {failedPage ? (
+                <button className="quit-modal-btn primary" onClick={retryFailedPage}>
+                  重试当前页
+                </button>
+              ) : null}
             </div>
           </div>
         </div>

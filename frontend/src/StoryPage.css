@@ -113,6 +113,27 @@
   align-items: flex-end;
 }
 
+.message-row.narration {
+  align-items: center;
+  margin: 26px 0;
+}
+
+.message-row.narration .message-meta {
+  color: #94795f;
+  letter-spacing: 0.18em;
+}
+
+.message-row.narration .message-bubble {
+  max-width: 86%;
+  min-height: auto;
+  border: 1px solid rgba(135, 104, 73, 0.22);
+  border-radius: 10px;
+  background: rgba(255, 250, 238, 0.72);
+  color: #67513f;
+  font-style: italic;
+  text-align: center;
+}
+
 .message-meta {
   font-size: 13px;
   color: #7d654d;
@@ -404,4 +425,11 @@
     transform: scale(1.08);
     opacity: 1;
   }
+}
+.message-action {
+  display: block;
+  margin-bottom: 0.4rem;
+  color: rgba(72, 52, 38, 0.68);
+  font-size: 0.88em;
+  font-style: italic;
 }

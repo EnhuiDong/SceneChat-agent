@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+.idea/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+tests/
+frontend/tests/
+storage_chroma/
+data/experiments/
+frontend/node_modules/
+frontend/dist/
