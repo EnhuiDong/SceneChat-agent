@@ -94,3 +94,40 @@ export async function deleteStorySession(sessionId) {
   }
   return response.json();
 }
+
+async function mutation(response, fallback) {
+  if (!response.ok) throw new Error(await readApiError(response, fallback));
+  return response.json();
+}
+
+export async function previewStoryIntervention(sessionId, payload) {
+  return mutation(await fetch(`/api/story/session/${encodeURIComponent(sessionId)}/interventions/preview`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }), "无法预检这条剧情干预。");
+}
+
+export async function confirmStoryIntervention(sessionId, payload) {
+  return mutation(await fetch(`/api/story/session/${encodeURIComponent(sessionId)}/interventions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }), "无法提交这条剧情干预。");
+}
+
+export async function cancelStoryIntervention(sessionId, interventionId, expectedRevision) {
+  return mutation(await fetch(`/api/story/session/${encodeURIComponent(sessionId)}/interventions/${encodeURIComponent(interventionId)}`, {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ expected_revision: expectedRevision }),
+  }), "无法取消这条剧情干预。");
+}
+
+export async function updateStoryPace(sessionId, pace, expectedRevision) {
+  return mutation(await fetch(`/api/story/session/${encodeURIComponent(sessionId)}/pace`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pace, expected_revision: expectedRevision }),
+  }), "无法更新剧情推进速度。");
+}

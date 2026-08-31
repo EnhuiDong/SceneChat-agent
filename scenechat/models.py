@@ -21,6 +21,8 @@ class Intervention:
     effective_after_turn: int = 0
     status: str = "preview"
     normalized_directive: str = ""
+    event_narration: str = ""
+    visibility: str = "public"
     conflicts: List[Dict[str, Any]] = field(default_factory=list)
     proposed_patch: List[Dict[str, Any]] = field(default_factory=list)
     expires_after_turns: int | None = 1
@@ -56,6 +58,12 @@ class Intervention:
             effective_after_turn=optional_int("effective_after_turn", 0) or 0,
             status=status,
             normalized_directive=str(data.get("normalized_directive") or "").strip(),
+            event_narration=str(data.get("event_narration") or "").strip(),
+            visibility=(
+                str(data.get("visibility") or "public")
+                if str(data.get("visibility") or "public") in {"public", "audience_only"}
+                else "public"
+            ),
             conflicts=[
                 item for item in data.get("conflicts") or [] if isinstance(item, dict)
             ],
@@ -339,7 +347,7 @@ class SimulationState:
     def add_message(self, msg: Message) -> None:
         self.history.append(msg)
         self.turn_count += 1
-        if msg.kind == "narration":
+        if msg.kind in {"narration", "intervention"}:
             self.narration_count += 1
         else:
             self.agent_turn_count += 1
@@ -376,7 +384,22 @@ class SimulationState:
             self.end_kind = "natural_end"
             self.run_status = "ended"
 
+        intervention_ids = []
+        if isinstance(msg.intent, dict):
+            intervention_ids.extend(msg.intent.get("intervention_ids") or [])
+            if msg.intent.get("intervention_id"):
+                intervention_ids.append(msg.intent["intervention_id"])
+        for intervention in self.interventions:
+            if intervention.id in intervention_ids and intervention.status == "pending":
+                intervention.status = "applied"
+                intervention.applied_at_turn = msg.turn
+
         self.evaluate_termination()
+        # Arc tracking is deterministic and derived from the committed message.
+        # Importing lazily avoids coupling the persistence models to orchestration.
+        from .pacing import update_arc_after_message
+
+        update_arc_after_message(self, msg)
         self.bump_revision()
 
     def bump_revision(self) -> int:
@@ -389,6 +412,9 @@ class SimulationState:
 
     def set_pace(self, value: int) -> None:
         self.arc_state.pace = max(0, min(int(value), 100))
+        from .pacing import initialize_arc
+
+        initialize_arc(self, reset_horizon=True)
         self.bump_revision()
 
     def _agent_can_observe(self, agent: AgentState, msg: Message) -> bool:
@@ -596,16 +622,6 @@ class SimulationState:
         variables = "\n".join(
             f"- {key}：{value}" for key, value in self.public_world_state().items()
         )
-
-    def public_world_state(self) -> Dict[str, Any]:
-        result: Dict[str, Any] = {}
-        public_viewer = ViewerContext()
-        for key, value in self.world_state.items():
-            field_spec = self.state_schema.get(key)
-            scopes = getattr(field_spec, "visibility", ["public"])
-            if can_access(scopes, public_viewer):
-                result[key] = value
-        return result
         conditions = "\n".join(
             f"- {condition}" for condition in self.termination_conditions
         )
@@ -616,6 +632,16 @@ class SimulationState:
             f"公共状态：\n{variables or '- 暂无额外状态变量'}\n"
             f"结束条件：\n{conditions or '- 尚未声明'}"
         )
+
+    def public_world_state(self) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        public_viewer = ViewerContext()
+        for key, value in self.world_state.items():
+            field_spec = self.state_schema.get(key)
+            scopes = getattr(field_spec, "visibility", ["public"])
+            if can_access(scopes, public_viewer):
+                result[key] = value
+        return result
 
     def state_summary_for(self, agent: AgentState) -> str:
         viewer = ViewerContext(

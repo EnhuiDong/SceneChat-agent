@@ -83,6 +83,9 @@ WORLD_JSON_INSTRUCTION = """在遵守上方所有世界设计规则的同时，�
   ],
   "fixed_canon": ["从用户约束账本继承的必须发生内容"],
   "target_beats": ["需要跟踪但不强迫具体角色选择的节点"],
+  "beat_specs": [
+    {"id":"beat-1","description":"可观察、可判定是否已经发生的剧情节点","required":false,"weight":1,"prerequisites":[],"phase_hint":"可选阶段名","resolution_signals":["足以判定节点完成的具体现象"]}
+  ],
   "covered_constraint_ids": ["本世界设定已落实的约束 ID"]
 }
 
@@ -94,6 +97,8 @@ WORLD_JSON_INSTRUCTION = """在遵守上方所有世界设计规则的同时，�
 有夜间技能、治疗、反制或结算顺序时，termination rule 必须用 phases 限制到结算/公布阶段，不能在中间行动后提前判胜。
 
 状态 effect 仅允许 set_world、increment_world、move_agent、set_agent_status、set_resource、consume_resource、set_goal_status、set_relationship、record_vote、clear_votes、set_phase、add_known_fact、protect_agent、clear_protections。模板中的 $actor、$target、$value 会在运行时由 Resolver 安全替换。
+
+beat_specs 必须与 target_beats 一一对应并使用稳定 ID。用户明确要求必须发生的节点标 required=true；普通期望节点不得标成硬约束。description 和 resolution_signals 必须描述可观察结果，不能要求某角色违背自主判断作出指定选择；prerequisites 只引用前面已声明的 beat ID。
 
 特别注意：公共世界会直接成为所有角色的知识。任何并非所有角色都知道的信息只能进入 director_notes_markdown 或带精确非 public scope 的 facts。桌游、审判、比赛等规则题材必须给出可执行 phase_specs、rules 与 termination_rules；自由谈话可以保持精简。天亮公布、结算、广播等没有角色行动的阶段必须设置 scheduler=event_first、advance_when=after_event、event_only=true，并给出 next_phase。"""
 

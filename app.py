@@ -19,7 +19,14 @@ from scenechat.generation import (
     repair_scenario_package,
 )
 from scenechat.knowledge import build_experiment_knowledge_base, requires_vector_index
-from scenechat.models import Message, SimulationState
+from scenechat.models import Intervention, Message, SimulationState
+from scenechat.interventions import (
+    has_blocking_conflicts,
+    preview_intervention,
+    public_intervention,
+    validate_intervention,
+)
+from scenechat.pacing import PacingPolicy, initialize_arc
 from scenechat.preflight import (
     validate_embedding_model_availability,
     validate_generation_model_availability,
@@ -113,6 +120,39 @@ def request_error(code: str, message: str, status_code: int = 400):
             status_code=status_code,
         )
     )
+
+
+def acquire_session_operation(session: dict, expected_revision):
+    """Acquire a per-session mutation slot after optimistic revision validation."""
+
+    try:
+        expected = int(expected_revision) if expected_revision is not None else None
+    except (TypeError, ValueError):
+        return None, request_error("state_revision_invalid", "状态版本无效，请同步会话后重试。")
+    state: SimulationState = session["state"]
+    initialize_arc(state)
+    stream_lock = session.setdefault("stream_lock", threading.Lock())
+    operation_lock = session.setdefault("operation_lock", threading.Lock())
+    with stream_lock:
+        if operation_lock.locked():
+            return None, request_error(
+                "session_operation_in_progress",
+                "当前会话正在执行另一项操作，请等待完成后重试。",
+                status_code=409,
+            )
+        if expected is not None and expected != state.revision:
+            return None, request_error(
+                "state_revision_conflict",
+                "剧情状态已经更新，请同步最新内容后再操作。",
+                status_code=409,
+            )
+        if not operation_lock.acquire(blocking=False):
+            return None, request_error(
+                "session_operation_in_progress",
+                "当前会话正在执行另一项操作，请稍后重试。",
+                status_code=409,
+            )
+    return operation_lock, None
 
 
 def run_stage(session_id: str, stage: str, label: str, operation):
@@ -346,6 +386,7 @@ def build_story_events(user_prompt: str, scene_override: str, session_id: str):
         lambda: agents_from_character_specs(package.characters),
     )
     state = SimulationState(initial_scene, agents, world_spec=package.world)
+    initialize_arc(state)
     knowledge_base = run_stage(
         session_id,
         "index",
@@ -504,6 +545,7 @@ def start_story():
             lambda: agents_from_character_specs(package.characters),
         )
         state = SimulationState(initial_scene, agents, world_spec=package.world)
+        initialize_arc(state)
         knowledge_base = run_stage(
             session_id,
             "index",
@@ -843,6 +885,145 @@ def next_story_page_stream():
     )
 
 
+@app.route("/api/story/session/<session_id>/interventions/preview", methods=["POST"])
+def preview_story_intervention(session_id):
+    session = load_story_session(session_id)
+    if not session:
+        return request_error("session_not_found", "故事会话不存在或已经失效。", status_code=404)
+    data = request.get_json(silent=True) or {}
+    raw_text = str(data.get("text") or "").strip()
+    scope = str(data.get("scope") or "next_scene")
+    if scope not in {"next_scene", "turns", "persistent"}:
+        return request_error("intervention_scope_invalid", "干预作用范围无效。")
+    try:
+        duration = int(data.get("expires_after_turns", 6)) if scope == "turns" else None
+    except (TypeError, ValueError):
+        return request_error("intervention_duration_invalid", "持续轮数必须是整数。")
+    if duration is not None and not 1 <= duration <= 100:
+        return request_error("intervention_duration_invalid", "持续轮数必须在 1 到 100 之间。")
+    operation_lock, error = acquire_session_operation(session, data.get("expected_revision"))
+    if error:
+        return error
+    try:
+        intervention = preview_intervention(
+            session["state"], raw_text, scope=scope,
+            expires_after_turns=duration, llm=session.get("simulation_llm"),
+        )
+        return jsonify({
+            "intervention": public_intervention(intervention),
+            "revision": session["state"].revision,
+        })
+    except ValueError as exc:
+        return request_error("intervention_preview_invalid", str(exc))
+    except Exception as exc:
+        app.logger.exception("story.intervention_preview status=failed session=%s", session_id)
+        return error_response(stage_error("intervention", exc))
+    finally:
+        operation_lock.release()
+
+
+@app.route("/api/story/session/<session_id>/interventions", methods=["POST"])
+def confirm_story_intervention(session_id):
+    session = load_story_session(session_id)
+    if not session:
+        return request_error("session_not_found", "故事会话不存在或已经失效。", status_code=404)
+    data = request.get_json(silent=True) or {}
+    source = data.get("intervention")
+    if not isinstance(source, dict):
+        return request_error("intervention_missing", "请先预检干预内容。")
+    operation_lock, error = acquire_session_operation(session, data.get("expected_revision"))
+    if error:
+        return error
+    try:
+        state: SimulationState = session["state"]
+        intervention = validate_intervention(state, Intervention.from_mapping(source))
+        if not intervention.raw_text or not intervention.normalized_directive:
+            return request_error("intervention_invalid", "干预预检结果不完整，请重新预检。")
+        if any(item.id == intervention.id for item in state.interventions):
+            return request_error("intervention_duplicate", "这条干预已经提交。", status_code=409)
+        blocking = has_blocking_conflicts(intervention)
+        force = bool(data.get("force", False))
+        if blocking and intervention.mode != "override":
+            return request_error(
+                "intervention_requires_override",
+                "这项改动与现有剧情冲突；请修改指令，或明确要求强制改写。",
+                status_code=409,
+            )
+        if intervention.mode == "override" and not force:
+            return request_error(
+                "intervention_confirmation_required", "强制改写需要再次明确确认。", status_code=409,
+            )
+        intervention.status = "pending"
+        intervention.created_at_turn = state.turn_count
+        intervention.effective_after_turn = state.turn_count
+        state.register_intervention(intervention)
+        persist_story_session(session_id, session)
+        return jsonify({
+            "intervention": public_intervention(intervention), "revision": state.revision,
+        }), 201
+    finally:
+        operation_lock.release()
+
+
+@app.route("/api/story/session/<session_id>/interventions/<intervention_id>", methods=["DELETE"])
+def cancel_story_intervention(session_id, intervention_id):
+    session = load_story_session(session_id)
+    if not session:
+        return request_error("session_not_found", "故事会话不存在或已经失效。", status_code=404)
+    data = request.get_json(silent=True) or {}
+    operation_lock, error = acquire_session_operation(session, data.get("expected_revision"))
+    if error:
+        return error
+    try:
+        state: SimulationState = session["state"]
+        intervention = next((item for item in state.interventions if item.id == intervention_id), None)
+        if intervention is None:
+            return request_error("intervention_not_found", "没有找到这条干预。", status_code=404)
+        if intervention.status in {"cancelled", "rejected"}:
+            return jsonify({"intervention": public_intervention(intervention), "revision": state.revision})
+        if intervention.status == "applied" and intervention.mode in {"event", "override"}:
+            return request_error(
+                "intervention_already_applied",
+                "该事件已经进入时间线，不能直接撤销；可提交一条新的修正干预。",
+                status_code=409,
+            )
+        intervention.status = "cancelled"
+        state.bump_revision()
+        persist_story_session(session_id, session)
+        return jsonify({"intervention": public_intervention(intervention), "revision": state.revision})
+    finally:
+        operation_lock.release()
+
+
+@app.route("/api/story/session/<session_id>/pace", methods=["PATCH"])
+def update_story_pace(session_id):
+    session = load_story_session(session_id)
+    if not session:
+        return request_error("session_not_found", "故事会话不存在或已经失效。", status_code=404)
+    data = request.get_json(silent=True) or {}
+    try:
+        pace = int(data.get("pace"))
+    except (TypeError, ValueError):
+        return request_error("pace_invalid", "剧情推进速度必须是 0 到 100 的整数。")
+    if not 0 <= pace <= 100:
+        return request_error("pace_invalid", "剧情推进速度必须在 0 到 100 之间。")
+    operation_lock, error = acquire_session_operation(session, data.get("expected_revision"))
+    if error:
+        return error
+    try:
+        state: SimulationState = session["state"]
+        state.set_pace(pace)
+        persist_story_session(session_id, session)
+        policy = PacingPolicy.from_value(pace)
+        return jsonify({
+            "arc_state": asdict(state.arc_state),
+            "pace_label": policy.label,
+            "revision": state.revision,
+        })
+    finally:
+        operation_lock.release()
+
+
 @app.route("/api/story/session/<session_id>", methods=["GET"])
 def get_story_session(session_id):
     session = load_story_session(session_id)
@@ -854,6 +1035,7 @@ def get_story_session(session_id):
         )
 
     state: SimulationState = session["state"]
+    initialize_arc(state)
 
     pages = []
     completed_requests = [
@@ -889,7 +1071,11 @@ def get_story_session(session_id):
             "progress": state.arc_state.progress,
             "tension": state.arc_state.tension,
             "target_end_turn": state.arc_state.target_end_turn,
+            "turns_since_progress": state.arc_state.turns_since_progress,
+            "active_beat_ids": state.arc_state.active_beat_ids,
+            "resolved_beat_ids": state.arc_state.resolved_beat_ids,
         },
+        "interventions": [public_intervention(item) for item in state.interventions],
         "turn_count": state.turn_count,
         "current_phase": state.current_phase,
         "world_state": state.public_world_state(),
@@ -917,6 +1103,7 @@ def get_story_session(session_id):
 def full_session_export(session_id: str, session: dict) -> dict:
     """Build an explicit owner export, including private scenario and agent state."""
     state: SimulationState = session["state"]
+    initialize_arc(state)
     package: ScenarioPackage = session["scenario"]
     page_requests = []
     for request_id, page_request in session.get("page_requests", {}).items():

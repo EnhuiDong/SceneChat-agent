@@ -5,13 +5,25 @@ from typing import Optional, Protocol
 
 from .context import build_agent_view, director_context
 from .models import AgentState, Message, SimulationState
+from .interventions import (
+    active_guidance,
+    guidance_context,
+    intervention_message,
+    mark_guidance_applied,
+    pending_direct_event,
+)
+from .pacing import (
+    pacing_context,
+    required_beats_resolved,
+    should_insert_narration,
+    validate_resolved_beats,
+)
 from .providers import get_simulation_llm
 from .runtime import Intent, IntentResolver
 from .scheduler import SimulationScheduler
 
 
 MAX_VISIBLE_OBSERVATIONS = 15
-NARRATION_INTERVAL = 3
 
 
 class AgentKnowledge(Protocol):
@@ -168,6 +180,12 @@ def build_narrator_prompt(
 【近期叙事与公开行动】
 {recent_history}
 
+【导演节奏与剧情弧】
+{pacing_context(state)}
+
+【已确认的用户导演指令】
+{guidance_context(state)}
+
 请生成一个符合原题材的简短叙事事件，用于补充环境、节奏、动作结果、中立事件或面向读者的镜头信息。不要替角色说台词，不要强迫角色作出重大决定，不要突然转换题材，也不要无依据加入 AI、未来科技或宏大阴谋。
 
 {mode_instruction}
@@ -178,6 +196,8 @@ def build_narrator_prompt(
   "visibility": "{visibility}",
   "location": "事件只发生在某个地点时填写；全局广播或读者镜头可为空",
   "state_updates": {{"公共状态变量": "环境事件或规则裁决造成的新值"}},
+  "resolved_beat_ids": ["只有本轮已经实际完成的当前可推进节点 ID；不要把刚埋下的线索算作完成"],
+  "tension": 0.0,
   "end_signal": false,
   "end_reason": "只有确实满足结束条件时填写"
 }}
@@ -224,6 +244,10 @@ def parse_narrator_event(raw: str) -> Optional[dict]:
         "end_signal": bool(payload.get("end_signal", False)),
         "end_reason": str(payload.get("end_reason") or "").strip(),
         "location": str(payload.get("location") or "").strip(),
+        "resolved_beat_ids": [
+            str(item) for item in payload.get("resolved_beat_ids") or []
+        ] if isinstance(payload.get("resolved_beat_ids"), list) else [],
+        "tension": payload.get("tension"),
     }
 
 
@@ -364,16 +388,25 @@ def simulate_narration(
     if parsed is None:
         state.record_generation_failure()
         return None
+    resolved_beat_ids = validate_resolved_beats(state, parsed["resolved_beat_ids"])
     resolution = (resolver or IntentResolver()).resolve_director_event(
         state,
         narration=parsed["narration"],
         visibility=visibility,
         proposed_updates=parsed["state_updates"],
-        end_signal=parsed["end_signal"],
+        end_signal=parsed["end_signal"] and required_beats_resolved(state, resolved_beat_ids),
         end_reason=parsed["end_reason"],
         location=parsed["location"],
     )
     state.record_generation_success()
+    applied_guidance_ids = mark_guidance_applied(state)
+    intent_payload = resolution.intent.to_dict()
+    intent_payload["arc_updates"] = {
+        "resolved_beat_ids": resolved_beat_ids,
+        "tension": parsed["tension"],
+    }
+    if applied_guidance_ids:
+        intent_payload["intervention_ids"] = applied_guidance_ids
     return Message(
         speaker="旁白",
         action="场景推进",
@@ -388,7 +421,7 @@ def simulate_narration(
         end_reason=resolution.end_reason,
         authoritative=True,
         state_patch=resolution.patch.operations,
-        intent=resolution.intent.to_dict(),
+        intent=intent_payload,
     )
 
 
@@ -400,17 +433,18 @@ def simulate_next_event(
     scheduler: SimulationScheduler | None = None,
     resolver: IntentResolver | None = None,
 ) -> Optional[Message]:
-    should_narrate = (
-        state.agent_turn_count > 0
-        and state.agent_turn_count % NARRATION_INTERVAL == 0
-        and (not state.history or state.history[-1].kind != "narration")
-    )
+    director_event = pending_direct_event(state)
+    if director_event is not None:
+        return intervention_message(state, director_event)
+    guidance_waiting = any(item.status == "pending" for item in active_guidance(state))
+    should_narrate = guidance_waiting or should_insert_narration(state)
     if should_narrate:
         narration = simulate_narration(
             state,
             knowledge_base,
             llm=llm,
             resolver=resolver,
+            forced_visibility="public" if guidance_waiting else None,
         )
         if narration is not None:
             return narration

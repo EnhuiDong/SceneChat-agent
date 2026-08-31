@@ -158,6 +158,10 @@ STAGE_MESSAGES = {
         "simulation_generation_failed",
         "故事续写失败，请稍后重试当前页面。",
     ),
+    "intervention": (
+        "intervention_preview_failed",
+        "剧情干预预检失败，请稍后重试；现有剧情状态没有被修改。",
+    ),
     "simulation_client": (
         "simulation_client_failed",
         "推演模型初始化失败，请检查模型配置后重试。",
