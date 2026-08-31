@@ -122,13 +122,29 @@ def director_context(state: SimulationState) -> str:
     private_state = "\n".join(
         f"- {key}：{value}" for key, value in state.world_state.items()
     ) or "- 无状态变量"
+    fixed_canon = "\n".join(
+        f"- {item}" for item in list(getattr(state.world_spec, "fixed_canon", []) or [])
+    ) or "- 无额外固定事实"
+    queued_interventions = "\n".join(
+        f"- [{item.id}] {item.mode}/{item.scope}："
+        f"{item.normalized_directive or item.raw_text}"
+        for item in state.interventions
+        if item.status in {"pending", "applied"}
+        and (item.status == "pending" or item.scope in {"turns", "persistent"})
+    ) or "- 无等待执行或持续生效的干预"
     return f"""{state.public_state_summary()}
 
 【导演可见的全部世界状态】
 {private_state}
 
+【不可静默改写的固定事实】
+{fixed_canon}
+
 【导演可见的全部事实】
 {facts}
 
 【角色运行状态】
-{agents}"""
+{agents}
+
+【等待执行或持续生效的导演干预】
+{queued_interventions}"""

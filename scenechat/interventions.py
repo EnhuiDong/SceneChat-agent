@@ -13,10 +13,11 @@ INTERVENTION_PROMPT = """你是互动故事的导演指令分析器。用户希�
 
 把输入分类为：
 - guidance：只影响后续倾向，不宣布事实、不直接改状态；
-- event：在下一步发生一个可观察事件，可更新已声明的公共状态；
-- override：明确改写既有事实、角色状态、阶段或硬设定。只有用户确实要求强行改写时才选。
+- event：在下一步发生一个可观察事件，可更新已声明的公共状态；只给观众看的秘密镜头也属于 event，并将 visibility 设为 audience_only；
+- override：追溯改写已经成立的事实，或强迫角色违背目标、修改角色状态、阶段或硬设定。只有用户确实要求强行改写时才选。因新事件导致公共状态自然变化仍是 event，不是 override。
 
 不得替用户扩大意图。不得把秘密注入不知情角色的头脑。不得输出任意代码或未列出的 patch 操作。
+proposed_patch 的 target/key 必须逐字复制【当前导演状态】中已有的角色名、地点、阶段或状态字段；没有完全匹配的字段就省略 patch，让事件只通过叙述进入时间线。公开事件已经会成为在场角色的观察，不要为每个角色额外输出 add_known_fact。
 识别与已发生事件、固定设定、世界规则或角色自主性的冲突。冲突 severity 只能是 warning 或 blocking。
 符合题材的新天气、道具、路人、来信、车辆等环境事件可以自然进入故事，不因“此前未出现”而算冲突；只有冒充既有角色/地点/状态字段、否定已发生事实或越过规则时才属于 unknown_reference/continuity 冲突。
 
@@ -36,6 +37,61 @@ OVERRIDE_OPS = EVENT_OPS | {
     "set_agent_status", "set_resource", "set_goal_status", "set_relationship",
     "set_phase", "add_known_fact",
 }
+
+
+def _patch_slot(operation: dict[str, Any]) -> tuple[str, ...] | None:
+    """Return the authoritative state slot an operation would overwrite."""
+
+    op = str(operation.get("op") or "").strip()
+    target = str(operation.get("target") or "").strip()
+    key = str(operation.get("key") or "").strip()
+    if op == "set_world":
+        return ("world", key)
+    if op == "move_agent":
+        return ("agent_location", target)
+    if op == "set_agent_status":
+        return ("agent_status", target, key)
+    if op in {"set_resource", "set_goal_status", "add_known_fact"}:
+        return (op, target, key)
+    if op == "set_relationship":
+        return ("relationship", target, key)
+    if op == "set_phase":
+        return ("phase",)
+    return None
+
+
+def _pending_patch_conflicts(
+    state: SimulationState,
+    intervention: Intervention,
+    safe_patch: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """Detect incompatible writes already queued for the same future boundary."""
+
+    queued: dict[tuple[str, ...], tuple[Any, Intervention]] = {}
+    for existing in state.interventions:
+        if existing.status != "pending" or existing.id == intervention.id:
+            continue
+        for operation in existing.proposed_patch:
+            slot = _patch_slot(operation)
+            if slot is not None:
+                queued[slot] = (operation.get("value"), existing)
+
+    conflicts = []
+    for operation in safe_patch:
+        slot = _patch_slot(operation)
+        if slot is None or slot not in queued:
+            continue
+        existing_value, existing = queued[slot]
+        if existing_value == operation.get("value"):
+            continue
+        conflicts.append(_conflict(
+            "blocking",
+            "continuity",
+            "这项改动与等待执行的导演干预"
+            f"“{existing.normalized_directive or existing.raw_text}”"
+            "将同一状态设为不同结果；请先取消旧干预，或明确使用强制改写。",
+        ))
+    return conflicts
 
 
 def _extract_json(text: str) -> dict[str, Any]:
@@ -75,8 +131,13 @@ def validate_intervention(state: SimulationState, intervention: Intervention) ->
         key = str(operation.get("key") or "").strip()
         value = operation.get("value")
         reason = ""
+        severity = "blocking"
         if op not in allowed:
-            reason = f"操作 {op or '（空）'} 不允许用于 {intervention.mode} 干预"
+            if intervention.mode == "event" and op == "add_known_fact":
+                reason = "公开事件会按可见范围自动成为角色观察，已移除多余的 add_known_fact"
+                severity = "warning"
+            else:
+                reason = f"操作 {op or '（空）'} 不允许用于 {intervention.mode} 干预"
         elif op in {"move_agent", "set_agent_status", "set_resource", "set_goal_status", "add_known_fact"} and target not in state.agents:
             reason = f"引用了不存在的角色“{target}”"
         elif op == "set_relationship" and (target not in state.agents or key not in state.agents):
@@ -91,6 +152,14 @@ def validate_intervention(state: SimulationState, intervention: Intervention) ->
             reason = f"引用了不存在的阶段“{value}”"
         elif op in {"set_world", "increment_world"} and state.state_schema and key not in state.state_schema:
             reason = f"引用了未声明的世界状态“{key}”"
+        elif (
+            op in {"set_world", "increment_world"}
+            and not state.state_schema
+            and state.world_state
+            and key not in state.world_state
+        ):
+            reason = f"引用了未声明的世界状态“{key}”；事件叙述仍可进入时间线，但不会创建近义字段"
+            severity = "warning" if intervention.mode == "event" else "blocking"
         elif op == "set_world" and not state._valid_world_value(key, value):
             reason = f"世界状态“{key}”的值不符合 schema"
         elif op == "increment_world" and (
@@ -106,10 +175,22 @@ def validate_intervention(state: SimulationState, intervention: Intervention) ->
         elif op == "set_agent_status" and not isinstance(value, bool):
             reason = "角色状态值必须是 true 或 false"
         if reason:
-            conflicts.append(_conflict("blocking", "unknown_reference", reason))
+            conflicts.append(_conflict(severity, "unknown_reference", reason))
         else:
             safe_patch.append(operation)
 
+    if intervention.mode == "guidance" and intervention.visibility == "audience_only":
+        intervention.mode = "event"
+        intervention.event_narration = (
+            intervention.event_narration
+            or intervention.normalized_directive
+            or intervention.raw_text
+        )
+        conflicts.append(_conflict(
+            "warning",
+            "rule",
+            "仅观众可见的具体镜头已按 audience_only 事件处理，不会进入角色记忆。",
+        ))
     if intervention.mode == "guidance":
         safe_patch = []
         intervention.event_narration = ""
@@ -120,6 +201,7 @@ def validate_intervention(state: SimulationState, intervention: Intervention) ->
     if intervention.visibility == "audience_only" and safe_patch:
         conflicts.append(_conflict("blocking", "rule", "仅观众可见的事件不能直接修改公共状态"))
         safe_patch = []
+    conflicts.extend(_pending_patch_conflicts(state, intervention, safe_patch))
 
     # Deduplicate deterministic/model conflicts without hiding independent issues.
     seen = set()

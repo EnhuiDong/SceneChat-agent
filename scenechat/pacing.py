@@ -82,11 +82,22 @@ def active_beat_context(state: SimulationState) -> str:
 def pacing_context(state: SimulationState) -> str:
     initialize_arc(state)
     policy = PacingPolicy.from_value(state.arc_state.pace)
+    resolution_instruction = ""
+    if policy.pace > 80:
+        resolution_instruction = (
+            "\n本档位要求：只要不违反硬规则和人物逻辑，本轮旁白应优先让当前节点出现可观察的完成结果，"
+            "不要连续只埋线索或重复加压；完成后再激活下一节点。"
+        )
+    elif policy.pace > 60:
+        resolution_instruction = (
+            "\n本档位要求：优先制造能实质推进当前节点的机会，并在结果已经发生时准确提交 resolved_beat_ids。"
+        )
     return (
         f"节奏档位：{policy.label}（{policy.pace}/100）。{policy.direction}。\n"
         f"剧情进度：{round(state.arc_state.progress * 100)}%；张力：{round(state.arc_state.tension * 100)}%。\n"
         f"预计收束轮次：约第 {state.arc_state.target_end_turn} 轮。该数字是软目标，不得牺牲人物逻辑或硬规则。\n"
         f"当前可推进节点：\n{active_beat_context(state)}"
+        f"{resolution_instruction}"
     )
 
 

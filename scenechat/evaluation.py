@@ -147,6 +147,138 @@ def evaluate_trace(
     return metrics
 
 
+def evaluate_director_control(state: SimulationState) -> dict[str, QualityScore]:
+    """Score persisted intervention safety and observable application results."""
+
+    interventions = list(state.interventions)
+    ids = [item.id for item in interventions]
+    unique_ids = len(ids) == len(set(ids))
+    valid_statuses = {"preview", "pending", "applied", "cancelled", "rejected"}
+    lifecycle_issues = [
+        item.id for item in interventions
+        if item.status not in valid_statuses
+        or (item.status == "applied" and item.applied_at_turn is None)
+    ]
+
+    timeline_ids: set[str] = set()
+    private_event_ids = set()
+    unsafe_private_patches = []
+    for message in state.history:
+        if isinstance(message.intent, dict):
+            timeline_ids.update(
+                str(item) for item in message.intent.get("intervention_ids") or []
+            )
+            intervention_id = message.intent.get("intervention_id")
+            if intervention_id:
+                timeline_ids.add(str(intervention_id))
+        if message.visibility == "audience_only":
+            private_event_ids.add(message.event_id)
+            if message.state_patch or message.state_updates:
+                unsafe_private_patches.append(message.event_id)
+
+    missing_timeline = [
+        item.id for item in interventions
+        if item.status == "applied" and item.id not in timeline_ids
+    ]
+    leaked_private_events = []
+    for agent in state.agents.values():
+        memory_event_ids = {memory.event_id for memory in agent.memories}
+        leaked_private_events.extend(sorted(private_event_ids & memory_event_ids))
+
+    blocking_applied = [
+        item.id for item in interventions
+        if item.status in {"pending", "applied"}
+        and item.mode != "override"
+        and any(conflict.get("severity") == "blocking" for conflict in item.conflicts)
+    ]
+    patch_issues = [
+        item.id for item in interventions
+        if (item.mode == "guidance" and item.proposed_patch)
+        or (item.visibility == "audience_only" and item.proposed_patch)
+    ]
+
+    return {
+        "intervention_identity": _score(
+            1.0 if unique_ids else 0.0,
+            "all intervention ids unique" if unique_ids else "duplicate intervention ids found",
+            1.0,
+        ),
+        "lifecycle_integrity": _score(
+            1.0 if not lifecycle_issues else 0.0,
+            "statuses and applied turns are valid"
+            if not lifecycle_issues else f"invalid lifecycle: {lifecycle_issues}",
+            1.0,
+        ),
+        "timeline_accounting": _score(
+            1.0 if not missing_timeline else 0.0,
+            "all applied interventions are traceable"
+            if not missing_timeline else f"missing timeline markers: {missing_timeline}",
+            1.0,
+        ),
+        "director_privacy": _score(
+            1.0 if not leaked_private_events and not unsafe_private_patches else 0.0,
+            "reader-only events stayed out of agent memory and public state"
+            if not leaked_private_events and not unsafe_private_patches
+            else f"leaked={leaked_private_events}, unsafe_patches={unsafe_private_patches}",
+            1.0,
+        ),
+        "conflict_enforcement": _score(
+            1.0 if not blocking_applied else 0.0,
+            "no blocked non-override intervention was queued or applied"
+            if not blocking_applied else f"blocked interventions active: {blocking_applied}",
+            1.0,
+        ),
+        "patch_boundary": _score(
+            1.0 if not patch_issues else 0.0,
+            "guidance and reader-only interventions carry no state patch"
+            if not patch_issues else f"unsafe intervention patches: {patch_issues}",
+            1.0,
+        ),
+    }
+
+
+def compare_pacing_runs(
+    slow_state: SimulationState,
+    fast_state: SimulationState,
+) -> dict[str, QualityScore]:
+    """Compare two runs of the same scenario using observable pacing effects."""
+
+    slow_events = max(len(slow_state.history), 1)
+    fast_events = max(len(fast_state.history), 1)
+    slow_density = slow_state.narration_count / slow_events
+    fast_density = fast_state.narration_count / fast_events
+    slow_remaining = max(
+        0,
+        (slow_state.arc_state.target_end_turn or slow_state.turn_count)
+        - slow_state.turn_count,
+    )
+    fast_remaining = max(
+        0,
+        (fast_state.arc_state.target_end_turn or fast_state.turn_count)
+        - fast_state.turn_count,
+    )
+
+    return {
+        "target_horizon_order": _score(
+            1.0 if fast_remaining < slow_remaining else 0.0,
+            f"slow remaining={slow_remaining}, fast remaining={fast_remaining}",
+            1.0,
+        ),
+        "narration_density_order": _score(
+            1.0 if fast_density >= slow_density else 0.0,
+            f"slow={slow_density:.3f}, fast={fast_density:.3f}",
+            1.0,
+        ),
+        "progress_order": _score(
+            1.0
+            if fast_state.ended or fast_state.arc_state.progress > slow_state.arc_state.progress
+            else 0.0,
+            f"slow={slow_state.arc_state.progress:.3f}, fast={fast_state.arc_state.progress:.3f}",
+            1.0,
+        ),
+    }
+
+
 def summarize_quality(metrics: dict[str, QualityScore]) -> dict:
     values = [metric.value for metric in metrics.values()]
     return {
