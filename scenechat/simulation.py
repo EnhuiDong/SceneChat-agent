@@ -72,11 +72,13 @@ def build_agent_prompt(
 
 【自然对话规则】
 1. 如果“需要优先处理的回应”非空，本轮应先回应其中最紧迫的一项；填写对应 reply_to_event_id。可以回答、质疑、回避或拒绝，但不能像没听见一样另起话题。
+   标为“可选择插话”的内容不是强制回应；只有当它与当前目标、关系或秘密风险确实相关时才插话，避免所有人逢点名必抢话。
 2. 每轮只推进一个主要意图。优先对最近的具体言行作出反应，不要重新介绍人物、世界背景或复述双方已经知道的事实。
 3. 遵循语言画像，但不要机械重复口癖。让句长、礼貌、直接程度、情绪外显和信息披露方式体现人物差异。
 4. 角色通常不会把完整动机、秘密和推理过程直接说出口。允许潜台词、停顿、试探、反问、转移、沉默，以及动作与台词不完全一致。
 5. 除非题材或当前情境要求正式陈述，speech 通常控制在一至三句；没有必要说话时可以只行动或保持沉默。
-6. relationship_updates 只在本轮出现新证据并确实改变主观判断时填写；不要每轮刷新关系描述。
+6. relationship_updates 只在一条自己确实观察过的历史事件提供新证据时填写；reason_event_id 必须指向该事件，单轮变化保持小幅。公开礼貌不等于私人信任恢复。
+7. 信息披露压力较高时，角色更难完全无视追问，但仍可以有限回答、转移、撒谎或反问；不要因为数值升高就自动公开全部秘密。
 
 你只提交 Intent，不直接修改世界状态。action_type、ability 和 target 必须来自上面的当前阶段、能力与在场角色；不能凭空宣布自己获胜、获得能力、知道秘密或强迫他人完成重大决定。private_reason 只解释本轮决策，不会公开，也不会自动写入长期记忆。
 
@@ -88,14 +90,25 @@ def build_agent_prompt(
   "target": "目标角色或地点；不需要目标时为空",
   "ability": "能力 ID 或名称；不使用能力时为空",
   "private_reason": "该角色不会说出口的一句理由",
-  "relationship_updates": {{"其他角色姓名": "行动后形成的主观关系判断"}},
+  "relationship_updates": {{
+    "其他角色姓名": {{
+      "trust_delta": 0.0,
+      "suspicion_delta": 0.0,
+      "affinity_delta": 0.0,
+      "reason_event_id": "造成变化的可见历史 event_id",
+      "private_note": "该事件为何改变了判断",
+      "summary": "可选：更新后的简短主观关系描述"
+    }}
+  }},
   "addressed_to": ["本轮明确对话或行动指向的角色姓名"],
+  "mentioned_agents": ["被谈及、可能因此选择插话，但本轮并非直接对话对象的角色"],
   "reply_to_event_id": "正在回应的可见消息 event_id；没有时为空",
   "conversation_move": "statement|answer|question|request|challenge|deflect|support|reveal|acknowledge|silence",
   "urgency": 0.0,
   "short_term_state": {{
     "emotion": {{"label": "本轮后的具体情绪", "intensity": 0.0}},
     "conversation_goal": "接下来几轮希望通过交流达成什么",
+    "disclosure_pressure_delta": 0.0,
     "commitments_add": ["本轮新作出的、之后需要履行的承诺"],
     "commitments_resolve": ["本轮已经履行的既有承诺，文字必须与列表一致"]
   }},
@@ -158,6 +171,7 @@ def parse_agent_intent(raw: str) -> Optional[dict]:
             "proposed_patch": [],
             "relationship_updates": {},
             "addressed_to": [],
+            "mentioned_agents": [],
             "reply_to_event_id": "",
             "conversation_move": "statement",
             "urgency": 0.0,
@@ -186,6 +200,9 @@ def parse_agent_intent(raw: str) -> Optional[dict]:
         else {},
         "addressed_to": payload.get("addressed_to")
         if isinstance(payload.get("addressed_to"), list)
+        else [],
+        "mentioned_agents": payload.get("mentioned_agents")
+        if isinstance(payload.get("mentioned_agents"), list)
         else [],
         "reply_to_event_id": str(payload.get("reply_to_event_id") or "").strip(),
         "conversation_move": str(payload.get("conversation_move") or "statement").strip(),
@@ -317,7 +334,9 @@ def simulate_next_turn(
         f"角色目标：{'；'.join(agent.goals)}\n"
         f"近期观察：{agent.recent_observations(5)}\n"
         f"当前对话目标：{agent.current_conversation_goal or '依据长期目标判断'}\n"
-        f"待回应对象：{agent.last_addressed_by or '无'}"
+        f"待回应对象：{agent.last_addressed_by or '无'}\n"
+        f"当前披露压力：{agent.disclosure_pressure:.2f}\n"
+        f"可选择插话数：{len(agent.conversation_opportunities)}"
     )
     try:
         retrieved_context = knowledge_base.retrieve_for_agent(
@@ -361,7 +380,12 @@ def simulate_next_turn(
                 f"{quality_retry_instruction(quality_issues)}\n"
                 "保持人物目标和行动方向不变，只修正上述问题。"
             )
-            if attempt < retries or any(issue.hard for issue in quality_issues):
+            should_retry = attempt < retries
+            state.record_dialogue_quality_issues(
+                [issue.code for issue in quality_issues],
+                retried=should_retry,
+            )
+            if should_retry or any(issue.hard for issue in quality_issues):
                 continue
         state.record_generation_success()
         return _message_from_resolution(state, agent, intent, resolution)

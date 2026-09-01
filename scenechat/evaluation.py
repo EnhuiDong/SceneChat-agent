@@ -7,6 +7,7 @@ used in local experiments or CI without changing production behavior.
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from dataclasses import asdict, dataclass
 from difflib import SequenceMatcher
@@ -133,6 +134,40 @@ def evaluate_trace(
     natural_end = ended and bool(state.end_reason) and state.end_kind not in {"max_turns", "blocked"}
     failure_count = state.failed_generation_count if state else 0
     blocked = bool(state and state.run_status == "blocked")
+    obligations = {
+        message.event_id
+        for message in dialogue
+        if isinstance(message.intent, dict)
+        and message.intent.get("conversation_move") in {"question", "request", "challenge"}
+        and message.intent.get("addressed_to")
+    }
+    replies = {
+        str(message.intent.get("reply_to_event_id") or "")
+        for message in dialogue
+        if isinstance(message.intent, dict) and message.intent.get("reply_to_event_id")
+    }
+    responsiveness = len(obligations.intersection(replies)) / max(len(obligations), 1)
+    threaded = sum(
+        bool(message.intent.get("reply_to_event_id") or message.intent.get("mentioned_agents"))
+        for message in dialogue
+        if isinstance(message.intent, dict)
+    ) / max(len(dialogue), 1)
+    monologues = sum(
+        len(message.speech) > 240
+        or len([part for part in re.split(r"[。！？!?；;]+", message.speech) if part.strip()]) > 4
+        for message in dialogue
+    )
+    relationship_updates = [
+        update
+        for message in dialogue
+        if isinstance(message.intent, dict)
+        for update in (message.intent.get("relationship_updates") or {}).values()
+        if isinstance(update, dict)
+    ]
+    evidenced_relationships = sum(
+        bool(update.get("reason_event_id") and update.get("private_note"))
+        for update in relationship_updates
+    )
 
     metrics = {
         "non_empty_dialogue": _score(1.0 if dialogue else 0.0, f"{len(dialogue)} dialogue events", 1.0),
@@ -141,7 +176,50 @@ def evaluate_trace(
         "turn_balance": _score(balance, f"normalized speaker entropy={balance:.3f}", 0.65),
         "role_differentiation": _score(differentiation, f"lexical differentiation={differentiation:.3f}", 0.45),
         "generation_stability": _score(0.0 if blocked else 1 / (1 + failure_count), f"failed generations={failure_count}, blocked={blocked}", 0.8),
+        "conversation_responsiveness": _score(
+            responsiveness if obligations else 1.0,
+            f"answered obligations={len(obligations.intersection(replies))}/{len(obligations)}",
+            0.75,
+        ),
+        "threaded_interaction": _score(
+            min(1.0, threaded * 2) if dialogue else 0.0,
+            f"linked or mention-aware turns={threaded:.3f}",
+            0.4,
+        ),
+        "monologue_avoidance": _score(
+            1 - monologues / max(len(dialogue), 1),
+            f"overlong dialogue turns={monologues}/{len(dialogue)}",
+        ),
+        "relationship_evidence": _score(
+            evidenced_relationships / max(len(relationship_updates), 1)
+            if relationship_updates else 1.0,
+            f"evidenced updates={evidenced_relationships}/{len(relationship_updates)}",
+            1.0,
+        ),
     }
+    if state is not None:
+        structured_memories = sum(
+            memory.memory_type != "event"
+            for agent in state.agents.values()
+            for memory in agent.memories
+        )
+        reflection_noise = sum(
+            memory.source == "private_reflection"
+            for agent in state.agents.values()
+            for memory in agent.memories
+        )
+        metrics["memory_signal"] = _score(
+            structured_memories / max(structured_memories + reflection_noise, 1)
+            if structured_memories or reflection_noise else 1.0,
+            f"structured memories={structured_memories}, reflection noise={reflection_noise}",
+            0.8,
+        )
+        quality_retries = getattr(state, "dialogue_quality_retry_count", 0)
+        metrics["quality_gate_stability"] = _score(
+            1 / (1 + quality_retries / max(len(dialogue), 1)),
+            f"quality retries={quality_retries}/{len(dialogue)} dialogue turns",
+            0.7,
+        )
     if expect_end or ended:
         metrics["natural_ending"] = _score(1.0 if natural_end else 0.0, f"ended={ended}, kind={getattr(state, 'end_kind', '')}", 1.0)
     return metrics

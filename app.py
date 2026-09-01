@@ -1158,6 +1158,8 @@ def full_session_export(session_id: str, session: dict) -> dict:
             "winner": state.winner,
             "run_status": state.run_status,
             "failed_generation_count": state.failed_generation_count,
+            "dialogue_quality_retry_count": state.dialogue_quality_retry_count,
+            "dialogue_quality_issue_counts": dict(state.dialogue_quality_issue_counts),
             "votes": state.votes,
             "pending_events": state.pending_events,
             "interventions": [asdict(item) for item in state.interventions],

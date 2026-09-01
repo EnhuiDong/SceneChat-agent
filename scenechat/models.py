@@ -139,7 +139,7 @@ class Message:
     visibility: str = "public"
     state_updates: Dict[str, str] = field(default_factory=dict)
     memory: str = ""
-    relationship_updates: Dict[str, str] = field(default_factory=dict)
+    relationship_updates: Dict[str, Any] = field(default_factory=dict)
     end_signal: bool = False
     end_reason: str = ""
     event_id: str = field(default_factory=lambda: uuid.uuid4().hex)
@@ -208,6 +208,7 @@ class AgentState:
     private_memory: List[str] = field(default_factory=list)
     observations: List[str] = field(default_factory=list)
     relationships: Dict[str, str] = field(default_factory=dict)
+    relationship_dynamics: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     role: str = ""
     abilities: List[str] = field(default_factory=list)
     id: str = ""
@@ -225,10 +226,12 @@ class AgentState:
     emotion_intensity: float = 0.2
     emotion_cause_event_id: str = ""
     current_conversation_goal: str = ""
+    disclosure_pressure: float = 0.0
     pending_commitments: List[str] = field(default_factory=list)
     unanswered_questions: List[Dict[str, Any]] = field(default_factory=list)
     last_addressed_by: str = ""
     pending_intents: List[Dict[str, Any]] = field(default_factory=list)
+    conversation_opportunities: List[Dict[str, Any]] = field(default_factory=list)
     memories: List[MemoryRecord] = field(default_factory=list)
     memory_summaries: List[Dict[str, Any]] = field(default_factory=list)
     initiative: int = 0
@@ -333,12 +336,78 @@ class AgentState:
             if item.memory_type == memory_type and "".join(item.content.split()).lower() == normalized:
                 item.active = False
 
+    def apply_relationship_update(
+        self,
+        target: str,
+        update: Dict[str, Any] | str,
+        *,
+        event_id: str,
+        turn: int,
+        phase: str,
+    ) -> None:
+        if isinstance(update, str):
+            value = update.strip()[:300]
+            if value:
+                self.relationships[target] = value
+            return
+        if not isinstance(update, dict):
+            return
+        dynamic = self.relationship_dynamics.setdefault(target, {
+            "trust": 0.5,
+            "suspicion": 0.5,
+            "affinity": 0.5,
+            "evidence": [],
+        })
+
+        def apply_delta(key: str) -> float:
+            try:
+                delta = max(-0.2, min(float(update.get(f"{key}_delta", 0.0)), 0.2))
+                current = max(0.0, min(float(dynamic.get(key, 0.5)), 1.0))
+            except (TypeError, ValueError):
+                delta, current = 0.0, 0.5
+            dynamic[key] = round(max(0.0, min(current + delta, 1.0)), 4)
+            return delta
+
+        deltas = {key: apply_delta(key) for key in ("trust", "suspicion", "affinity")}
+        note = str(update.get("private_note") or update.get("summary") or "").strip()[:300]
+        evidence = dynamic.get("evidence")
+        if not isinstance(evidence, list):
+            evidence = []
+        evidence.append({
+            "event_id": str(update.get("reason_event_id") or event_id)[:120],
+            "turn": turn,
+            "note": note,
+            **{f"{key}_delta": value for key, value in deltas.items()},
+        })
+        dynamic["evidence"] = evidence[-12:]
+        summary = str(update.get("summary") or "").strip()[:300]
+        if summary:
+            self.relationships[target] = summary
+        evidence_text = note or (
+            f"信任 {deltas['trust']:+.2f}，怀疑 {deltas['suspicion']:+.2f}，"
+            f"亲近 {deltas['affinity']:+.2f}"
+        )
+        self.remember_structured(
+            f"关于{target}：{evidence_text}",
+            memory_type="relationship_evidence",
+            importance=3,
+            event_id=str(update.get("reason_event_id") or event_id),
+            turn=turn,
+            phase=phase,
+            related_agents=[target],
+        )
+
     def layered_memory(self, focus_agents: List[str] | None = None, limit: int = 14) -> str:
         focus = set(focus_agents or [])
-        summarized_through = max(
-            [int(item.get("through_turn", 0) or 0) for item in self.memory_summaries]
-            or [0]
-        )
+        summary_turns = [0]
+        for item in self.memory_summaries:
+            if not isinstance(item, dict):
+                continue
+            try:
+                summary_turns.append(max(0, int(item.get("through_turn", 0) or 0)))
+            except (TypeError, ValueError):
+                continue
+        summarized_through = max(summary_turns)
         selected = [
             item for item in self.memories
             if item.active and item.memory_type != "event" and item.importance >= 2
@@ -461,6 +530,8 @@ class SimulationState:
         self.arc_state = ArcState()
         self.protected_agents: set[str] = set()
         self.failed_generation_count = 0
+        self.dialogue_quality_retry_count = 0
+        self.dialogue_quality_issue_counts: Dict[str, int] = {}
         self.run_status = "running"
 
         default_location = self.locations[0] if self.locations else scene
@@ -514,16 +585,13 @@ class SimulationState:
                     phase=self.current_phase,
                 )
             for target, update in msg.relationship_updates.items():
-                if target in self.agents and target != active_agent.name and update.strip():
-                    active_agent.relationships[target] = update.strip()
-                    active_agent.remember_structured(
-                        f"关于{target}：{update.strip()}",
-                        memory_type="relationship_evidence",
-                        importance=3,
+                if target in self.agents and target != active_agent.name:
+                    active_agent.apply_relationship_update(
+                        target,
+                        update,
                         event_id=msg.event_id,
                         turn=msg.turn,
                         phase=self.current_phase,
-                        related_agents=[target],
                     )
             self._update_conversation_state(active_agent, msg)
 
@@ -562,6 +630,15 @@ class SimulationState:
         update_arc_after_message(self, msg)
         phase_changed = self.current_phase != phase_before
         for agent in self.agents.values():
+            fresh_opportunities = []
+            for item in agent.conversation_opportunities:
+                try:
+                    created_at = int(item.get("created_at_turn", 0) or 0)
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                if created_at >= msg.turn - 4:
+                    fresh_opportunities.append(item)
+            agent.conversation_opportunities = fresh_opportunities[-8:]
             if self._agent_can_observe(agent, msg):
                 agent.refresh_memory_summary(
                     self.current_phase,
@@ -574,6 +651,7 @@ class SimulationState:
         """Commit validated dialogue metadata without granting world authority."""
 
         intent = msg.intent if isinstance(msg.intent, dict) else {}
+        actor.conversation_opportunities = []
         reply_to = str(intent.get("reply_to_event_id") or "").strip()
         if reply_to:
             actor.pending_intents = [
@@ -609,6 +687,17 @@ class SimulationState:
             goal = str(short_term.get("conversation_goal") or "").strip()
             if goal:
                 actor.current_conversation_goal = goal[:240]
+            try:
+                pressure_delta = max(
+                    -0.15,
+                    min(float(short_term.get("disclosure_pressure_delta", 0.0)), 0.15),
+                )
+                actor.disclosure_pressure = max(
+                    0.0,
+                    min(actor.disclosure_pressure + pressure_delta, 1.0),
+                )
+            except (TypeError, ValueError):
+                pass
             resolved = {
                 str(item).strip() for item in short_term.get("commitments_resolve") or []
                 if str(item).strip()
@@ -660,6 +749,33 @@ class SimulationState:
             if str(name) in self.agents and str(name) != actor.name
         ]
         summary = (msg.speech or msg.action).strip()[:300]
+        mentioned_agents = [
+            str(name) for name in intent.get("mentioned_agents") or []
+            if str(name) in self.agents
+            and str(name) != actor.name
+            and str(name) not in addressed_to
+        ]
+        for name in mentioned_agents:
+            target = self.agents[name]
+            if not summary or not self._agent_can_observe(target, msg):
+                continue
+            target.conversation_opportunities.append({
+                "event_id": msg.event_id,
+                "speaker": actor.name,
+                "move": "mention",
+                "summary": summary,
+                "urgency": max(0.25, min(actor.initiative / 100, 1.0)),
+                "created_at_turn": msg.turn,
+            })
+            target.conversation_opportunities = target.conversation_opportunities[-8:]
+
+        if move == "reveal":
+            actor.disclosure_pressure = max(0.0, actor.disclosure_pressure - 0.25)
+        elif move == "deflect":
+            actor.disclosure_pressure = min(1.0, actor.disclosure_pressure + 0.08)
+        elif move in {"answer", "acknowledge"}:
+            actor.disclosure_pressure = max(0.0, actor.disclosure_pressure - 0.08)
+
         if not summary or move not in {"question", "request", "challenge"}:
             return
         obligation = {
@@ -677,6 +793,8 @@ class SimulationState:
                 continue
             delivered_to.append(name)
             target.last_addressed_by = actor.name
+            pressure_gain = (0.04 if move == "question" else 0.08) + obligation["urgency"] * 0.12
+            target.disclosure_pressure = min(1.0, target.disclosure_pressure + pressure_gain)
             target.pending_intents = [
                 item for item in target.pending_intents
                 if str(item.get("event_id") or "") != msg.event_id
@@ -879,6 +997,16 @@ class SimulationState:
 
     def record_generation_success(self) -> None:
         self.failed_generation_count = 0
+
+    def record_dialogue_quality_issues(self, codes: List[str], *, retried: bool) -> None:
+        if retried:
+            self.dialogue_quality_retry_count += 1
+        for code in codes:
+            value = str(code).strip()
+            if value:
+                self.dialogue_quality_issue_counts[value] = (
+                    self.dialogue_quality_issue_counts.get(value, 0) + 1
+                )
 
     def apply_state_updates(
         self,

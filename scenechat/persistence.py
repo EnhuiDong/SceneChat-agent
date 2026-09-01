@@ -192,6 +192,55 @@ def _memory_from_dict(data: dict[str, Any]) -> MemoryRecord:
     return MemoryRecord(**values)
 
 
+def _bounded_float(value: Any, default: float, low: float = 0.0, high: float = 1.0) -> float:
+    try:
+        return max(low, min(float(value), high))
+    except (TypeError, ValueError):
+        return default
+
+
+def _conversation_item_from_dict(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "event_id": str(data.get("event_id") or "")[:120],
+        "speaker": str(data.get("speaker") or "")[:120],
+        "move": str(data.get("move") or "statement")[:40],
+        "summary": str(data.get("summary") or "")[:500],
+        "urgency": _bounded_float(data.get("urgency"), 0.0),
+        "created_at_turn": _nonnegative_int(data.get("created_at_turn"), 0),
+    }
+
+
+def _relationship_dynamics_from_dict(data: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(data, dict):
+        return {}
+    result = {}
+    for raw_target, raw_value in list(data.items())[:50]:
+        if not isinstance(raw_value, dict):
+            continue
+        target = str(raw_target).strip()[:120]
+        if not target:
+            continue
+        evidence = []
+        for item in raw_value.get("evidence") or []:
+            if not isinstance(item, dict):
+                continue
+            evidence.append({
+                "event_id": str(item.get("event_id") or "")[:120],
+                "turn": _nonnegative_int(item.get("turn"), 0),
+                "note": str(item.get("note") or "")[:300],
+                "trust_delta": _bounded_float(item.get("trust_delta"), 0.0, -0.2, 0.2),
+                "suspicion_delta": _bounded_float(item.get("suspicion_delta"), 0.0, -0.2, 0.2),
+                "affinity_delta": _bounded_float(item.get("affinity_delta"), 0.0, -0.2, 0.2),
+            })
+        result[target] = {
+            "trust": _bounded_float(raw_value.get("trust"), 0.5),
+            "suspicion": _bounded_float(raw_value.get("suspicion"), 0.5),
+            "affinity": _bounded_float(raw_value.get("affinity"), 0.5),
+            "evidence": evidence[-12:],
+        }
+    return result
+
+
 def agent_from_dict(data: dict[str, Any]) -> AgentState:
     values = _known_fields(AgentState, data)
     raw_voice_profile = data.get("voice_profile")
@@ -205,9 +254,14 @@ def agent_from_dict(data: dict[str, Any]) -> AgentState:
         if str(item).strip()
     ] if isinstance(data.get("pending_commitments"), list) else []
     values["pending_intents"] = [
-        dict(item) for item in data.get("pending_intents") or []
+        _conversation_item_from_dict(item) for item in data.get("pending_intents") or []
         if isinstance(item, dict)
-    ]
+    ][-12:]
+    values["conversation_opportunities"] = [
+        _conversation_item_from_dict(item)
+        for item in data.get("conversation_opportunities") or []
+        if isinstance(item, dict)
+    ][-8:]
     values["unanswered_questions"] = [
         dict(item) for item in data.get("unanswered_questions") or []
         if isinstance(item, dict)
@@ -221,6 +275,12 @@ def agent_from_dict(data: dict[str, Any]) -> AgentState:
         for item in data.get("memory_summaries") or []
         if isinstance(item, dict)
     ][-6:]
+    values["relationship_dynamics"] = _relationship_dynamics_from_dict(
+        data.get("relationship_dynamics")
+    )
+    values["disclosure_pressure"] = _bounded_float(
+        data.get("disclosure_pressure"), 0.0
+    )
     try:
         values["emotion_intensity"] = max(
             0.0, min(float(data.get("emotion_intensity", 0.2)), 1.0)
@@ -274,6 +334,14 @@ def state_from_dict(
     state.winner = str(data.get("winner") or "")
     state.run_status = str(data.get("run_status") or "running")
     state.failed_generation_count = int(data.get("failed_generation_count", 0))
+    state.dialogue_quality_retry_count = _nonnegative_int(
+        data.get("dialogue_quality_retry_count"), 0
+    )
+    state.dialogue_quality_issue_counts = {
+        str(key)[:80]: _nonnegative_int(value, 0)
+        for key, value in (data.get("dialogue_quality_issue_counts") or {}).items()
+        if str(key).strip()
+    } if isinstance(data.get("dialogue_quality_issue_counts"), dict) else {}
     state.votes = dict(data.get("votes") or {})
     state.pending_events = list(data.get("pending_events") or [])
     state.interventions = [

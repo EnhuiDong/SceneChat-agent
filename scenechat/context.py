@@ -124,19 +124,24 @@ def _short_term_summary(agent: AgentState) -> str:
     return (
         f"- 当前情绪：{agent.current_emotion}（强度 {agent.emotion_intensity:.2f}）\n"
         f"- 当前对话目标：{agent.current_conversation_goal or '依据长期目标判断'}\n"
+        f"- 信息披露压力：{agent.disclosure_pressure:.2f}（越高越难继续完全回避，但仍由人设决定如何回应）\n"
         f"- 尚未履行的承诺：{commitments}\n"
         f"- 自己仍在等待回答的问题：{waiting}"
     )
 
 
 def _response_obligations(agent: AgentState) -> str:
-    if not agent.pending_intents:
-        return "- 当前没有必须优先回应的直接提问或请求"
-    return "\n".join(
+    required = [
         f"- event_id={item.get('event_id')}；{item.get('speaker')}向你提出"
         f"{item.get('move')}：{item.get('summary')}（紧迫度 {item.get('urgency', 0)}）"
         for item in agent.pending_intents[-6:]
-    )
+    ]
+    opportunities = [
+        f"- 可选择插话 event_id={item.get('event_id')}：{item.get('speaker')}提到了你——"
+        f"{item.get('summary')}（相关度 {item.get('urgency', 0)}）"
+        for item in agent.conversation_opportunities[-4:]
+    ]
+    return "\n".join(required + opportunities) or "- 当前没有必须回应或值得插话的对话"
 
 
 def build_agent_view(
@@ -147,9 +152,19 @@ def build_agent_view(
     goals = "\n".join(
         f"- {goal}（{agent.goal_status.get(goal, 'active')}）" for goal in agent.goals
     ) or "- 依据自己的人设行动"
-    relationships = "\n".join(
-        f"- {key}：{value}" for key, value in agent.relationships.items()
-    ) or "- 暂无额外关系信息"
+    relationship_targets = set(agent.relationships) | set(agent.relationship_dynamics)
+    relationship_lines = []
+    for target in sorted(relationship_targets):
+        narrative = agent.relationships.get(target, "暂无稳定描述")
+        dynamic = agent.relationship_dynamics.get(target)
+        if isinstance(dynamic, dict):
+            relationship_lines.append(
+                f"- {target}：{narrative}；信任 {dynamic.get('trust', 0.5)}，"
+                f"怀疑 {dynamic.get('suspicion', 0.5)}，亲近 {dynamic.get('affinity', 0.5)}"
+            )
+        else:
+            relationship_lines.append(f"- {target}：{narrative}")
+    relationships = "\n".join(relationship_lines) or "- 暂无额外关系信息"
     colocated = [
         f"### {other.name}\n{other.public_profile}\n状态："
         f"{'可行动' if other.eligible else '已离场或不可行动'}"

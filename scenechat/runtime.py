@@ -25,8 +25,9 @@ class Intent:
     private_reason: str = ""
     expected_effect: str = ""
     proposed_patch: list[dict[str, Any]] = field(default_factory=list)
-    relationship_updates: dict[str, str] = field(default_factory=dict)
+    relationship_updates: dict[str, Any] = field(default_factory=dict)
     addressed_to: list[str] = field(default_factory=list)
+    mentioned_agents: list[str] = field(default_factory=list)
     reply_to_event_id: str = ""
     conversation_move: str = "statement"
     urgency: float = 0.0
@@ -53,13 +54,18 @@ class Intent:
             if isinstance(proposed, list)
             else [],
             relationship_updates={
-                str(key): str(value)
+                str(key): value
                 for key, value in (data.get("relationship_updates") or {}).items()
+                if isinstance(value, (dict, str))
             } if isinstance(data.get("relationship_updates"), dict) else {},
             addressed_to=[
                 str(item).strip() for item in data.get("addressed_to") or []
                 if str(item).strip()
             ] if isinstance(data.get("addressed_to"), list) else [],
+            mentioned_agents=[
+                str(item).strip() for item in data.get("mentioned_agents") or []
+                if str(item).strip()
+            ] if isinstance(data.get("mentioned_agents"), list) else [],
             reply_to_event_id=str(data.get("reply_to_event_id") or "").strip(),
             conversation_move=str(data.get("conversation_move") or "statement").strip(),
             urgency=urgency,
@@ -253,6 +259,25 @@ class IntentResolver:
             if speaker in state.agents and speaker != actor.name and speaker not in valid_addressees:
                 valid_addressees.append(speaker)
         intent.addressed_to = valid_addressees[:6]
+        mentioned = []
+        explicit_mentions = list(intent.mentioned_agents)
+        combined_text = f"{intent.action}\n{intent.speech}"
+        explicit_mentions.extend(
+            name for name in state.agents
+            if name != actor.name and len(name) >= 2 and name in combined_text
+        )
+        for name in explicit_mentions:
+            target = state.agents.get(name)
+            if (
+                target is not None
+                and target.name != actor.name
+                and target.name not in valid_addressees
+                and target.eligible
+                and target.current_location == actor.current_location
+                and target.name not in mentioned
+            ):
+                mentioned.append(target.name)
+        intent.mentioned_agents = mentioned[:6]
 
         source = intent.short_term_state
         emotion_source = source.get("emotion") if isinstance(source.get("emotion"), dict) else {}
@@ -277,7 +302,15 @@ class IntentResolver:
             "conversation_goal": str(source.get("conversation_goal") or "").strip()[:240],
             "commitments_add": text_list("commitments_add", 4),
             "commitments_resolve": text_list("commitments_resolve", 4),
+            "disclosure_pressure_delta": 0.0,
         }
+        try:
+            intent.short_term_state["disclosure_pressure_delta"] = max(
+                -0.15,
+                min(float(source.get("disclosure_pressure_delta", 0.0)), 0.15),
+            )
+        except (TypeError, ValueError):
+            pass
 
         candidates = []
         for item in intent.memory_candidates[:8]:
@@ -306,11 +339,36 @@ class IntentResolver:
             })
         intent.memory_candidates = candidates
 
-        intent.relationship_updates = {
-            target: str(update).strip()[:300]
-            for target, update in intent.relationship_updates.items()
-            if target in state.agents and target != actor.name and str(update).strip()
-        }
+        relationship_updates = {}
+        for target, update in intent.relationship_updates.items():
+            if target not in state.agents or target == actor.name or not isinstance(update, dict):
+                continue
+            reason_event_id = str(update.get("reason_event_id") or intent.reply_to_event_id).strip()
+            if reason_event_id not in visible_recent:
+                continue
+
+            def bounded_delta(key: str) -> float:
+                try:
+                    return max(-0.2, min(float(update.get(key, 0.0)), 0.2))
+                except (TypeError, ValueError):
+                    return 0.0
+
+            trust_delta = bounded_delta("trust_delta")
+            suspicion_delta = bounded_delta("suspicion_delta")
+            affinity_delta = bounded_delta("affinity_delta")
+            note = str(update.get("private_note") or "").strip()[:300]
+            summary = str(update.get("summary") or "").strip()[:300]
+            if not any((trust_delta, suspicion_delta, affinity_delta)) or not note:
+                continue
+            relationship_updates[target] = {
+                "trust_delta": trust_delta,
+                "suspicion_delta": suspicion_delta,
+                "affinity_delta": affinity_delta,
+                "reason_event_id": reason_event_id,
+                "private_note": note,
+                "summary": summary,
+            }
+        intent.relationship_updates = relationship_updates
 
     def resolve_director_event(
         self,

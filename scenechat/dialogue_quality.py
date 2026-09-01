@@ -16,7 +16,15 @@ class DialogueQualityIssue:
 
 
 def _normalized(value: Any) -> str:
-    return re.sub(r"[\W_]+", "", str(value or "").lower(), flags=re.UNICODE)
+    text = str(value or "").lower()
+    replacements = {
+        "害怕": "担心", "担忧": "担心", "恐怕": "担心",
+        "丢掉": "失去", "保不住": "失去", "饭碗": "职位", "工作": "职位",
+        "同伙": "队友", "同伴": "队友", "一伙": "队友",
+    }
+    for source, target in replacements.items():
+        text = text.replace(source, target)
+    return re.sub(r"[\W_]+", "", text, flags=re.UNICODE)
 
 
 def _similar(left: str, right: str, threshold: float) -> bool:
@@ -27,20 +35,54 @@ def _similar(left: str, right: str, threshold: float) -> bool:
     return SequenceMatcher(None, first, second).ratio() >= threshold
 
 
-def _known_text(agent: AgentState) -> str:
-    return _normalized("\n".join(
-        [agent.profile, *agent.observations, *agent.private_memory]
+def _looks_like_secret(fragment: str, output: str) -> bool:
+    secret = _normalized(fragment)
+    candidate = _normalized(output)
+    if min(len(secret), len(candidate)) < 8:
+        return False
+    if secret in candidate:
+        return True
+    if SequenceMatcher(None, secret, candidate).ratio() >= 0.68:
+        return True
+    secret_pairs = {secret[index:index + 2] for index in range(len(secret) - 1)}
+    output_pairs = {candidate[index:index + 2] for index in range(len(candidate) - 1)}
+    shared = secret_pairs.intersection(output_pairs)
+    if len(shared) >= 5 and len(shared) / max(len(secret_pairs), 1) >= 0.58:
+        return True
+    secret_characters = set(secret)
+    shared_characters = secret_characters.intersection(set(candidate))
+    return (
+        len(shared_characters) >= 6
+        and len(shared_characters) / max(len(secret_characters), 1) >= 0.68
+    )
+
+
+def _known_parts(agent: AgentState) -> list[str]:
+    profile_lines = [
+        line for line in agent.profile.splitlines()
+        if "不知道" not in line and "未知" not in line
+    ]
+    return [
+        part for part in (
+            [*profile_lines, *agent.observations, *agent.private_memory]
         + list(agent.known_facts.values())
-    ))
+        ) if str(part).strip()
+    ]
 
 
 def _hidden_fragments(state: SimulationState, agent: AgentState) -> list[str]:
-    known = _known_text(agent)
+    known_parts = _known_parts(agent)
+    normalized_known = _normalized("\n".join(known_parts))
     fragments: list[str] = []
     for fact_id, fact in state.facts.items():
         content = str(getattr(fact, "content", "") or "").strip()
         normalized = _normalized(content)
-        if fact_id not in agent.known_facts and len(normalized) >= 8 and normalized not in known:
+        if (
+            fact_id not in agent.known_facts
+            and len(normalized) >= 8
+            and normalized not in normalized_known
+            and not any(_looks_like_secret(content, part) for part in known_parts)
+        ):
             fragments.append(content)
 
     for other in state.agents.values():
@@ -55,7 +97,8 @@ def _hidden_fragments(state: SimulationState, agent: AgentState) -> list[str]:
                 or line.startswith("#")
                 or len(normalized) < 8
                 or normalized in public
-                or normalized in known
+                or normalized in normalized_known
+                or any(_looks_like_secret(line, part) for part in known_parts)
                 or line in {"无额外秘密", "未提供额外私有知识。"}
             ):
                 continue
@@ -132,10 +175,9 @@ def inspect_dialogue_intent(
             if isinstance(item, dict)
         ],
     ])
-    normalized_output = _normalized(private_output)
     leaked = next((
         fragment for fragment in _hidden_fragments(state, agent)
-        if _normalized(fragment) in normalized_output
+        if _looks_like_secret(fragment, private_output)
     ), "")
     if leaked:
         issues.append(DialogueQualityIssue(

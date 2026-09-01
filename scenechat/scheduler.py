@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from .models import AgentState, SimulationState
 
@@ -36,6 +37,41 @@ class SimulationScheduler:
                 actor.name,
                 f"优先回应 {pending.get('speaker') or '上一位角色'} 的直接"
                 f"{pending.get('move') or '发言'}",
+            )
+        opportunities_by_agent = {
+            agent.name: [
+                item for item in agent.conversation_opportunities
+                if self._pending_priority(item)[1] >= state.turn_count - 4
+            ]
+            for agent in eligible
+        }
+        opportunity_candidates = [
+            agent for agent in eligible if opportunities_by_agent[agent.name]
+        ]
+        if opportunity_candidates:
+            recent_speakers = [
+                message.speaker for message in state.history[-2:]
+                if message.speaker in state.agents
+            ]
+            fresh_candidates = [
+                agent for agent in opportunity_candidates
+                if agent.name not in recent_speakers
+            ] or opportunity_candidates
+            actor = max(
+                fresh_candidates,
+                key=lambda item: self._opportunity_priority(
+                    opportunities_by_agent[item.name]
+                ),
+            )
+            opportunity = max(
+                opportunities_by_agent[actor.name],
+                key=self._pending_priority,
+            )
+            return SchedulerDecision(
+                "agent",
+                actor.name,
+                f"{opportunity.get('speaker') or '上一位角色'}提及了该角色，"
+                "允许其按相关性选择插话",
             )
         if strategy == "initiative":
             actor = sorted(eligible, key=lambda item: (-item.initiative, item.name))[0]
@@ -113,3 +149,14 @@ class SimulationScheduler:
             default=(0.0, 0),
         )
         return urgency, created_at, agent.name
+
+    @classmethod
+    def _opportunity_priority(
+        cls,
+        opportunities: list[dict[str, Any]],
+    ) -> tuple[float, int]:
+        urgency, created_at = max(
+            (cls._pending_priority(item) for item in opportunities),
+            default=(0.0, 0),
+        )
+        return urgency, created_at
