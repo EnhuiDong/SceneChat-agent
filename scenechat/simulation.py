@@ -4,6 +4,7 @@ import re
 from typing import Optional, Protocol
 
 from .context import build_agent_view, director_context
+from .dialogue_quality import inspect_dialogue_intent, quality_retry_instruction
 from .models import AgentState, Message, SimulationState
 from .interventions import (
     active_guidance,
@@ -24,6 +25,13 @@ from .scheduler import SimulationScheduler
 
 
 MAX_VISIBLE_OBSERVATIONS = 15
+
+
+def _single_retry_setting(name: str, default: str = "1") -> int:
+    try:
+        return max(0, min(int(os.getenv(name, default)), 1))
+    except (TypeError, ValueError):
+        return int(default)
 
 
 class AgentKnowledge(Protocol):
@@ -62,7 +70,15 @@ def build_agent_prompt(
 
 请严格站在“{agent.name}”的有限视角中推进一轮行动。行动和发言必须符合其身份、目标、已知信息与社会处境，不要解释创作过程，不要替其他角色行动。
 
-你只提交 Intent，不直接修改世界状态。action_type、ability 和 target 必须来自上面的当前阶段、能力与在场角色；不能凭空宣布自己获胜、获得能力、知道秘密或强迫他人完成重大决定。private_reason 只用于该角色的私人记忆，不会公开。
+【自然对话规则】
+1. 如果“需要优先处理的回应”非空，本轮应先回应其中最紧迫的一项；填写对应 reply_to_event_id。可以回答、质疑、回避或拒绝，但不能像没听见一样另起话题。
+2. 每轮只推进一个主要意图。优先对最近的具体言行作出反应，不要重新介绍人物、世界背景或复述双方已经知道的事实。
+3. 遵循语言画像，但不要机械重复口癖。让句长、礼貌、直接程度、情绪外显和信息披露方式体现人物差异。
+4. 角色通常不会把完整动机、秘密和推理过程直接说出口。允许潜台词、停顿、试探、反问、转移、沉默，以及动作与台词不完全一致。
+5. 除非题材或当前情境要求正式陈述，speech 通常控制在一至三句；没有必要说话时可以只行动或保持沉默。
+6. relationship_updates 只在本轮出现新证据并确实改变主观判断时填写；不要每轮刷新关系描述。
+
+你只提交 Intent，不直接修改世界状态。action_type、ability 和 target 必须来自上面的当前阶段、能力与在场角色；不能凭空宣布自己获胜、获得能力、知道秘密或强迫他人完成重大决定。private_reason 只解释本轮决策，不会公开，也不会自动写入长期记忆。
 
 只输出一个 JSON 对象，不要使用 Markdown 代码块：
 {{
@@ -73,6 +89,23 @@ def build_agent_prompt(
   "ability": "能力 ID 或名称；不使用能力时为空",
   "private_reason": "该角色不会说出口的一句理由",
   "relationship_updates": {{"其他角色姓名": "行动后形成的主观关系判断"}},
+  "addressed_to": ["本轮明确对话或行动指向的角色姓名"],
+  "reply_to_event_id": "正在回应的可见消息 event_id；没有时为空",
+  "conversation_move": "statement|answer|question|request|challenge|deflect|support|reveal|acknowledge|silence",
+  "urgency": 0.0,
+  "short_term_state": {{
+    "emotion": {{"label": "本轮后的具体情绪", "intensity": 0.0}},
+    "conversation_goal": "接下来几轮希望通过交流达成什么",
+    "commitments_add": ["本轮新作出的、之后需要履行的承诺"],
+    "commitments_resolve": ["本轮已经履行的既有承诺，文字必须与列表一致"]
+  }},
+  "memory_candidates": [{{
+    "type": "claim|clue|commitment|relationship_evidence|revelation|decision",
+    "content": "本轮值得跨多轮保留的一条具体信息；普通动作和泛泛心理不要填写",
+    "importance": 1,
+    "related_agents": ["与这条记忆直接相关的角色"],
+    "source_event_id": "信息来自某条可见历史消息时填写，否则为空"
+  }}],
   "expected_effect": "角色期望发生什么，不代表一定成功",
   "proposed_patch": []
 }}
@@ -124,6 +157,12 @@ def parse_agent_intent(raw: str) -> Optional[dict]:
             "expected_effect": "",
             "proposed_patch": [],
             "relationship_updates": {},
+            "addressed_to": [],
+            "reply_to_event_id": "",
+            "conversation_move": "statement",
+            "urgency": 0.0,
+            "short_term_state": {},
+            "memory_candidates": [],
         }
     if not isinstance(payload, dict):
         return None
@@ -145,6 +184,18 @@ def parse_agent_intent(raw: str) -> Optional[dict]:
         "relationship_updates": payload.get("relationship_updates")
         if isinstance(payload.get("relationship_updates"), dict)
         else {},
+        "addressed_to": payload.get("addressed_to")
+        if isinstance(payload.get("addressed_to"), list)
+        else [],
+        "reply_to_event_id": str(payload.get("reply_to_event_id") or "").strip(),
+        "conversation_move": str(payload.get("conversation_move") or "statement").strip(),
+        "urgency": payload.get("urgency", 0.0),
+        "short_term_state": payload.get("short_term_state")
+        if isinstance(payload.get("short_term_state"), dict)
+        else {},
+        "memory_candidates": payload.get("memory_candidates")
+        if isinstance(payload.get("memory_candidates"), list)
+        else [],
     }
 
 
@@ -264,7 +315,9 @@ def simulate_next_turn(
         f"当前场景：{state.scene}\n"
         f"当前角色：{agent.name}\n"
         f"角色目标：{'；'.join(agent.goals)}\n"
-        f"近期观察：{agent.recent_observations(5)}"
+        f"近期观察：{agent.recent_observations(5)}\n"
+        f"当前对话目标：{agent.current_conversation_goal or '依据长期目标判断'}\n"
+        f"待回应对象：{agent.last_addressed_by or '无'}"
     )
     try:
         retrieved_context = knowledge_base.retrieve_for_agent(
@@ -279,7 +332,10 @@ def simulate_next_turn(
     prompt = build_agent_prompt(state, agent, retrieved_context)
     active_llm = llm or get_simulation_llm()
     active_resolver = resolver or IntentResolver()
-    retries = max(0, min(int(os.getenv("SIMULATION_PARSE_RETRIES", "1")), 1))
+    retries = max(
+        _single_retry_setting("SIMULATION_PARSE_RETRIES"),
+        _single_retry_setting("SIMULATION_QUALITY_RETRIES"),
+    )
     rejection = ""
     for attempt in range(retries + 1):
         attempt_prompt = prompt
@@ -288,7 +344,7 @@ def simulate_next_turn(
                 "\n\n【上一次 Intent 被拒绝】\n"
                 f"{rejection}\n请保持角色目标不变，改为提交一项当前阶段合法的 Intent。"
             )
-        response = active_llm.complete(attempt_prompt, max_tokens=360)
+        response = active_llm.complete(attempt_prompt, max_tokens=520)
         parsed = parse_agent_intent(response.text)
         if parsed is None:
             rejection = "输出不是合法的 Intent JSON"
@@ -298,6 +354,15 @@ def simulate_next_turn(
         if not resolution.accepted:
             rejection = resolution.reason
             continue
+        quality_issues = inspect_dialogue_intent(state, agent, intent)
+        if quality_issues:
+            rejection = (
+                "Intent 通过规则校验，但未通过对话质量门：\n"
+                f"{quality_retry_instruction(quality_issues)}\n"
+                "保持人物目标和行动方向不变，只修正上述问题。"
+            )
+            if attempt < retries or any(issue.hard for issue in quality_issues):
+                continue
         state.record_generation_success()
         return _message_from_resolution(state, agent, intent, resolution)
 
@@ -339,7 +404,7 @@ def _message_from_resolution(state, agent, intent, resolution) -> Message:
         participants=resolution.participants,
         individual_observations=resolution.individual_observations,
         state_updates=resolution.patch.public_updates(),
-        memory=intent.private_reason,
+        memory="",
         relationship_updates=intent.relationship_updates,
         authoritative=True,
         state_patch=resolution.patch.operations,
@@ -376,7 +441,7 @@ def simulate_narration(
     prompt = build_narrator_prompt(state, narrator_context, visibility)
     active_llm = llm or get_simulation_llm()
     parsed = None
-    retries = max(0, min(int(os.getenv("SIMULATION_PARSE_RETRIES", "1")), 1))
+    retries = _single_retry_setting("SIMULATION_PARSE_RETRIES")
     for attempt in range(retries + 1):
         attempt_prompt = prompt if attempt == 0 else (
             prompt + "\n\n上一次输出无法解析。只重新输出一个符合 schema 的完整 JSON 对象。"

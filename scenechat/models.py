@@ -5,8 +5,12 @@ import uuid
 from .visibility import ViewerContext, can_access, normalize_scopes
 
 
-MAX_AGENT_MEMORY = 20
+MAX_AGENT_MEMORY = 80
 MAX_AGENT_OBSERVATIONS = 30
+MEMORY_SUMMARY_INTERVAL = 8
+MEMORY_TYPES = {
+    "claim", "clue", "commitment", "relationship_evidence", "revelation", "decision",
+}
 
 
 @dataclass
@@ -170,6 +174,10 @@ class MemoryRecord:
     confidence: float = 1.0
     importance: int = 1
     created_at_turn: int = 0
+    memory_type: str = "event"
+    related_agents: List[str] = field(default_factory=list)
+    phase: str = ""
+    active: bool = True
 
 
 @dataclass
@@ -212,12 +220,20 @@ class AgentState:
     goal_status: Dict[str, str] = field(default_factory=dict)
     known_facts: Dict[str, str] = field(default_factory=dict)
     false_beliefs: List[str] = field(default_factory=list)
+    voice_profile: Dict[str, Any] = field(default_factory=dict)
     current_emotion: str = "平静"
+    emotion_intensity: float = 0.2
+    emotion_cause_event_id: str = ""
+    current_conversation_goal: str = ""
+    pending_commitments: List[str] = field(default_factory=list)
+    unanswered_questions: List[Dict[str, Any]] = field(default_factory=list)
+    last_addressed_by: str = ""
     pending_intents: List[Dict[str, Any]] = field(default_factory=list)
     memories: List[MemoryRecord] = field(default_factory=list)
+    memory_summaries: List[Dict[str, Any]] = field(default_factory=list)
     initiative: int = 0
 
-    def observe(self, message: Message) -> None:
+    def observe(self, message: Message, phase: str = "") -> None:
         observation = message.as_observation_for(self.name)
         self.observations.append(observation)
         self.observations = self.observations[-MAX_AGENT_OBSERVATIONS:]
@@ -229,12 +245,12 @@ class AgentState:
                 source="direct_observation",
                 visibility=[f"agent:{self.name}"],
                 created_at_turn=message.turn,
+                memory_type="event",
+                related_agents=[message.speaker] if message.speaker != self.name else [],
+                phase=phase,
             )
         )
-        self.memories = self.memories[-MAX_AGENT_MEMORY:]
-
-        if message.speaker == self.name:
-            self.remember(f"我曾经采取行动：{message.action}；并说：{message.speech}")
+        self._trim_memories()
 
     def remember(self, memory: str) -> None:
         memory = memory.strip()
@@ -250,7 +266,133 @@ class AgentState:
                 visibility=[f"agent:{self.name}"],
             )
         )
-        self.memories = self.memories[-MAX_AGENT_MEMORY:]
+        self._trim_memories()
+
+    def _trim_memories(self) -> None:
+        recent_events = [item for item in self.memories if item.memory_type == "event"][-30:]
+        structured = [item for item in self.memories if item.memory_type != "event"][-50:]
+        self.memories = sorted(
+            recent_events + structured,
+            key=lambda item: item.created_at_turn,
+        )[-MAX_AGENT_MEMORY:]
+
+    def remember_structured(
+        self,
+        content: str,
+        *,
+        memory_type: str,
+        importance: int,
+        event_id: str,
+        turn: int,
+        phase: str,
+        related_agents: List[str] | None = None,
+    ) -> None:
+        value = content.strip()[:500]
+        kind = memory_type if memory_type in MEMORY_TYPES else "decision"
+        try:
+            priority = max(1, min(int(importance), 5))
+        except (TypeError, ValueError):
+            priority = 1
+        minimum_importance = {
+            "claim": 2,
+            "clue": 2,
+            "commitment": 1,
+            "relationship_evidence": 2,
+            "revelation": 2,
+            "decision": 3,
+        }[kind]
+        if not value or priority < minimum_importance:
+            return
+        normalized = "".join(value.split()).lower()
+        duplicate = next((
+            item for item in reversed(self.memories[-20:])
+            if item.memory_type == kind
+            and "".join(item.content.split()).lower() == normalized
+        ), None)
+        if duplicate:
+            duplicate.importance = max(duplicate.importance, priority)
+            duplicate.active = True
+            duplicate.created_at_turn = max(duplicate.created_at_turn, turn)
+            return
+        self.memories.append(MemoryRecord(
+            event_id=event_id or f"memory-{uuid.uuid4().hex}",
+            content=value,
+            source="memory_candidate",
+            visibility=[f"agent:{self.name}"],
+            importance=priority,
+            created_at_turn=turn,
+            memory_type=kind,
+            related_agents=list(related_agents or [])[:6],
+            phase=phase,
+        ))
+        self._trim_memories()
+
+    def resolve_structured_memory(self, memory_type: str, content: str) -> None:
+        normalized = "".join(content.split()).lower()
+        for item in self.memories:
+            if item.memory_type == memory_type and "".join(item.content.split()).lower() == normalized:
+                item.active = False
+
+    def layered_memory(self, focus_agents: List[str] | None = None, limit: int = 14) -> str:
+        focus = set(focus_agents or [])
+        summarized_through = max(
+            [int(item.get("through_turn", 0) or 0) for item in self.memory_summaries]
+            or [0]
+        )
+        selected = [
+            item for item in self.memories
+            if item.active and item.memory_type != "event" and item.importance >= 2
+            and (
+                item.created_at_turn > summarized_through
+                or item.memory_type == "commitment"
+                or item.importance >= 5
+                or bool(focus.intersection(item.related_agents))
+            )
+        ]
+        selected.sort(
+            key=lambda item: (
+                bool(focus.intersection(item.related_agents)),
+                item.importance,
+                item.created_at_turn,
+            ),
+            reverse=True,
+        )
+        labels = {
+            "claim": "他人主张", "clue": "线索", "commitment": "承诺",
+            "relationship_evidence": "关系证据", "revelation": "已披露信息",
+            "decision": "关键决定",
+        }
+        lines = [
+            f"- [{labels.get(item.memory_type, item.memory_type)}|重要度 {item.importance}] {item.content}"
+            for item in selected[:limit]
+        ]
+        summaries = [str(item.get("content") or "") for item in self.memory_summaries[-2:]]
+        parts = summaries + lines
+        return "\n".join(part for part in parts if part) or "- 暂无需要长期保留的故事记忆"
+
+    def refresh_memory_summary(self, phase: str, turn: int, *, force: bool = False) -> None:
+        previous_turn = int(self.memory_summaries[-1].get("through_turn", 0)) if self.memory_summaries else 0
+        previous_phase = str(self.memory_summaries[-1].get("phase") or "") if self.memory_summaries else ""
+        if not self.memory_summaries and not force and turn < MEMORY_SUMMARY_INTERVAL:
+            return
+        if not force and previous_phase == phase and turn - previous_turn < MEMORY_SUMMARY_INTERVAL:
+            return
+        window = [item for item in self.memories if item.created_at_turn > previous_turn]
+        important = [item for item in window if item.active and item.importance >= 2][-8:]
+        if important:
+            body = "；".join(f"{item.memory_type}:{item.content[:120]}" for item in important)
+        else:
+            body = "；".join(
+                item.content for item in window if item.memory_type == "event"
+            )[-1200:]
+        if not body:
+            return
+        self.memory_summaries.append({
+            "phase": phase,
+            "through_turn": turn,
+            "content": f"- 阶段摘要（{phase}，截至第 {turn} 回合）：{body}",
+        })
+        self.memory_summaries = self.memory_summaries[-6:]
 
     def ability_by_reference(self, reference: str) -> AbilityState | None:
         value = reference.strip()
@@ -345,6 +487,7 @@ class SimulationState:
         raise RuntimeError("当前没有可行动角色")
 
     def add_message(self, msg: Message) -> None:
+        phase_before = self.current_phase
         self.history.append(msg)
         self.turn_count += 1
         if msg.kind in {"narration", "intervention"}:
@@ -357,15 +500,32 @@ class SimulationState:
         # observations are checked in code rather than entrusted to the model.
         for agent in self.agents.values():
             if self._agent_can_observe(agent, msg):
-                agent.observe(msg)
+                agent.observe(msg, phase=self.current_phase)
 
         active_agent = self.agents.get(msg.speaker)
         if active_agent is not None:
             if msg.memory:
-                active_agent.remember(msg.memory)
+                active_agent.remember_structured(
+                    msg.memory,
+                    memory_type="decision",
+                    importance=3,
+                    event_id=msg.event_id,
+                    turn=msg.turn,
+                    phase=self.current_phase,
+                )
             for target, update in msg.relationship_updates.items():
                 if target in self.agents and target != active_agent.name and update.strip():
                     active_agent.relationships[target] = update.strip()
+                    active_agent.remember_structured(
+                        f"关于{target}：{update.strip()}",
+                        memory_type="relationship_evidence",
+                        importance=3,
+                        event_id=msg.event_id,
+                        turn=msg.turn,
+                        phase=self.current_phase,
+                        related_agents=[target],
+                    )
+            self._update_conversation_state(active_agent, msg)
 
         # Dialogue describes an agent's attempted action; it is not an
         # authoritative rule resolution. Only an observable narrator event may
@@ -400,7 +560,137 @@ class SimulationState:
         from .pacing import update_arc_after_message
 
         update_arc_after_message(self, msg)
+        phase_changed = self.current_phase != phase_before
+        for agent in self.agents.values():
+            if self._agent_can_observe(agent, msg):
+                agent.refresh_memory_summary(
+                    self.current_phase,
+                    msg.turn,
+                    force=phase_changed,
+                )
         self.bump_revision()
+
+    def _update_conversation_state(self, actor: AgentState, msg: Message) -> None:
+        """Commit validated dialogue metadata without granting world authority."""
+
+        intent = msg.intent if isinstance(msg.intent, dict) else {}
+        reply_to = str(intent.get("reply_to_event_id") or "").strip()
+        if reply_to:
+            actor.pending_intents = [
+                item for item in actor.pending_intents
+                if str(item.get("event_id") or "") != reply_to
+            ]
+            if not actor.pending_intents:
+                actor.last_addressed_by = ""
+            for agent in self.agents.values():
+                if not self._agent_can_observe(agent, msg):
+                    continue
+                agent.unanswered_questions = [
+                    item for item in agent.unanswered_questions
+                    if str(item.get("event_id") or "") != reply_to
+                ]
+
+        short_term = intent.get("short_term_state")
+        if isinstance(short_term, dict):
+            emotion = short_term.get("emotion")
+            if isinstance(emotion, dict):
+                label = str(emotion.get("label") or "").strip()
+                if label:
+                    actor.current_emotion = label[:80]
+                    actor.emotion_cause_event_id = (
+                        str(emotion.get("cause_event_id") or reply_to or msg.event_id)[:80]
+                    )
+                try:
+                    actor.emotion_intensity = max(
+                        0.0, min(float(emotion.get("intensity", actor.emotion_intensity)), 1.0)
+                    )
+                except (TypeError, ValueError):
+                    pass
+            goal = str(short_term.get("conversation_goal") or "").strip()
+            if goal:
+                actor.current_conversation_goal = goal[:240]
+            resolved = {
+                str(item).strip() for item in short_term.get("commitments_resolve") or []
+                if str(item).strip()
+            }
+            if resolved:
+                actor.pending_commitments = [
+                    item for item in actor.pending_commitments if item not in resolved
+                ]
+                for item in resolved:
+                    actor.resolve_structured_memory("commitment", item)
+            for value in short_term.get("commitments_add") or []:
+                commitment = str(value).strip()[:240]
+                if commitment and commitment not in actor.pending_commitments:
+                    actor.pending_commitments.append(commitment)
+                    actor.remember_structured(
+                        commitment,
+                        memory_type="commitment",
+                        importance=4,
+                        event_id=msg.event_id,
+                        turn=msg.turn,
+                        phase=self.current_phase,
+                    )
+            actor.pending_commitments = actor.pending_commitments[-12:]
+
+        for candidate in intent.get("memory_candidates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            actor.remember_structured(
+                str(candidate.get("content") or ""),
+                memory_type=str(candidate.get("type") or "decision"),
+                importance=candidate.get("importance", 1),
+                event_id=str(candidate.get("source_event_id") or msg.event_id),
+                turn=msg.turn,
+                phase=self.current_phase,
+                related_agents=[
+                    str(name) for name in candidate.get("related_agents") or []
+                    if str(name) in self.agents and str(name) != actor.name
+                ],
+            )
+
+        try:
+            actor.initiative = max(0, min(round(float(intent.get("urgency", 0.0)) * 100), 100))
+        except (TypeError, ValueError):
+            actor.initiative = 0
+
+        move = str(intent.get("conversation_move") or "statement")
+        addressed_to = [
+            str(name) for name in intent.get("addressed_to") or []
+            if str(name) in self.agents and str(name) != actor.name
+        ]
+        summary = (msg.speech or msg.action).strip()[:300]
+        if not summary or move not in {"question", "request", "challenge"}:
+            return
+        obligation = {
+            "event_id": msg.event_id,
+            "speaker": actor.name,
+            "move": move,
+            "summary": summary,
+            "urgency": max(0.0, min(actor.initiative / 100, 1.0)),
+            "created_at_turn": msg.turn,
+        }
+        delivered_to = []
+        for name in addressed_to:
+            target = self.agents[name]
+            if not self._agent_can_observe(target, msg):
+                continue
+            delivered_to.append(name)
+            target.last_addressed_by = actor.name
+            target.pending_intents = [
+                item for item in target.pending_intents
+                if str(item.get("event_id") or "") != msg.event_id
+            ]
+            target.pending_intents.append(dict(obligation))
+            target.pending_intents = target.pending_intents[-12:]
+        if move == "question" and delivered_to:
+            actor.unanswered_questions.append({
+                "event_id": msg.event_id,
+                "addressed_to": delivered_to,
+                "question": summary,
+                "created_at_turn": msg.turn,
+            })
+            actor.unanswered_questions = actor.unanswered_questions[-12:]
 
     def bump_revision(self) -> int:
         self.revision += 1

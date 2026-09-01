@@ -125,6 +125,17 @@ CHARACTER_JSON_INSTRUCTION = """在遵守上方所有角色设计规则的同时
         "可能错误相信": "..."
       },
       "decision_logic": "在本题材关键局面中的观察、推理、表达和行动逻辑",
+      "voice_profile": {
+        "register": "自然口语、正式、古典、粗粝、克制等；优先使用用户明确设定",
+        "sentence_length": "短句为主|中等|长短交替",
+        "directness": 0.5,
+        "emotional_expressiveness": 0.5,
+        "politeness": 0.5,
+        "humor_style": "没有时为空字符串",
+        "rhetorical_habits": ["稳定但不过度重复的表达策略"],
+        "avoidances": ["该角色不会使用的措辞或表达方式"],
+        "vocabulary_hints": ["符合身份与时代的少量自然词汇"]
+      },
       "relationships": {"其他角色姓名": "该角色的主观认知，不得包含无权知道的秘密"},
       "observation_value": "该角色的互动观察价值",
       "resources": {"资源名":"初始数量或状态"},
@@ -138,7 +149,9 @@ CHARACTER_JSON_INSTRUCTION = """在遵守上方所有角色设计规则的同时
   ]
 }
 
-角色数量必须与约束账本的 requested_character_count 完全一致。公开字段不能泄露 private_identity、faction、私有知识、隐藏阵营或秘密任务。能力必须结构化且引用真实阶段；普通交谈能力可以为空。夜袭、查验、守护等秘密技能默认 director_only；只有在场角色可直接观察的技能才标 public。inspect/protect/eliminate/heal/move/vote 已有通用 Resolver 行为，effects 可留空；只有额外题材状态变化才填写 effects。"""
+角色数量必须与约束账本的 requested_character_count 完全一致。公开字段不能泄露 private_identity、faction、私有知识、隐藏阵营或秘密任务。能力必须结构化且引用真实阶段；普通交谈能力可以为空。夜袭、查验、守护等秘密技能默认 director_only；只有在场角色可直接观察的技能才标 public。inspect/protect/eliminate/heal/move/vote 已有通用 Resolver 行为，effects 可留空；只有额外题材状态变化才填写 effects。
+
+voice_profile 只负责稳定语言倾向，不得用夸张口癖替代人物塑造。用户明确写过语气、时代用语、措辞禁忌或表达习惯时必须原样落实；用户未写时仅根据身份、年龄、时代和性格做克制推断。不同角色至少应在直接程度、情绪外显、礼貌程度或表达策略中的两项存在可解释差异。"""
 
 
 def _content(response: Any) -> str:

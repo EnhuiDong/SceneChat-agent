@@ -465,7 +465,13 @@ def message_to_frontend(msg: Message):
         "intent": {
             key: value
             for key, value in msg.intent.items()
-            if key not in {"private_reason", "proposed_patch", "relationship_updates"}
+            if key not in {
+                "private_reason",
+                "proposed_patch",
+                "relationship_updates",
+                "short_term_state",
+                "memory_candidates",
+            }
         },
     }
 

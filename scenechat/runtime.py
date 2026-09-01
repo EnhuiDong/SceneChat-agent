@@ -3,11 +3,15 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from .models import AgentState, SimulationState
+from .models import AgentState, MEMORY_TYPES, SimulationState
 
 
 SAFE_FREE_ACTIONS = {"speak", "act", "observe", "pass"}
 TARGETED_ACTIONS = {"vote", "eliminate", "inspect", "protect", "heal", "poison"}
+CONVERSATION_MOVES = {
+    "statement", "answer", "question", "request", "challenge", "deflect",
+    "support", "reveal", "acknowledge", "silence",
+}
 
 
 @dataclass
@@ -22,10 +26,20 @@ class Intent:
     expected_effect: str = ""
     proposed_patch: list[dict[str, Any]] = field(default_factory=list)
     relationship_updates: dict[str, str] = field(default_factory=dict)
+    addressed_to: list[str] = field(default_factory=list)
+    reply_to_event_id: str = ""
+    conversation_move: str = "statement"
+    urgency: float = 0.0
+    short_term_state: dict[str, Any] = field(default_factory=dict)
+    memory_candidates: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_mapping(cls, actor: str, data: dict[str, Any]) -> "Intent":
         proposed = data.get("proposed_patch") or data.get("state_patch") or []
+        try:
+            urgency = max(0.0, min(float(data.get("urgency", 0.0)), 1.0))
+        except (TypeError, ValueError):
+            urgency = 0.0
         return cls(
             actor=actor,
             action_type=str(data.get("action_type") or "speak").strip(),
@@ -42,6 +56,22 @@ class Intent:
                 str(key): str(value)
                 for key, value in (data.get("relationship_updates") or {}).items()
             } if isinstance(data.get("relationship_updates"), dict) else {},
+            addressed_to=[
+                str(item).strip() for item in data.get("addressed_to") or []
+                if str(item).strip()
+            ] if isinstance(data.get("addressed_to"), list) else [],
+            reply_to_event_id=str(data.get("reply_to_event_id") or "").strip(),
+            conversation_move=str(data.get("conversation_move") or "statement").strip(),
+            urgency=urgency,
+            short_term_state=(
+                dict(data.get("short_term_state"))
+                if isinstance(data.get("short_term_state"), dict)
+                else {}
+            ),
+            memory_candidates=[
+                dict(item) for item in data.get("memory_candidates") or []
+                if isinstance(item, dict)
+            ] if isinstance(data.get("memory_candidates"), list) else [],
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -127,6 +157,7 @@ class IntentResolver:
         target_error = self._validate_target(state, actor, intent, ability, rule)
         if target_error:
             return Resolution(False, target_error, intent)
+        self._sanitize_conversation_metadata(state, actor, intent)
 
         patch = StatePatch()
         observations: dict[str, str] = {}
@@ -155,6 +186,131 @@ class IntentResolver:
             location=actor.current_location,
             individual_observations=observations,
         )
+
+    @staticmethod
+    def _sanitize_conversation_metadata(
+        state: SimulationState,
+        actor: AgentState,
+        intent: Intent,
+    ) -> None:
+        if intent.conversation_move not in CONVERSATION_MOVES:
+            intent.conversation_move = "statement" if intent.speech else "silence"
+        try:
+            intent.urgency = max(0.0, min(float(intent.urgency), 1.0))
+        except (TypeError, ValueError):
+            intent.urgency = 0.0
+
+        valid_addressees = []
+        for name in intent.addressed_to:
+            target = state.agents.get(name)
+            if (
+                target is not None
+                and target.name != actor.name
+                and target.eligible
+                and target.current_location == actor.current_location
+                and target.name not in valid_addressees
+            ):
+                valid_addressees.append(target.name)
+        if intent.target in state.agents and intent.target != actor.name:
+            target = state.agents[intent.target]
+            if target.current_location == actor.current_location and target.eligible:
+                if target.name not in valid_addressees:
+                    valid_addressees.append(target.name)
+
+        visible_recent = {
+            message.event_id: message
+            for message in state.history[-30:]
+            if state._agent_can_observe(actor, message)
+        }
+        if intent.reply_to_event_id not in visible_recent:
+            intent.reply_to_event_id = ""
+        if (
+            not intent.reply_to_event_id
+            and actor.pending_intents
+            and intent.conversation_move in {"answer", "deflect", "challenge", "acknowledge"}
+        ):
+            def pending_priority(item: dict[str, Any]) -> tuple[float, int]:
+                try:
+                    urgency = float(item.get("urgency", 0) or 0)
+                except (TypeError, ValueError):
+                    urgency = 0.0
+                try:
+                    created_at = int(item.get("created_at_turn", 0) or 0)
+                except (TypeError, ValueError):
+                    created_at = 0
+                return urgency, created_at
+
+            pending = sorted(
+                actor.pending_intents,
+                key=pending_priority,
+                reverse=True,
+            )[0]
+            candidate = str(pending.get("event_id") or "")
+            if candidate in visible_recent:
+                intent.reply_to_event_id = candidate
+        if intent.reply_to_event_id:
+            speaker = visible_recent[intent.reply_to_event_id].speaker
+            if speaker in state.agents and speaker != actor.name and speaker not in valid_addressees:
+                valid_addressees.append(speaker)
+        intent.addressed_to = valid_addressees[:6]
+
+        source = intent.short_term_state
+        emotion_source = source.get("emotion") if isinstance(source.get("emotion"), dict) else {}
+        label = str(emotion_source.get("label") or "").strip()[:80]
+        try:
+            intensity = max(0.0, min(float(emotion_source.get("intensity", actor.emotion_intensity)), 1.0))
+        except (TypeError, ValueError):
+            intensity = actor.emotion_intensity
+
+        def text_list(key: str, maximum: int) -> list[str]:
+            values = source.get(key)
+            if not isinstance(values, list):
+                return []
+            return [str(item).strip()[:240] for item in values if str(item).strip()][:maximum]
+
+        intent.short_term_state = {
+            "emotion": {
+                "label": label,
+                "intensity": intensity,
+                "cause_event_id": intent.reply_to_event_id,
+            },
+            "conversation_goal": str(source.get("conversation_goal") or "").strip()[:240],
+            "commitments_add": text_list("commitments_add", 4),
+            "commitments_resolve": text_list("commitments_resolve", 4),
+        }
+
+        candidates = []
+        for item in intent.memory_candidates[:8]:
+            memory_type = str(item.get("type") or "").strip()
+            content = str(item.get("content") or "").strip()[:500]
+            if memory_type not in MEMORY_TYPES or not content:
+                continue
+            try:
+                importance = max(1, min(int(item.get("importance", 1)), 5))
+            except (TypeError, ValueError):
+                importance = 1
+            related_agents = []
+            for name in item.get("related_agents") or []:
+                value = str(name).strip()
+                if value in state.agents and value != actor.name and value not in related_agents:
+                    related_agents.append(value)
+            source_event_id = str(item.get("source_event_id") or "").strip()
+            if source_event_id not in visible_recent:
+                source_event_id = intent.reply_to_event_id
+            candidates.append({
+                "type": memory_type,
+                "content": content,
+                "importance": importance,
+                "related_agents": related_agents[:6],
+                "source_event_id": source_event_id,
+            })
+        intent.memory_candidates = candidates
+
+        intent.relationship_updates = {
+            target: str(update).strip()[:300]
+            for target, update in intent.relationship_updates.items()
+            if target in state.agents and target != actor.name and str(update).strip()
+        }
 
     def resolve_director_event(
         self,

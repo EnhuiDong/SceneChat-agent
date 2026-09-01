@@ -27,6 +27,16 @@ class SimulationScheduler:
         if not eligible:
             return SchedulerDecision("narration", reason="当前阶段没有可行动角色")
 
+        response_candidates = [agent for agent in eligible if agent.pending_intents]
+        if response_candidates:
+            actor = max(response_candidates, key=self._response_priority)
+            pending = max(actor.pending_intents, key=self._pending_priority)
+            return SchedulerDecision(
+                "agent",
+                actor.name,
+                f"优先回应 {pending.get('speaker') or '上一位角色'} 的直接"
+                f"{pending.get('move') or '发言'}",
+            )
         if strategy == "initiative":
             actor = sorted(eligible, key=lambda item: (-item.initiative, item.name))[0]
         elif strategy == "urgency_director":
@@ -83,3 +93,23 @@ class SimulationScheduler:
             return int(value)
         except (TypeError, ValueError):
             return 0
+
+    @staticmethod
+    def _pending_priority(item: dict) -> tuple[float, int]:
+        try:
+            urgency = float(item.get("urgency", 0) or 0)
+        except (TypeError, ValueError):
+            urgency = 0.0
+        try:
+            created_at = int(item.get("created_at_turn", 0) or 0)
+        except (TypeError, ValueError):
+            created_at = 0
+        return urgency, created_at
+
+    @classmethod
+    def _response_priority(cls, agent: AgentState) -> tuple[float, int, str]:
+        urgency, created_at = max(
+            (cls._pending_priority(item) for item in agent.pending_intents),
+            default=(0.0, 0),
+        )
+        return urgency, created_at, agent.name

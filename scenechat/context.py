@@ -20,6 +20,10 @@ class AgentView:
     known_facts: str
     observations: str
     private_memory: str
+    story_memory: str
+    voice_profile: str
+    short_term_state: str
+    response_obligations: str
     retrieved_background: str
 
     def render(self) -> str:
@@ -54,7 +58,19 @@ class AgentView:
 {self.observations}
 
 【你的私人记忆——仅你可见】
-{self.private_memory}"""
+{self.private_memory}
+
+【按当前人物与议题筛选的故事记忆——仅你可见】
+{self.story_memory}
+
+【你的语言与表达画像】
+{self.voice_profile}
+
+【你的当前心理与对话状态】
+{self.short_term_state}
+
+【需要优先处理的回应】
+{self.response_obligations}"""
 
 
 def _ability_summary(agent: AgentState) -> str:
@@ -70,6 +86,57 @@ def _ability_summary(agent: AgentState) -> str:
         entries = [f"- {ability}" for ability in agent.abilities]
     resources = [f"- 资源 {key}：{value}" for key, value in agent.resources.items()]
     return "\n".join(entries + resources) or "- 无额外能力或资源"
+
+
+def _voice_summary(agent: AgentState) -> str:
+    profile = agent.voice_profile if isinstance(agent.voice_profile, dict) else {}
+    if not profile:
+        return "- 结构化语言画像未提供；以完整角色档案中的表达设定为准"
+    lines = [
+        f"- 语域：{profile.get('register') or '自然口语'}",
+        f"- 句式长度：{profile.get('sentence_length') or '中等'}",
+        f"- 直接程度：{profile.get('directness', 0.5)}",
+        f"- 情绪外显：{profile.get('emotional_expressiveness', 0.5)}",
+        f"- 礼貌程度：{profile.get('politeness', 0.5)}",
+    ]
+    optional = (
+        ("幽默方式", profile.get("humor_style")),
+        ("表达策略", "；".join(profile.get("rhetorical_habits") or [])),
+        ("避免表达", "；".join(profile.get("avoidances") or [])),
+        ("可自然使用的词汇", "、".join(profile.get("vocabulary_hints") or [])),
+    )
+    lines.extend(f"- {label}：{value}" for label, value in optional if value)
+    return "\n".join(lines)
+
+
+def _short_term_summary(agent: AgentState) -> str:
+    commitments = "；".join(agent.pending_commitments) or "无"
+    waiting_items = []
+    for item in agent.unanswered_questions[-5:]:
+        recipients = item.get("addressed_to")
+        if not isinstance(recipients, list):
+            recipients = []
+        names = "、".join(str(name) for name in recipients if str(name).strip())
+        waiting_items.append(
+            f"等待{names or '相关人物'}回应：{str(item.get('question') or '').strip()}"
+        )
+    waiting = "；".join(waiting_items) or "无"
+    return (
+        f"- 当前情绪：{agent.current_emotion}（强度 {agent.emotion_intensity:.2f}）\n"
+        f"- 当前对话目标：{agent.current_conversation_goal or '依据长期目标判断'}\n"
+        f"- 尚未履行的承诺：{commitments}\n"
+        f"- 自己仍在等待回答的问题：{waiting}"
+    )
+
+
+def _response_obligations(agent: AgentState) -> str:
+    if not agent.pending_intents:
+        return "- 当前没有必须优先回应的直接提问或请求"
+    return "\n".join(
+        f"- event_id={item.get('event_id')}；{item.get('speaker')}向你提出"
+        f"{item.get('move')}：{item.get('summary')}（紧迫度 {item.get('urgency', 0)}）"
+        for item in agent.pending_intents[-6:]
+    )
 
 
 def build_agent_view(
@@ -92,6 +159,11 @@ def build_agent_view(
     facts = "\n".join(
         f"- [{fact_id}] {content}" for fact_id, content in agent.known_facts.items() if content
     ) or "- 暂无额外结构化事实"
+    focus_agents = [agent.last_addressed_by] if agent.last_addressed_by else []
+    for item in agent.pending_intents:
+        speaker = str(item.get("speaker") or "")
+        if speaker and speaker not in focus_agents:
+            focus_agents.append(speaker)
     return AgentView(
         agent_name=agent.name,
         scene=state.scene,
@@ -104,7 +176,11 @@ def build_agent_view(
         colocated_public_profiles="\n\n".join(colocated) or "当前地点没有其他可见角色。",
         known_facts=facts,
         observations=agent.recent_observations(),
-        private_memory=agent.recent_private_memory(),
+        private_memory=agent.recent_private_memory(6),
+        story_memory=agent.layered_memory(focus_agents),
+        voice_profile=_voice_summary(agent),
+        short_term_state=_short_term_summary(agent),
+        response_obligations=_response_obligations(agent),
         retrieved_background=retrieved_background,
     )
 

@@ -589,6 +589,61 @@ def _abilities_from_scalar(value: Any) -> list[AbilitySpec]:
 
 
 @dataclass
+class VoiceProfile:
+    """Stable speaking tendencies without forcing repetitive catchphrases."""
+
+    register: str = "自然口语"
+    sentence_length: str = "中等"
+    directness: float = 0.5
+    emotional_expressiveness: float = 0.5
+    politeness: float = 0.5
+    humor_style: str = ""
+    rhetorical_habits: list[str] = field(default_factory=list)
+    avoidances: list[str] = field(default_factory=list)
+    vocabulary_hints: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "VoiceProfile":
+        source = data if isinstance(data, dict) else {}
+
+        def ratio(key: str, default: float) -> float:
+            try:
+                return max(0.0, min(float(source.get(key, default)), 1.0))
+            except (TypeError, ValueError):
+                return default
+
+        return cls(
+            register=_text(source.get("register"), "自然口语"),
+            sentence_length=_text(source.get("sentence_length"), "中等"),
+            directness=ratio("directness", 0.5),
+            emotional_expressiveness=ratio("emotional_expressiveness", 0.5),
+            politeness=ratio("politeness", 0.5),
+            humor_style=_text(source.get("humor_style")),
+            rhetorical_habits=_string_list(source.get("rhetorical_habits"))[:6],
+            avoidances=_string_list(source.get("avoidances"))[:8],
+            vocabulary_hints=_string_list(source.get("vocabulary_hints"))[:10],
+        )
+
+    def render(self) -> str:
+        lines = [
+            f"语域：{self.register}",
+            f"句式长度：{self.sentence_length}",
+            f"直接程度：{self.directness:.2f}",
+            f"情绪外显：{self.emotional_expressiveness:.2f}",
+            f"礼貌程度：{self.politeness:.2f}",
+        ]
+        if self.humor_style:
+            lines.append(f"幽默方式：{self.humor_style}")
+        if self.rhetorical_habits:
+            lines.append(f"表达策略：{'；'.join(self.rhetorical_habits)}")
+        if self.avoidances:
+            lines.append(f"避免表达：{'；'.join(self.avoidances)}")
+        if self.vocabulary_hints:
+            lines.append(f"可自然使用的词汇：{'、'.join(self.vocabulary_hints)}")
+        return "\n".join(f"- {line}" for line in lines)
+
+
+@dataclass
 class CharacterSpec:
     id: str
     name: str
@@ -610,6 +665,7 @@ class CharacterSpec:
     resources: dict[str, Any] = field(default_factory=dict)
     known_fact_ids: list[str] = field(default_factory=list)
     false_beliefs: list[str] = field(default_factory=list)
+    voice_profile: VoiceProfile = field(default_factory=VoiceProfile)
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any], index: int) -> "CharacterSpec":
@@ -637,6 +693,7 @@ class CharacterSpec:
             resources=dict(data.get("resources") or {}) if isinstance(data.get("resources"), dict) else {},
             known_fact_ids=_string_list(data.get("known_fact_ids")),
             false_beliefs=_string_list(data.get("false_beliefs")),
+            voice_profile=VoiceProfile.from_mapping(data.get("voice_profile")),
         )
 
     @property
@@ -650,7 +707,7 @@ class CharacterSpec:
             ]
         )
 
-    def to_markdown(self, index: int) -> str:
+    def to_markdown(self, index: int, *, include_voice: bool = True) -> str:
         knowledge = "\n".join(f"- **{key}**：{value}" for key, value in self.knowledge.items())
         relationships = "\n".join(
             f"- **{key}**：{value}" for key, value in self.relationships.items()
@@ -664,6 +721,10 @@ class CharacterSpec:
         private_identity = self.private_identity
         if abilities:
             private_identity = f"{private_identity}\n\n**能力与资源**\n{abilities}"
+        voice_section = (
+            f"\n\n### 12. 语言与表达画像\n{self.voice_profile.render()}"
+            if include_voice else ""
+        )
         return f"""## 角色 {index}
 ### 1. 角色姓名
 {self.name}
@@ -696,7 +757,7 @@ class CharacterSpec:
 {relationships or '尚未形成明确的个人认知。'}
 
 ### 11. 实验观察价值
-{self.observation_value}""".strip()
+{self.observation_value}{voice_section}""".strip()
 
     def to_public_markdown(self, index: int) -> str:
         return f"""## 角色 {index}
@@ -1034,7 +1095,7 @@ def agents_from_character_specs(characters: list[CharacterSpec]):
         agents.append(
             AgentState(
                 name=character.name,
-                profile=character.to_markdown(index),
+                profile=character.to_markdown(index, include_voice=False),
                 public_profile=character.public_profile,
                 goals=list(character.goals),
                 private_memory=[f"我的初始知识边界：{knowledge}"] if knowledge else [],
@@ -1062,6 +1123,7 @@ def agents_from_character_specs(characters: list[CharacterSpec]):
                 goal_status={goal: "active" for goal in character.goals},
                 known_facts={fact_id: "" for fact_id in character.known_fact_ids},
                 false_beliefs=list(character.false_beliefs),
+                voice_profile=asdict(character.voice_profile),
             )
         )
     return agents

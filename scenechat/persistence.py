@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import fields
+from dataclasses import asdict, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -13,11 +13,12 @@ from .models import (
     AgentState,
     ArcState,
     Intervention,
+    MEMORY_TYPES,
     MemoryRecord,
     Message,
     SimulationState,
 )
-from .scenario import CharacterSpec, ScenarioBrief, ScenarioPackage, WorldSpec
+from .scenario import CharacterSpec, ScenarioBrief, ScenarioPackage, VoiceProfile, WorldSpec
 
 
 SCHEMA_VERSION = 2
@@ -158,18 +159,84 @@ def _known_fields(cls, data: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in data.items() if key in names}
 
 
+def _nonnegative_int(value: Any, default: int = 0) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _memory_from_dict(data: dict[str, Any]) -> MemoryRecord:
+    values = _known_fields(MemoryRecord, data)
+    values["event_id"] = str(data.get("event_id") or "")[:120]
+    values["content"] = str(data.get("content") or "")[:2000]
+    values["source"] = str(data.get("source") or "observation")[:80]
+    values["visibility"] = [
+        str(item)[:120] for item in data.get("visibility") or []
+        if str(item).strip()
+    ] if isinstance(data.get("visibility"), list) else ["agent_private"]
+    values["related_agents"] = [
+        str(item)[:120] for item in data.get("related_agents") or []
+        if str(item).strip()
+    ] if isinstance(data.get("related_agents"), list) else []
+    try:
+        values["confidence"] = max(0.0, min(float(data.get("confidence", 1.0)), 1.0))
+    except (TypeError, ValueError):
+        values["confidence"] = 1.0
+    values["importance"] = max(1, min(_nonnegative_int(data.get("importance"), 1), 5))
+    values["created_at_turn"] = _nonnegative_int(data.get("created_at_turn"), 0)
+    memory_type = str(data.get("memory_type") or "event")
+    values["memory_type"] = memory_type if memory_type in MEMORY_TYPES | {"event"} else "event"
+    values["phase"] = str(data.get("phase") or "")[:120]
+    values["active"] = data.get("active") if isinstance(data.get("active"), bool) else True
+    return MemoryRecord(**values)
+
+
 def agent_from_dict(data: dict[str, Any]) -> AgentState:
     values = _known_fields(AgentState, data)
+    raw_voice_profile = data.get("voice_profile")
+    values["voice_profile"] = (
+        asdict(VoiceProfile.from_mapping(raw_voice_profile))
+        if isinstance(raw_voice_profile, dict) and raw_voice_profile
+        else {}
+    )
+    values["pending_commitments"] = [
+        str(item) for item in data.get("pending_commitments") or []
+        if str(item).strip()
+    ] if isinstance(data.get("pending_commitments"), list) else []
+    values["pending_intents"] = [
+        dict(item) for item in data.get("pending_intents") or []
+        if isinstance(item, dict)
+    ]
+    values["unanswered_questions"] = [
+        dict(item) for item in data.get("unanswered_questions") or []
+        if isinstance(item, dict)
+    ]
+    values["memory_summaries"] = [
+        {
+            "phase": str(item.get("phase") or "")[:120],
+            "through_turn": _nonnegative_int(item.get("through_turn", 0)),
+            "content": str(item.get("content") or "")[:2000],
+        }
+        for item in data.get("memory_summaries") or []
+        if isinstance(item, dict)
+    ][-6:]
+    try:
+        values["emotion_intensity"] = max(
+            0.0, min(float(data.get("emotion_intensity", 0.2)), 1.0)
+        )
+    except (TypeError, ValueError):
+        values["emotion_intensity"] = 0.2
     values["ability_states"] = {
         key: AbilityState(**_known_fields(AbilityState, value))
         for key, value in (data.get("ability_states") or {}).items()
         if isinstance(value, dict)
     }
     values["memories"] = [
-        MemoryRecord(**_known_fields(MemoryRecord, value))
+        _memory_from_dict(value)
         for value in data.get("memories") or []
         if isinstance(value, dict)
-    ]
+    ][-80:]
     return AgentState(**values)
 
 
