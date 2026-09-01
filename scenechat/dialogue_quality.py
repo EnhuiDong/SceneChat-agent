@@ -164,6 +164,7 @@ def inspect_dialogue_intent(
             "missing_response",
             f"本轮没有回应{most_recent.get('speaker')}提出的{most_recent.get('move')}；"
             f"请填写 event_id={most_recent.get('event_id')}，即使选择回避或沉默也要明确回应。",
+            hard=True,
         ))
 
     private_output = "\n".join([

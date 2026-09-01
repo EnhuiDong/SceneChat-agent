@@ -392,6 +392,33 @@ def simulate_next_turn(
 
     phase = state.phase_specs.get(state.current_phase)
     allowed_actions = list(getattr(phase, "allowed_action_types", []) or [])
+    pending = agent.pending_intents[-1] if agent.pending_intents else None
+    if pending and (not allowed_actions or "speak" in allowed_actions):
+        requester = str(pending.get("speaker") or "对方").strip()
+        try:
+            fallback_urgency = float(pending.get("urgency", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            fallback_urgency = 0.0
+        fallback_intent = Intent(
+            actor=agent.name,
+            action_type="speak",
+            action=f"看向{requester}，明确表示自己听见了问题。",
+            speech="我听见了，但现在还不能给出完整答复。",
+            private_reason=f"模型重试后仍未完成必要回应：{rejection}",
+            addressed_to=[requester] if requester in state.agents else [],
+            reply_to_event_id=str(pending.get("event_id") or ""),
+            conversation_move="deflect",
+            urgency=fallback_urgency,
+        )
+        fallback_resolution = active_resolver.resolve(state, fallback_intent)
+        if fallback_resolution.accepted and fallback_intent.reply_to_event_id:
+            state.record_generation_success()
+            return _message_from_resolution(
+                state,
+                agent,
+                fallback_intent,
+                fallback_resolution,
+            )
     fallback_type = next(
         (candidate for candidate in ("pass", "observe", "speak", "act") if candidate in allowed_actions),
         "" if allowed_actions else "pass",
