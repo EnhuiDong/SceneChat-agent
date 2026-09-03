@@ -20,6 +20,7 @@ from scenechat.generation import (
 )
 from scenechat.knowledge import build_experiment_knowledge_base, requires_vector_index
 from scenechat.models import Intervention, Message, SimulationState
+from scenechat.observability import director_observability_payload
 from scenechat.interventions import (
     has_blocking_conflicts,
     preview_intervention,
@@ -478,7 +479,25 @@ def message_to_frontend(msg: Message):
     }
 
 
-def replay_page_response(page_request: dict, session_id: str):
+def director_state_event(state: SimulationState, *, include_quality: bool = False):
+    return {
+        "type": "director_state",
+        "revision": state.revision,
+        "turn_count": state.turn_count,
+        "current_phase": state.current_phase,
+        "world_state": state.public_world_state(),
+        "director_observability": director_observability_payload(
+            state,
+            include_quality=include_quality,
+        ),
+    }
+
+
+def replay_page_response(
+    page_request: dict,
+    session_id: str,
+    state: SimulationState,
+):
     def replay():
         yield json.dumps({
             "type": "page_start",
@@ -495,6 +514,10 @@ def replay_page_response(page_request: dict, session_id: str):
                 "message": cached_message,
                 "replayed": True,
             }, ensure_ascii=False) + "\n"
+        yield json.dumps(
+            director_state_event(state, include_quality=True),
+            ensure_ascii=False,
+        ) + "\n"
         yield json.dumps(page_request["done"], ensure_ascii=False) + "\n"
 
     return Response(replay(), mimetype="application/x-ndjson")
@@ -695,7 +718,7 @@ def next_story_page_stream():
             str(data.get("request_id") or "").strip()
         )
         if completed_request and completed_request.get("status") == "completed":
-            return replay_page_response(completed_request, session_id)
+            return replay_page_response(completed_request, session_id, session["state"])
         return jsonify({
             "session_id": session_id,
             "page": session["page"],
@@ -741,7 +764,7 @@ def next_story_page_stream():
                 status_code=409,
             )
         if page_request is not None and page_request["status"] == "completed":
-            return replay_page_response(page_request, session_id)
+            return replay_page_response(page_request, session_id, state)
         if operation_lock.locked():
             return request_error(
                 "session_operation_in_progress",
@@ -828,6 +851,10 @@ def next_story_page_stream():
                     "request_id": request_id,
                     "message": serialized,
                 }, ensure_ascii=False) + "\n"
+                yield json.dumps(
+                    director_state_event(state),
+                    ensure_ascii=False,
+                ) + "\n"
         except GeneratorExit:
             page_request["status"] = "retryable"
             raise
@@ -878,6 +905,10 @@ def next_story_page_stream():
         page_request["done"] = done_event
         page_request["status"] = "completed"
         persist_story_session(session_id, session)
+        yield json.dumps(
+            director_state_event(state, include_quality=True),
+            ensure_ascii=False,
+        ) + "\n"
         yield json.dumps(done_event, ensure_ascii=False) + "\n"
 
     def locked_generate():
@@ -1092,6 +1123,7 @@ def get_story_session(session_id):
         "run_status": getattr(state, "run_status", "running"),
         "winner": getattr(state, "winner", ""),
         "public_state": state.public_state_summary(),
+        "director_observability": director_observability_payload(state),
         "pages": pages,
         "agents": [
             {

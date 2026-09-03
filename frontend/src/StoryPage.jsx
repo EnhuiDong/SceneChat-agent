@@ -11,6 +11,7 @@ import {
   updateStoryPace,
 } from "./storyApi";
 import { loadPageIndex, loadStoryPages } from "./storyStorage";
+import DirectorObservability from "./DirectorObservability";
 import "./StoryPage.css";
 
 const ROLE_COLORS = ["#44705a", "#8a5d3b", "#596b98", "#8b536b", "#6f6740", "#4f7180", "#795487", "#89704c"];
@@ -20,7 +21,7 @@ function roleColor(name = "") {
   return ROLE_COLORS[hash % ROLE_COLORS.length];
 }
 
-function MessageCard({ message, skipToken }) {
+function MessageCard({ message, skipToken, focused }) {
   const fullText = message.display_text || "";
   const instant = Boolean(message.replayed || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches || !fullText);
   const [visibleText, setVisibleText] = useState(instant ? fullText : "");
@@ -42,7 +43,7 @@ function MessageCard({ message, skipToken }) {
   const narration = ["narration", "intervention"].includes(message.kind);
   const kindLabel = message.kind === "intervention" ? "导演干预" : message.kind === "narration" ? "旁白" : "角色行动";
   return (
-    <article className={`timeline-message ${narration ? "narration" : "dialogue"} ${message.kind === "intervention" ? "director-event" : ""}`} style={{ "--role-color": roleColor(message.speaker) }}>
+    <article id={message.event_id ? `event-${message.event_id}` : undefined} className={`timeline-message ${narration ? "narration" : "dialogue"} ${message.kind === "intervention" ? "director-event" : ""} ${focused ? "evidence-focus" : ""}`} style={{ "--role-color": roleColor(message.speaker) }}>
       <header><span className="speaker-dot" /> <strong>{message.speaker || "旁白"}</strong><small>{kindLabel}</small></header>
       {message.action ? <p className="message-action">{message.action}</p> : null}
       <p>{renderedText}{renderedText.length < fullText.length ? <span className="typing-caret" /> : null}</p>
@@ -67,6 +68,7 @@ function StoryPage() {
   const [errorMessage, setErrorMessage] = useState("");
   const [showQuitModal, setShowQuitModal] = useState(false);
   const [selectedCharacterId, setSelectedCharacterId] = useState("");
+  const [focusedEventId, setFocusedEventId] = useState("");
   const [skipToken, setSkipToken] = useState(0);
   const [autoAdvance, setAutoAdvance] = useState(false);
   const [autoCountdown, setAutoCountdown] = useState(null);
@@ -107,6 +109,14 @@ function StoryPage() {
   useEffect(() => { localStorage.setItem("story_batch_size", String(batchSize)); }, [batchSize]);
   useEffect(() => { setPaceDraft(snapshot.arc_state?.pace ?? 50); }, [snapshot.arc_state?.pace]);
   useEffect(() => { contentRef.current?.scrollTo({ top: contentRef.current.scrollHeight, behavior: "smooth" }); }, [currentPage.messages?.length, isGenerating]);
+  useEffect(() => {
+    if (!focusedEventId) return undefined;
+    const timer = window.setTimeout(() => {
+      document.getElementById(`event-${focusedEventId}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }, 0);
+    const clear = window.setTimeout(() => setFocusedEventId(""), 2400);
+    return () => { window.clearTimeout(timer); window.clearTimeout(clear); };
+  }, [currentPageIndex, focusedEventId]);
 
   const syncSnapshot = useCallback(async () => {
     if (!sessionId) return;
@@ -164,6 +174,19 @@ function StoryPage() {
         if (event.type === "message") {
           const nextMessage = { ...event.message, replayed: Boolean(event.replayed) };
           setPages((previous) => previous.map((page, index) => index !== targetIndex ? page : page.messages.some((item) => (item.event_id && item.event_id === nextMessage.event_id) || (!item.event_id && item.id === nextMessage.id)) ? page : { ...page, messages: [...page.messages, nextMessage] }));
+        }
+        if (event.type === "director_state") {
+          setSnapshot((previous) => ({
+            ...previous,
+            revision: event.revision ?? previous.revision,
+            turn_count: event.turn_count ?? previous.turn_count,
+            current_phase: event.current_phase || previous.current_phase,
+            world_state: event.world_state || previous.world_state,
+            director_observability: {
+              ...(previous.director_observability || {}),
+              ...(event.director_observability || {}),
+            },
+          }));
         }
         if (event.type === "page_done") {
           localStorage.removeItem("story_pending_page_request");
@@ -331,6 +354,16 @@ function StoryPage() {
   };
 
   const visibleWorldState = Object.entries(snapshot.world_state || scenario.initial_state || {});
+  const jumpToEvent = useCallback((eventId) => {
+    if (!eventId) return;
+    const pageIndex = pages.findIndex((page) => page.messages?.some((message) => message.event_id === eventId));
+    if (pageIndex < 0) {
+      setErrorMessage("对应事件不在当前已加载的分页中，可在完整档案中继续查阅。");
+      return;
+    }
+    setCurrentPageIndex(pageIndex);
+    setFocusedEventId(eventId);
+  }, [pages]);
 
   return (
     <main className="simulation-page">
@@ -350,7 +383,7 @@ function StoryPage() {
         <section className="timeline-panel">
           <div className="timeline-context"><span>第 {currentPage.page || 1} 幕</span><p>{scene || scenario.brief?.premise || prompt}</p></div>
           <div className="timeline-content" ref={contentRef} aria-live="polite">
-            {currentPage.messages?.length ? currentPage.messages.map((message, index) => <MessageCard key={`${message.event_id || message.id}-${index}`} message={message} skipToken={skipToken} />) : <div className="timeline-empty"><span className="scene-loader" /><strong>角色正在进入场景</strong><p>第一轮行动会从公开场景和各自掌握的信息开始。</p></div>}
+            {currentPage.messages?.length ? currentPage.messages.map((message, index) => <MessageCard key={`${message.event_id || message.id}-${index}`} message={message} skipToken={skipToken} focused={message.event_id === focusedEventId} />) : <div className="timeline-empty"><span className="scene-loader" /><strong>角色正在进入场景</strong><p>第一轮行动会从公开场景和各自掌握的信息开始。</p></div>}
             {currentPage.isEnd ? <div className="ending-card"><strong>本次模拟已收束</strong><p>{currentPage.endReason || snapshot.end_reason || "场景达到自然结束条件。"}</p>{snapshot.winner ? <span>结果：{snapshot.winner}</span> : null}</div> : null}
           </div>
 
@@ -358,6 +391,7 @@ function StoryPage() {
 
           <section className="director-console" aria-label="剧情导演台">
             <div className="director-console-heading"><div><span>DIRECTOR</span><h2>干预下一步剧情</h2></div><div className="arc-progress"><span>剧情进度 {progressPercent}%</span><div><i style={{ width: `${progressPercent}%` }} /></div></div></div>
+            <DirectorObservability data={snapshot.director_observability} onJumpToEvent={jumpToEvent} />
             <div className="pace-control"><label htmlFor="story-pace">推进速度 <strong>{paceDraft <= 20 ? "沉浸" : paceDraft <= 40 ? "舒缓" : paceDraft <= 60 ? "均衡" : paceDraft <= 80 ? "紧凑" : "冲刺"}</strong></label><input id="story-pace" type="range" min="0" max="100" step="10" value={paceDraft} onChange={(event) => setPaceDraft(Number(event.target.value))} onMouseUp={savePace} onTouchEnd={savePace} onKeyUp={savePace} disabled={isGenerating || isDirecting} /><div><span>慢 · 多细节</span><span>快 · 早收束</span></div></div>
             <textarea value={interventionDraft} onChange={(event) => { setInterventionDraft(event.target.value); setInterventionPreview(null); }} onFocus={() => setAutoCountdown(null)} maxLength={3000} placeholder="例如：让暴雨在下一轮切断交通，但不要替任何角色决定是否离开。" disabled={isGenerating || isDirecting} />
             <div className="director-options"><select aria-label="干预作用范围" value={interventionScope} onChange={(event) => { setInterventionScope(event.target.value); setInterventionPreview(null); }} disabled={isGenerating || isDirecting}><option value="next_scene">只影响下一步</option><option value="turns">持续若干轮</option><option value="persistent">持续到取消</option></select>{interventionScope === "turns" ? <input aria-label="持续轮数" type="number" min="1" max="100" value={interventionDuration} onChange={(event) => { setInterventionDuration(Number(event.target.value)); setInterventionPreview(null); }} /> : null}<button type="button" onClick={previewIntervention} disabled={!interventionDraft.trim() || isGenerating || isDirecting}>{isDirecting ? "分析中…" : "预检干预"}</button></div>
