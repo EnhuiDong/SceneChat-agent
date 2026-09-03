@@ -12,6 +12,9 @@ from .models import (
     AbilityState,
     AgentState,
     ArcState,
+    BeliefRecord,
+    ConversationThread,
+    DialogueObligation,
     Intervention,
     MEMORY_TYPES,
     MemoryRecord,
@@ -21,7 +24,7 @@ from .models import (
 from .scenario import CharacterSpec, ScenarioBrief, ScenarioPackage, VoiceProfile, WorldSpec
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def utc_now() -> str:
@@ -207,7 +210,72 @@ def _conversation_item_from_dict(data: dict[str, Any]) -> dict[str, Any]:
         "summary": str(data.get("summary") or "")[:500],
         "urgency": _bounded_float(data.get("urgency"), 0.0),
         "created_at_turn": _nonnegative_int(data.get("created_at_turn"), 0),
+        "thread_id": str(data.get("thread_id") or "")[:120],
+        "obligation_id": str(data.get("obligation_id") or "")[:160],
+        "status": str(data.get("status") or "open")[:40],
+        "resolution_event_id": str(data.get("resolution_event_id") or "")[:120],
     }
+
+
+def _belief_from_dict(data: dict[str, Any]) -> BeliefRecord:
+    status = str(data.get("epistemic_status") or "heard")
+    if status not in {"heard", "observed", "inferred", "believed", "verified", "disputed", "disproved"}:
+        status = "heard"
+    return BeliefRecord(
+        id=str(data.get("id") or "")[:160] or BeliefRecord(content="").id,
+        content=str(data.get("content") or "")[:500],
+        source_agent=str(data.get("source_agent") or "")[:120],
+        source_event_id=str(data.get("source_event_id") or "")[:120],
+        epistemic_status=status,
+        confidence=_bounded_float(data.get("confidence"), 0.5),
+        related_agents=[
+            str(item)[:120] for item in data.get("related_agents") or []
+            if str(item).strip()
+        ][:6] if isinstance(data.get("related_agents"), list) else [],
+        created_at_turn=_nonnegative_int(data.get("created_at_turn"), 0),
+        active=data.get("active") if isinstance(data.get("active"), bool) else True,
+        supersedes=str(data.get("supersedes") or "")[:160],
+    )
+
+
+def _obligation_from_dict(data: dict[str, Any]) -> DialogueObligation:
+    status = str(data.get("status") or "open")
+    if status not in {"open", "responded", "satisfied", "withdrawn", "expired"}:
+        status = "open"
+    return DialogueObligation(
+        id=str(data.get("id") or "")[:180] or f"obligation-{_nonnegative_int(data.get('created_at_turn'), 0)}",
+        source_event_id=str(data.get("source_event_id") or data.get("event_id") or "")[:120],
+        requester=str(data.get("requester") or data.get("speaker") or "")[:120],
+        target=str(data.get("target") or "")[:120],
+        move=str(data.get("move") or "question")[:40],
+        summary=str(data.get("summary") or "")[:500],
+        urgency=_bounded_float(data.get("urgency"), 0.0),
+        status=status,
+        resolution_event_id=str(data.get("resolution_event_id") or "")[:120],
+        created_at_turn=_nonnegative_int(data.get("created_at_turn"), 0),
+        updated_at_turn=_nonnegative_int(data.get("updated_at_turn"), 0),
+    )
+
+
+def _thread_from_dict(data: dict[str, Any]) -> ConversationThread:
+    status = str(data.get("status") or "active")
+    if status not in {"active", "dormant", "resolved"}:
+        status = "active"
+    return ConversationThread(
+        id=str(data.get("id") or "")[:160],
+        topic=str(data.get("topic") or "未命名议题")[:160],
+        status=status,
+        participants=[str(item)[:120] for item in data.get("participants") or []][:12],
+        source_event_ids=[str(item)[:120] for item in data.get("source_event_ids") or []][-40:],
+        obligations=[
+            _obligation_from_dict(item) for item in data.get("obligations") or []
+            if isinstance(item, dict)
+        ][-30:],
+        claim_ids=[str(item)[:160] for item in data.get("claim_ids") or []][-30:],
+        tension=_bounded_float(data.get("tension"), 0.0),
+        created_at_turn=_nonnegative_int(data.get("created_at_turn"), 0),
+        last_active_turn=_nonnegative_int(data.get("last_active_turn"), 0),
+    )
 
 
 def _relationship_dynamics_from_dict(data: Any) -> dict[str, dict[str, Any]]:
@@ -228,11 +296,28 @@ def _relationship_dynamics_from_dict(data: Any) -> dict[str, dict[str, Any]]:
                 "event_id": str(item.get("event_id") or "")[:120],
                 "turn": _nonnegative_int(item.get("turn"), 0),
                 "note": str(item.get("note") or "")[:300],
-                "trust_delta": _bounded_float(item.get("trust_delta"), 0.0, -0.2, 0.2),
-                "suspicion_delta": _bounded_float(item.get("suspicion_delta"), 0.0, -0.2, 0.2),
-                "affinity_delta": _bounded_float(item.get("affinity_delta"), 0.0, -0.2, 0.2),
+                "facets": {
+                    str(key)[:80]: _bounded_float(value, 0.0, -0.2, 0.2)
+                    for key, value in (item.get("facets") or {}).items()
+                } if isinstance(item.get("facets"), dict) else {},
+                "proposed_facets": {
+                    str(key)[:80]: _bounded_float(value, 0.0, -0.2, 0.2)
+                    for key, value in (item.get("proposed_facets") or {}).items()
+                } if isinstance(item.get("proposed_facets"), dict) else {},
+                "cap": _bounded_float(item.get("cap"), 0.2, 0.0, 0.2),
             })
+        facets = {
+            str(key)[:80]: _bounded_float(value, 0.5)
+            for key, value in (raw_value.get("facets") or {}).items()
+        } if isinstance(raw_value.get("facets"), dict) else {}
+        if not facets:
+            facets = {
+                "cooperation": 1.0 - _bounded_float(raw_value.get("suspicion"), 0.5),
+                "confidence": _bounded_float(raw_value.get("trust"), 0.5),
+                "regard": _bounded_float(raw_value.get("affinity"), 0.5),
+            }
         result[target] = {
+            "facets": facets,
             "trust": _bounded_float(raw_value.get("trust"), 0.5),
             "suspicion": _bounded_float(raw_value.get("suspicion"), 0.5),
             "affinity": _bounded_float(raw_value.get("affinity"), 0.5),
@@ -281,6 +366,24 @@ def agent_from_dict(data: dict[str, Any]) -> AgentState:
     values["disclosure_pressure"] = _bounded_float(
         data.get("disclosure_pressure"), 0.0
     )
+    values["disclosure_pressure_by_thread"] = {
+        str(key)[:120]: _bounded_float(value, 0.0)
+        for key, value in (data.get("disclosure_pressure_by_thread") or {}).items()
+    } if isinstance(data.get("disclosure_pressure_by_thread"), dict) else {}
+    if not values["disclosure_pressure_by_thread"] and values["disclosure_pressure"]:
+        values["disclosure_pressure_by_thread"] = {
+            "general": values["disclosure_pressure"]
+        }
+    values["active_thread_ids"] = [
+        str(item)[:120] for item in data.get("active_thread_ids") or []
+    ][-8:] if isinstance(data.get("active_thread_ids"), list) else []
+    values["core_beliefs"] = [
+        str(item)[:500] for item in data.get("core_beliefs") or [] if str(item).strip()
+    ][:6] if isinstance(data.get("core_beliefs"), list) else []
+    values["belief_records"] = [
+        _belief_from_dict(item) for item in data.get("belief_records") or []
+        if isinstance(item, dict) and str(item.get("content") or "").strip()
+    ][-60:]
     try:
         values["emotion_intensity"] = max(
             0.0, min(float(data.get("emotion_intensity", 0.2)), 1.0)
@@ -342,6 +445,18 @@ def state_from_dict(
         for key, value in (data.get("dialogue_quality_issue_counts") or {}).items()
         if str(key).strip()
     } if isinstance(data.get("dialogue_quality_issue_counts"), dict) else {}
+    state.conversation_threads = {
+        thread.id: thread
+        for item in data.get("conversation_threads") or []
+        if isinstance(item, dict)
+        for thread in [_thread_from_dict(item)]
+        if thread.id
+    }
+    state.last_scheduler_decision = (
+        dict(data.get("last_scheduler_decision"))
+        if isinstance(data.get("last_scheduler_decision"), dict)
+        else {}
+    )
     state.votes = dict(data.get("votes") or {})
     state.pending_events = list(data.get("pending_events") or [])
     state.interventions = [
@@ -355,6 +470,43 @@ def state_from_dict(
     state.agent_order = [name for name in requested_order if name in state.agents]
     if not state.agent_order:
         state.agent_order = list(state.agents)
+    if not state.conversation_threads:
+        for agent in state.agents.values():
+            for pending in agent.pending_intents:
+                event_id = str(pending.get("event_id") or "")
+                if not event_id:
+                    continue
+                thread_id = f"thread-{event_id[:16]}"
+                thread = state.conversation_threads.setdefault(
+                    thread_id,
+                    ConversationThread(
+                        id=thread_id,
+                        topic=str(pending.get("summary") or "旧版待回应议题")[:160],
+                        participants=[
+                            name for name in [str(pending.get("speaker") or ""), agent.name]
+                            if name
+                        ],
+                        source_event_ids=[event_id],
+                        created_at_turn=_nonnegative_int(pending.get("created_at_turn"), 0),
+                        last_active_turn=_nonnegative_int(pending.get("created_at_turn"), 0),
+                    ),
+                )
+                obligation = DialogueObligation(
+                    id=f"obligation-{event_id[:12]}-{agent.id or agent.name}",
+                    source_event_id=event_id,
+                    requester=str(pending.get("speaker") or ""),
+                    target=agent.name,
+                    move=str(pending.get("move") or "question"),
+                    summary=str(pending.get("summary") or "")[:500],
+                    urgency=_bounded_float(pending.get("urgency"), 0.0),
+                    created_at_turn=_nonnegative_int(pending.get("created_at_turn"), 0),
+                    updated_at_turn=_nonnegative_int(pending.get("created_at_turn"), 0),
+                )
+                thread.obligations.append(obligation)
+                pending["thread_id"] = thread_id
+                pending["obligation_id"] = obligation.id
+                if thread_id not in agent.active_thread_ids:
+                    agent.active_thread_ids.append(thread_id)
     return state
 
 

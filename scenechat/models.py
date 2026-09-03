@@ -11,6 +11,20 @@ MEMORY_SUMMARY_INTERVAL = 8
 MEMORY_TYPES = {
     "claim", "clue", "commitment", "relationship_evidence", "revelation", "decision",
 }
+DEFAULT_RELATIONSHIP_DIMENSIONS = {
+    "cooperation": {
+        "label": "合作倾向", "low_label": "对抗", "high_label": "协作",
+        "description": "双方当前更倾向相互阻碍还是共同配合。",
+    },
+    "confidence": {
+        "label": "可靠判断", "low_label": "不可靠", "high_label": "可靠",
+        "description": "该角色认为对方的言行与能力有多可靠。",
+    },
+    "regard": {
+        "label": "重视程度", "low_label": "漠视", "high_label": "重视",
+        "description": "该角色在决策中有多重视对方及其处境。",
+    },
+}
 
 
 @dataclass
@@ -181,6 +195,55 @@ class MemoryRecord:
 
 
 @dataclass
+class BeliefRecord:
+    """A character-owned proposition; it is not automatically world truth."""
+
+    content: str
+    id: str = field(default_factory=lambda: f"belief-{uuid.uuid4().hex}")
+    source_agent: str = ""
+    source_event_id: str = ""
+    epistemic_status: str = "heard"
+    confidence: float = 0.5
+    related_agents: List[str] = field(default_factory=list)
+    created_at_turn: int = 0
+    active: bool = True
+    supersedes: str = ""
+
+
+@dataclass
+class DialogueObligation:
+    """One directed conversational duty inside a topic thread."""
+
+    source_event_id: str
+    requester: str
+    target: str
+    move: str
+    summary: str
+    id: str = field(default_factory=lambda: f"obligation-{uuid.uuid4().hex}")
+    urgency: float = 0.0
+    status: str = "open"
+    resolution_event_id: str = ""
+    created_at_turn: int = 0
+    updated_at_turn: int = 0
+
+
+@dataclass
+class ConversationThread:
+    """A topic-scoped interaction chain shared by observable participants."""
+
+    topic: str
+    id: str = field(default_factory=lambda: f"thread-{uuid.uuid4().hex}")
+    status: str = "active"
+    participants: List[str] = field(default_factory=list)
+    source_event_ids: List[str] = field(default_factory=list)
+    obligations: List[DialogueObligation] = field(default_factory=list)
+    claim_ids: List[str] = field(default_factory=list)
+    tension: float = 0.0
+    created_at_turn: int = 0
+    last_active_turn: int = 0
+
+
+@dataclass
 class AbilityState:
     id: str
     name: str
@@ -221,12 +284,16 @@ class AgentState:
     goal_status: Dict[str, str] = field(default_factory=dict)
     known_facts: Dict[str, str] = field(default_factory=dict)
     false_beliefs: List[str] = field(default_factory=list)
+    core_beliefs: List[str] = field(default_factory=list)
+    belief_records: List[BeliefRecord] = field(default_factory=list)
     voice_profile: Dict[str, Any] = field(default_factory=dict)
     current_emotion: str = "平静"
     emotion_intensity: float = 0.2
     emotion_cause_event_id: str = ""
     current_conversation_goal: str = ""
     disclosure_pressure: float = 0.0
+    disclosure_pressure_by_thread: Dict[str, float] = field(default_factory=dict)
+    active_thread_ids: List[str] = field(default_factory=list)
     pending_commitments: List[str] = field(default_factory=list)
     unanswered_questions: List[Dict[str, Any]] = field(default_factory=list)
     last_addressed_by: str = ""
@@ -235,6 +302,101 @@ class AgentState:
     memories: List[MemoryRecord] = field(default_factory=list)
     memory_summaries: List[Dict[str, Any]] = field(default_factory=list)
     initiative: int = 0
+
+    def set_disclosure_pressure(self, thread_id: str, value: float) -> float:
+        key = str(thread_id or "general")[:120]
+        try:
+            bounded = max(0.0, min(float(value), 1.0))
+        except (TypeError, ValueError):
+            bounded = 0.0
+        # Refresh insertion order so trimming keeps the most recently touched topics.
+        self.disclosure_pressure_by_thread.pop(key, None)
+        self.disclosure_pressure_by_thread[key] = round(bounded, 4)
+        self.disclosure_pressure_by_thread = dict(
+            list(self.disclosure_pressure_by_thread.items())[-12:]
+        )
+        self.disclosure_pressure = max(
+            self.disclosure_pressure_by_thread.values(), default=bounded
+        )
+        return bounded
+
+    def adjust_disclosure_pressure(self, thread_id: str, delta: float) -> float:
+        key = str(thread_id or "general")[:120]
+        current = self.disclosure_pressure_by_thread.get(
+            key,
+            self.disclosure_pressure if not self.disclosure_pressure_by_thread else 0.0,
+        )
+        try:
+            change = max(-0.25, min(float(delta), 0.25))
+        except (TypeError, ValueError):
+            change = 0.0
+        return self.set_disclosure_pressure(key, current + change)
+
+    def remember_belief(
+        self,
+        content: str,
+        *,
+        source_agent: str = "",
+        source_event_id: str = "",
+        epistemic_status: str = "heard",
+        confidence: float = 0.5,
+        related_agents: List[str] | None = None,
+        turn: int = 0,
+        supersedes: str = "",
+    ) -> BeliefRecord | None:
+        value = str(content or "").strip()[:500]
+        if not value:
+            return None
+        allowed = {"heard", "observed", "inferred", "believed", "verified", "disputed", "disproved"}
+        status = epistemic_status if epistemic_status in allowed else "heard"
+        try:
+            certainty = max(0.0, min(float(confidence), 1.0))
+        except (TypeError, ValueError):
+            certainty = 0.5
+        normalized = "".join(value.split()).lower()
+        duplicate = next((
+            item for item in reversed(self.belief_records[-30:])
+            if item.active and "".join(item.content.split()).lower() == normalized
+        ), None)
+        if duplicate:
+            duplicate.confidence = max(duplicate.confidence, certainty)
+            status_rank = {
+                "heard": 0, "inferred": 1, "believed": 2,
+                "observed": 3, "verified": 4,
+            }
+            if (
+                status in {"disputed", "disproved"}
+                or (
+                    duplicate.epistemic_status in {"disputed", "disproved"}
+                    and status == "verified"
+                )
+                or (
+                    duplicate.epistemic_status not in {"disputed", "disproved"}
+                    and status_rank.get(status, 0)
+                    >= status_rank.get(duplicate.epistemic_status, 0)
+                )
+            ):
+                duplicate.epistemic_status = status
+            duplicate.source_event_id = source_event_id or duplicate.source_event_id
+            duplicate.created_at_turn = max(duplicate.created_at_turn, turn)
+            return duplicate
+        if supersedes:
+            for item in self.belief_records:
+                if item.id == supersedes:
+                    item.active = False
+        record = BeliefRecord(
+            content=value,
+            source_agent=str(source_agent)[:120],
+            source_event_id=str(source_event_id)[:120],
+            epistemic_status=status,
+            confidence=certainty,
+            related_agents=list(related_agents or [])[:6],
+            created_at_turn=max(0, int(turn or 0)),
+            supersedes=str(supersedes)[:120],
+        )
+        self.belief_records.append(record)
+        self.belief_records = self.belief_records[-60:]
+        return record
 
     def observe(self, message: Message, phase: str = "") -> None:
         observation = message.as_observation_for(self.name)
@@ -344,6 +506,7 @@ class AgentState:
         event_id: str,
         turn: int,
         phase: str,
+        dimension_specs: Dict[str, Dict[str, str]] | None = None,
     ) -> None:
         if isinstance(update, str):
             value = update.strip()[:300]
@@ -352,23 +515,55 @@ class AgentState:
             return
         if not isinstance(update, dict):
             return
-        dynamic = self.relationship_dynamics.setdefault(target, {
-            "trust": 0.5,
-            "suspicion": 0.5,
-            "affinity": 0.5,
-            "evidence": [],
-        })
-
-        def apply_delta(key: str) -> float:
+        dimensions = dimension_specs or DEFAULT_RELATIONSHIP_DIMENSIONS
+        dynamic = self.relationship_dynamics.setdefault(target, {"facets": {}, "evidence": []})
+        facets = dynamic.get("facets")
+        if not isinstance(facets, dict):
+            facets = {}
+        # Schema-v2 compatibility: convert the former genre-biased fixed axes
+        # into neutral, world-configurable relationship facets.
+        def legacy_value(key: str, default: float = 0.5) -> float:
             try:
-                delta = max(-0.2, min(float(update.get(f"{key}_delta", 0.0)), 0.2))
-                current = max(0.0, min(float(dynamic.get(key, 0.5)), 1.0))
+                return max(0.0, min(float(dynamic.get(key, default)), 1.0))
             except (TypeError, ValueError):
-                delta, current = 0.0, 0.5
-            dynamic[key] = round(max(0.0, min(current + delta, 1.0)), 4)
-            return delta
+                return default
 
-        deltas = {key: apply_delta(key) for key in ("trust", "suspicion", "affinity")}
+        legacy_values = {
+            "cooperation": 1.0 - legacy_value("suspicion"),
+            "confidence": legacy_value("trust"),
+            "regard": legacy_value("affinity"),
+        }
+        for key in dimensions:
+            if key not in facets:
+                facets[key] = max(0.0, min(legacy_values.get(key, 0.5), 1.0))
+
+        raw_facets = update.get("facets") if isinstance(update.get("facets"), dict) else {}
+        if not raw_facets:
+            try:
+                legacy_suspicion = -float(update.get("suspicion_delta", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                legacy_suspicion = 0.0
+            raw_facets = {
+                "confidence": update.get("trust_delta", 0.0),
+                "cooperation": legacy_suspicion,
+                "regard": update.get("affinity_delta", 0.0),
+            }
+        deltas: Dict[str, float] = {}
+        for key, raw_delta in raw_facets.items():
+            if key not in dimensions:
+                continue
+            try:
+                delta = max(-0.2, min(float(raw_delta), 0.2))
+                current = max(0.0, min(float(facets.get(key, 0.5)), 1.0))
+            except (TypeError, ValueError):
+                continue
+            facets[key] = round(max(0.0, min(current + delta, 1.0)), 4)
+            deltas[key] = delta
+        dynamic["facets"] = facets
+        # Retain these values for old exports/readers without using them in new prompts.
+        dynamic["trust"] = facets.get("confidence", dynamic.get("trust", 0.5))
+        dynamic["suspicion"] = 1.0 - facets.get("cooperation", 0.5)
+        dynamic["affinity"] = facets.get("regard", dynamic.get("affinity", 0.5))
         note = str(update.get("private_note") or update.get("summary") or "").strip()[:300]
         evidence = dynamic.get("evidence")
         if not isinstance(evidence, list):
@@ -377,15 +572,17 @@ class AgentState:
             "event_id": str(update.get("reason_event_id") or event_id)[:120],
             "turn": turn,
             "note": note,
-            **{f"{key}_delta": value for key, value in deltas.items()},
+            "facets": dict(deltas),
+            "proposed_facets": dict(update.get("proposed_facets") or raw_facets),
+            "cap": update.get("applied_cap", 0.2),
         })
         dynamic["evidence"] = evidence[-12:]
         summary = str(update.get("summary") or "").strip()[:300]
         if summary:
             self.relationships[target] = summary
-        evidence_text = note or (
-            f"信任 {deltas['trust']:+.2f}，怀疑 {deltas['suspicion']:+.2f}，"
-            f"亲近 {deltas['affinity']:+.2f}"
+        evidence_text = note or "；".join(
+            f"{dimensions[key].get('label', key)} {value:+.2f}"
+            for key, value in deltas.items()
         )
         self.remember_structured(
             f"关于{target}：{evidence_text}",
@@ -523,6 +720,24 @@ class SimulationState:
         self.termination_rules = list(getattr(world_spec, "termination_rules", []) or [])
         self.facts = {fact.id: fact for fact in list(getattr(world_spec, "facts", []) or [])}
         self.locations = list(getattr(world_spec, "locations", []) or [])
+        configured_dimensions = {}
+        for dimension in list(getattr(world_spec, "relationship_dimensions", []) or []):
+            dimension_id = str(getattr(dimension, "id", "") or "").strip()
+            if not dimension_id:
+                continue
+            configured_dimensions[dimension_id] = {
+                "label": str(getattr(dimension, "label", dimension_id) or dimension_id),
+                "low_label": str(getattr(dimension, "low_label", "低") or "低"),
+                "high_label": str(getattr(dimension, "high_label", "高") or "高"),
+                "description": str(getattr(dimension, "description", "") or ""),
+            }
+        self.relationship_dimensions: Dict[str, Dict[str, str]] = (
+            configured_dimensions or {
+                key: dict(value) for key, value in DEFAULT_RELATIONSHIP_DIMENSIONS.items()
+            }
+        )
+        self.conversation_threads: Dict[str, ConversationThread] = {}
+        self.last_scheduler_decision: Dict[str, Any] = {}
         self.phase_action_log: set[str] = set()
         self.votes: Dict[str, str] = {}
         self.pending_events: List[Dict[str, Any]] = []
@@ -538,6 +753,16 @@ class SimulationState:
         for agent in self.agents.values():
             if not agent.current_location:
                 agent.current_location = default_location
+            for target, dynamic in list(agent.relationship_dynamics.items()):
+                if target not in self.agents or target == agent.name or not isinstance(dynamic, dict):
+                    agent.relationship_dynamics.pop(target, None)
+                    continue
+                facets = dynamic.get("facets") if isinstance(dynamic.get("facets"), dict) else {}
+                dynamic["facets"] = {
+                    key: max(0.0, min(float(value), 1.0))
+                    for key, value in facets.items()
+                    if key in self.relationship_dimensions and isinstance(value, (int, float))
+                }
             for fact in self.facts.values():
                 viewer = ViewerContext(
                     name=agent.name,
@@ -592,6 +817,7 @@ class SimulationState:
                         event_id=msg.event_id,
                         turn=msg.turn,
                         phase=self.current_phase,
+                        dimension_specs=self.relationship_dimensions,
                     )
             self._update_conversation_state(active_agent, msg)
 
@@ -629,7 +855,23 @@ class SimulationState:
 
         update_arc_after_message(self, msg)
         phase_changed = self.current_phase != phase_before
+        expired_question_ids: set[str] = set()
         for agent in self.agents.values():
+            fresh_pending = []
+            for item in agent.pending_intents:
+                try:
+                    created_at = int(item.get("created_at_turn", 0) or 0)
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                if created_at >= msg.turn - 12:
+                    fresh_pending.append(item)
+                    continue
+                pair = self.obligation_by_id(str(item.get("obligation_id") or ""))
+                if pair is not None and pair[1].status == "open":
+                    pair[1].status = "expired"
+                    pair[1].updated_at_turn = msg.turn
+                    expired_question_ids.add(pair[1].source_event_id)
+            agent.pending_intents = fresh_pending[-12:]
             fresh_opportunities = []
             for item in agent.conversation_opportunities:
                 try:
@@ -645,14 +887,149 @@ class SimulationState:
                     msg.turn,
                     force=phase_changed,
                 )
+            for thread_id, pressure in list(agent.disclosure_pressure_by_thread.items()):
+                thread = self.conversation_threads.get(thread_id)
+                if thread is not None and msg.turn - thread.last_active_turn > 4:
+                    agent.set_disclosure_pressure(thread_id, max(0.0, pressure - 0.03))
+            agent.active_thread_ids = [
+                thread_id for thread_id in agent.active_thread_ids
+                if thread_id in self.conversation_threads
+                and self.conversation_threads[thread_id].status == "active"
+            ][-8:]
+        if expired_question_ids:
+            for agent in self.agents.values():
+                agent.unanswered_questions = [
+                    item for item in agent.unanswered_questions
+                    if str(item.get("event_id") or "") not in expired_question_ids
+                ]
+        for thread in self.conversation_threads.values():
+            if thread.status == "active" and msg.turn - thread.last_active_turn > 8:
+                thread.status = "dormant"
         self.bump_revision()
+
+    def thread_for_event(self, event_id: str) -> ConversationThread | None:
+        value = str(event_id or "")
+        if not value:
+            return None
+        return next((
+            thread for thread in self.conversation_threads.values()
+            if value in thread.source_event_ids
+            or any(item.source_event_id == value for item in thread.obligations)
+        ), None)
+
+    def obligation_by_id(
+        self,
+        obligation_id: str,
+    ) -> tuple[ConversationThread, DialogueObligation] | None:
+        value = str(obligation_id or "")
+        for thread in self.conversation_threads.values():
+            for obligation in thread.obligations:
+                if obligation.id == value:
+                    return thread, obligation
+        return None
+
+    def active_threads_for(self, agent_name: str) -> List[ConversationThread]:
+        threads = [
+            thread for thread in self.conversation_threads.values()
+            if thread.status == "active" and agent_name in thread.participants
+        ]
+        return sorted(threads, key=lambda item: item.last_active_turn, reverse=True)
+
+    def _commit_thread_metadata(
+        self,
+        actor: AgentState,
+        msg: Message,
+        intent: Dict[str, Any],
+        *,
+        move: str,
+        addressed_to: List[str],
+        summary: str,
+    ) -> ConversationThread | None:
+        thread = self.conversation_threads.get(str(intent.get("thread_id") or ""))
+        reply_pair = self.obligation_by_id(str(intent.get("reply_to_obligation_id") or ""))
+        if reply_pair is None:
+            reply_event = str(intent.get("reply_to_event_id") or "")
+            reply_thread = self.thread_for_event(reply_event)
+            if reply_thread is not None:
+                obligation = next((
+                    item for item in reversed(reply_thread.obligations)
+                    if item.source_event_id == reply_event
+                    and item.target == actor.name
+                    and item.status == "open"
+                ), None)
+                if obligation is not None:
+                    reply_pair = (reply_thread, obligation)
+        if reply_pair is not None:
+            thread, obligation = reply_pair
+            requested = str(intent.get("obligation_resolution") or "")
+            if requested not in {"responded", "satisfied", "withdrawn"}:
+                requested = (
+                    "satisfied" if move in {"answer", "reveal"} else "responded"
+                )
+            obligation.status = requested
+            obligation.resolution_event_id = msg.event_id
+            obligation.updated_at_turn = msg.turn
+            intent["thread_id"] = thread.id
+            intent["reply_to_obligation_id"] = obligation.id
+            intent["obligation_resolution"] = requested
+
+        if thread is None and move in {"question", "request", "challenge"} and addressed_to:
+            thread = ConversationThread(
+                id=f"thread-{msg.event_id[:16]}",
+                topic=summary[:160] or f"{actor.name}发起的互动",
+                participants=[actor.name, *addressed_to],
+                source_event_ids=[msg.event_id],
+                tension=0.12 if move == "challenge" else 0.05,
+                created_at_turn=msg.turn,
+                last_active_turn=msg.turn,
+            )
+            self.conversation_threads[thread.id] = thread
+            intent["thread_id"] = thread.id
+
+        if thread is None:
+            return None
+        thread.status = "active"
+        thread.last_active_turn = msg.turn
+        if msg.event_id not in thread.source_event_ids:
+            thread.source_event_ids.append(msg.event_id)
+            thread.source_event_ids = thread.source_event_ids[-40:]
+        for name in [actor.name, *addressed_to]:
+            if name in self.agents and name not in thread.participants:
+                thread.participants.append(name)
+        thread.participants = thread.participants[-12:]
+        tension_delta = {
+            "challenge": 0.12, "question": 0.04, "request": 0.04,
+            "deflect": 0.06, "answer": -0.05, "support": -0.06,
+            "reveal": -0.08, "acknowledge": -0.03,
+        }.get(move, 0.0)
+        thread.tension = round(max(0.0, min(thread.tension + tension_delta, 1.0)), 4)
+        if thread.id not in actor.active_thread_ids:
+            actor.active_thread_ids.append(thread.id)
+            actor.active_thread_ids = actor.active_thread_ids[-8:]
+        return thread
 
     def _update_conversation_state(self, actor: AgentState, msg: Message) -> None:
         """Commit validated dialogue metadata without granting world authority."""
 
         intent = msg.intent if isinstance(msg.intent, dict) else {}
         actor.conversation_opportunities = []
+        move = str(intent.get("conversation_move") or "statement")
+        addressed_to = [
+            str(name) for name in intent.get("addressed_to") or []
+            if str(name) in self.agents and str(name) != actor.name
+        ]
+        summary = (msg.speech or msg.action).strip()[:300]
+        thread = self._commit_thread_metadata(
+            actor,
+            msg,
+            intent,
+            move=move,
+            addressed_to=addressed_to,
+            summary=summary,
+        )
+        thread_id = thread.id if thread is not None else "general"
         reply_to = str(intent.get("reply_to_event_id") or "").strip()
+        reply_resolution = str(intent.get("obligation_resolution") or "")
         if reply_to:
             actor.pending_intents = [
                 item for item in actor.pending_intents
@@ -663,10 +1040,25 @@ class SimulationState:
             for agent in self.agents.values():
                 if not self._agent_can_observe(agent, msg):
                     continue
-                agent.unanswered_questions = [
-                    item for item in agent.unanswered_questions
-                    if str(item.get("event_id") or "") != reply_to
-                ]
+                if reply_resolution == "satisfied":
+                    remaining_questions = []
+                    for item in agent.unanswered_questions:
+                        if str(item.get("event_id") or "") != reply_to:
+                            remaining_questions.append(item)
+                            continue
+                        remaining_targets = [
+                            name for name in item.get("addressed_to") or []
+                            if str(name) != actor.name
+                        ]
+                        if remaining_targets:
+                            item["addressed_to"] = remaining_targets
+                            remaining_questions.append(item)
+                    agent.unanswered_questions = remaining_questions
+                else:
+                    for item in agent.unanswered_questions:
+                        if str(item.get("event_id") or "") == reply_to:
+                            item["status"] = "responded"
+                            item["resolution_event_id"] = msg.event_id
 
         short_term = intent.get("short_term_state")
         if isinstance(short_term, dict):
@@ -692,9 +1084,8 @@ class SimulationState:
                     -0.15,
                     min(float(short_term.get("disclosure_pressure_delta", 0.0)), 0.15),
                 )
-                actor.disclosure_pressure = max(
-                    0.0,
-                    min(actor.disclosure_pressure + pressure_delta, 1.0),
+                actor.adjust_disclosure_pressure(
+                    str(intent.get("thread_id") or "general"), pressure_delta
                 )
             except (TypeError, ValueError):
                 pass
@@ -738,17 +1129,39 @@ class SimulationState:
                 ],
             )
 
+        for candidate in intent.get("claim_updates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            source_event_id = str(candidate.get("source_event_id") or reply_to or msg.event_id)
+            source_message = next((
+                item for item in reversed(self.history)
+                if item.event_id == source_event_id
+            ), None)
+            record = actor.remember_belief(
+                str(candidate.get("content") or ""),
+                source_agent=(
+                    str(candidate.get("source_agent") or "")
+                    or (source_message.speaker if source_message is not None else actor.name)
+                ),
+                source_event_id=source_event_id,
+                epistemic_status=str(candidate.get("epistemic_status") or "heard"),
+                confidence=candidate.get("confidence", 0.5),
+                related_agents=[
+                    str(name) for name in candidate.get("related_agents") or []
+                    if str(name) in self.agents and str(name) != actor.name
+                ],
+                turn=msg.turn,
+                supersedes=str(candidate.get("supersedes") or ""),
+            )
+            if record is not None and thread is not None and record.id not in thread.claim_ids:
+                thread.claim_ids.append(record.id)
+                thread.claim_ids = thread.claim_ids[-30:]
+
         try:
             actor.initiative = max(0, min(round(float(intent.get("urgency", 0.0)) * 100), 100))
         except (TypeError, ValueError):
             actor.initiative = 0
 
-        move = str(intent.get("conversation_move") or "statement")
-        addressed_to = [
-            str(name) for name in intent.get("addressed_to") or []
-            if str(name) in self.agents and str(name) != actor.name
-        ]
-        summary = (msg.speech or msg.action).strip()[:300]
         mentioned_agents = [
             str(name) for name in intent.get("mentioned_agents") or []
             if str(name) in self.agents
@@ -759,6 +1172,12 @@ class SimulationState:
             target = self.agents[name]
             if not summary or not self._agent_can_observe(target, msg):
                 continue
+            if thread is not None and name not in thread.participants:
+                thread.participants.append(name)
+                thread.participants = thread.participants[-12:]
+            if thread is not None and thread.id not in target.active_thread_ids:
+                target.active_thread_ids.append(thread.id)
+                target.active_thread_ids = target.active_thread_ids[-8:]
             target.conversation_opportunities.append({
                 "event_id": msg.event_id,
                 "speaker": actor.name,
@@ -766,17 +1185,23 @@ class SimulationState:
                 "summary": summary,
                 "urgency": max(0.25, min(actor.initiative / 100, 1.0)),
                 "created_at_turn": msg.turn,
+                "thread_id": thread.id if thread is not None else "",
             })
             target.conversation_opportunities = target.conversation_opportunities[-8:]
 
         if move == "reveal":
-            actor.disclosure_pressure = max(0.0, actor.disclosure_pressure - 0.25)
+            actor.adjust_disclosure_pressure(thread_id, -0.25)
         elif move == "deflect":
-            actor.disclosure_pressure = min(1.0, actor.disclosure_pressure + 0.08)
+            actor.adjust_disclosure_pressure(thread_id, 0.08)
         elif move in {"answer", "acknowledge"}:
-            actor.disclosure_pressure = max(0.0, actor.disclosure_pressure - 0.08)
+            actor.adjust_disclosure_pressure(thread_id, -0.08)
 
         if not summary or move not in {"question", "request", "challenge"}:
+            if thread is not None and thread.obligations and all(
+                item.status in {"satisfied", "withdrawn"}
+                for item in thread.obligations
+            ):
+                thread.status = "resolved"
             return
         obligation = {
             "event_id": msg.event_id,
@@ -785,6 +1210,7 @@ class SimulationState:
             "summary": summary,
             "urgency": max(0.0, min(actor.initiative / 100, 1.0)),
             "created_at_turn": msg.turn,
+            "thread_id": thread.id if thread is not None else "",
         }
         delivered_to = []
         for name in addressed_to:
@@ -794,7 +1220,25 @@ class SimulationState:
             delivered_to.append(name)
             target.last_addressed_by = actor.name
             pressure_gain = (0.04 if move == "question" else 0.08) + obligation["urgency"] * 0.12
-            target.disclosure_pressure = min(1.0, target.disclosure_pressure + pressure_gain)
+            target.adjust_disclosure_pressure(thread_id, pressure_gain)
+            if thread is not None:
+                if thread.id not in target.active_thread_ids:
+                    target.active_thread_ids.append(thread.id)
+                    target.active_thread_ids = target.active_thread_ids[-8:]
+                structured_obligation = DialogueObligation(
+                    id=f"obligation-{msg.event_id[:12]}-{target.id or target.name}",
+                    source_event_id=msg.event_id,
+                    requester=actor.name,
+                    target=target.name,
+                    move=move,
+                    summary=summary,
+                    urgency=obligation["urgency"],
+                    created_at_turn=msg.turn,
+                    updated_at_turn=msg.turn,
+                )
+                thread.obligations.append(structured_obligation)
+                thread.obligations = thread.obligations[-30:]
+                obligation["obligation_id"] = structured_obligation.id
             target.pending_intents = [
                 item for item in target.pending_intents
                 if str(item.get("event_id") or "") != msg.event_id

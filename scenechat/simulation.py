@@ -5,6 +5,7 @@ from typing import Optional, Protocol
 
 from .context import build_agent_view, director_context
 from .dialogue_quality import inspect_dialogue_intent, quality_retry_instruction
+from .dialogue_policy import safe_obligation_fallback
 from .models import AgentState, Message, SimulationState
 from .interventions import (
     active_guidance,
@@ -61,6 +62,11 @@ def build_agent_prompt(
     retrieved_context: str,
 ) -> str:
     view = build_agent_view(state, agent, retrieved_context)
+    relationship_dimensions = json.dumps(
+        state.relationship_dimensions,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
     return f"""你正在扮演社会模拟实验中的角色“{agent.name}”。
 
@@ -71,14 +77,15 @@ def build_agent_prompt(
 请严格站在“{agent.name}”的有限视角中推进一轮行动。行动和发言必须符合其身份、目标、已知信息与社会处境，不要解释创作过程，不要替其他角色行动。
 
 【自然对话规则】
-1. 如果“需要优先处理的回应”非空，本轮应先回应其中最紧迫的一项；填写对应 reply_to_event_id。可以回答、质疑、回避或拒绝，但不能像没听见一样另起话题。
+1. 如果“需要优先处理的回应”非空，本轮应先回应其中最紧迫的一项；填写对应 thread_id、reply_to_obligation_id 和 reply_to_event_id。可以回答、质疑、回避或拒绝，但不能像没听见一样另起话题。回避表示已经回应但没有解决，不要伪装成完整回答。
    标为“可选择插话”的内容不是强制回应；只有当它与当前目标、关系或秘密风险确实相关时才插话，避免所有人逢点名必抢话。
 2. 每轮只推进一个主要意图。优先对最近的具体言行作出反应，不要重新介绍人物、世界背景或复述双方已经知道的事实。
 3. 遵循语言画像，但不要机械重复口癖。让句长、礼貌、直接程度、情绪外显和信息披露方式体现人物差异。
 4. 角色通常不会把完整动机、秘密和推理过程直接说出口。允许潜台词、停顿、试探、反问、转移、沉默，以及动作与台词不完全一致。
 5. 除非题材或当前情境要求正式陈述，speech 通常控制在一至三句；没有必要说话时可以只行动或保持沉默。
-6. relationship_updates 只在一条自己确实观察过的历史事件提供新证据时填写；reason_event_id 必须指向该事件，单轮变化保持小幅。公开礼貌不等于私人信任恢复。
-7. 信息披露压力较高时，角色更难完全无视追问，但仍可以有限回答、转移、撒谎或反问；不要因为数值升高就自动公开全部秘密。
+6. 本场景的关系维度为：{relationship_dimensions}。relationship_updates.facets 只能使用这些维度 ID；它们是题材相关的主观关系，不是固定的狼人杀式猜疑参数，也不能代替生命值、距离或胜负等客观战斗状态。每次变化必须引用新观察到的历史事件。
+7. 信息披露压力按议题隔离。某个议题压力较高时，角色更难完全无视该议题的追问，但仍可以有限回答、转移、撒谎或反问；不要因此公开其他议题的秘密。
+8. 他人的发言首先只是主张，不是客观事实。只有权威事件才能直接成为 verified；普通听闻、观察和推断用 claim_updates 保存来源。used_memory_ids 只填写本轮确实使用的已知事实、记忆或主张 ID。
 
 你只提交 Intent，不直接修改世界状态。action_type、ability 和 target 必须来自上面的当前阶段、能力与在场角色；不能凭空宣布自己获胜、获得能力、知道秘密或强迫他人完成重大决定。private_reason 只解释本轮决策，不会公开，也不会自动写入长期记忆。
 
@@ -92,9 +99,7 @@ def build_agent_prompt(
   "private_reason": "该角色不会说出口的一句理由",
   "relationship_updates": {{
     "其他角色姓名": {{
-      "trust_delta": 0.0,
-      "suspicion_delta": 0.0,
-      "affinity_delta": 0.0,
+      "facets": {{"本场景声明的关系维度 ID": 0.0}},
       "reason_event_id": "造成变化的可见历史 event_id",
       "private_note": "该事件为何改变了判断",
       "summary": "可选：更新后的简短主观关系描述"
@@ -103,6 +108,9 @@ def build_agent_prompt(
   "addressed_to": ["本轮明确对话或行动指向的角色姓名"],
   "mentioned_agents": ["被谈及、可能因此选择插话，但本轮并非直接对话对象的角色"],
   "reply_to_event_id": "正在回应的可见消息 event_id；没有时为空",
+  "thread_id": "正在延续的可见议题 thread_id；新议题或无关行动时为空",
+  "reply_to_obligation_id": "正在回应的 obligation_id；没有时为空",
+  "obligation_resolution": "responded|satisfied|withdrawn；回避和反问只能填 responded",
   "conversation_move": "statement|answer|question|request|challenge|deflect|support|reveal|acknowledge|silence",
   "urgency": 0.0,
   "short_term_state": {{
@@ -118,6 +126,15 @@ def build_agent_prompt(
     "importance": 1,
     "related_agents": ["与这条记忆直接相关的角色"],
     "source_event_id": "信息来自某条可见历史消息时填写，否则为空"
+  }}],
+  "used_memory_ids": ["本轮实际使用的可见事实、记忆或认知记录 ID"],
+  "claim_updates": [{{
+    "content": "值得保留的具体主张或认知，不要把普通台词全部复制进来",
+    "source_event_id": "来源事件；自身本轮新主张可为空",
+    "epistemic_status": "heard|observed|inferred|believed|verified|disputed|disproved",
+    "confidence": 0.5,
+    "related_agents": ["相关角色"],
+    "supersedes": "被本条认知修正或推翻的既有 belief ID；没有时为空"
   }}],
   "expected_effect": "角色期望发生什么，不代表一定成功",
   "proposed_patch": []
@@ -173,10 +190,15 @@ def parse_agent_intent(raw: str) -> Optional[dict]:
             "addressed_to": [],
             "mentioned_agents": [],
             "reply_to_event_id": "",
+            "thread_id": "",
+            "reply_to_obligation_id": "",
+            "obligation_resolution": "",
             "conversation_move": "statement",
             "urgency": 0.0,
             "short_term_state": {},
             "memory_candidates": [],
+            "used_memory_ids": [],
+            "claim_updates": [],
         }
     if not isinstance(payload, dict):
         return None
@@ -205,6 +227,9 @@ def parse_agent_intent(raw: str) -> Optional[dict]:
         if isinstance(payload.get("mentioned_agents"), list)
         else [],
         "reply_to_event_id": str(payload.get("reply_to_event_id") or "").strip(),
+        "thread_id": str(payload.get("thread_id") or "").strip(),
+        "reply_to_obligation_id": str(payload.get("reply_to_obligation_id") or "").strip(),
+        "obligation_resolution": str(payload.get("obligation_resolution") or "").strip(),
         "conversation_move": str(payload.get("conversation_move") or "statement").strip(),
         "urgency": payload.get("urgency", 0.0),
         "short_term_state": payload.get("short_term_state")
@@ -212,6 +237,12 @@ def parse_agent_intent(raw: str) -> Optional[dict]:
         else {},
         "memory_candidates": payload.get("memory_candidates")
         if isinstance(payload.get("memory_candidates"), list)
+        else [],
+        "used_memory_ids": payload.get("used_memory_ids")
+        if isinstance(payload.get("used_memory_ids"), list)
+        else [],
+        "claim_updates": payload.get("claim_updates")
+        if isinstance(payload.get("claim_updates"), list)
         else [],
     }
 
@@ -332,10 +363,12 @@ def simulate_next_turn(
         f"当前场景：{state.scene}\n"
         f"当前角色：{agent.name}\n"
         f"角色目标：{'；'.join(agent.goals)}\n"
+        f"可选核心信念：{'；'.join(agent.core_beliefs) or '无额外设定'}\n"
         f"近期观察：{agent.recent_observations(5)}\n"
         f"当前对话目标：{agent.current_conversation_goal or '依据长期目标判断'}\n"
         f"待回应对象：{agent.last_addressed_by or '无'}\n"
-        f"当前披露压力：{agent.disclosure_pressure:.2f}\n"
+        f"当前各议题披露压力：{agent.disclosure_pressure_by_thread or {'general': agent.disclosure_pressure}}\n"
+        f"活跃议题：{'；'.join(thread.topic for thread in state.active_threads_for(agent.name)[:4]) or '无'}\n"
         f"可选择插话数：{len(agent.conversation_opportunities)}"
     )
     try:
@@ -394,22 +427,7 @@ def simulate_next_turn(
     allowed_actions = list(getattr(phase, "allowed_action_types", []) or [])
     pending = agent.pending_intents[-1] if agent.pending_intents else None
     if pending and (not allowed_actions or "speak" in allowed_actions):
-        requester = str(pending.get("speaker") or "对方").strip()
-        try:
-            fallback_urgency = float(pending.get("urgency", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            fallback_urgency = 0.0
-        fallback_intent = Intent(
-            actor=agent.name,
-            action_type="speak",
-            action=f"看向{requester}，明确表示自己听见了问题。",
-            speech="我听见了，但现在还不能给出完整答复。",
-            private_reason=f"模型重试后仍未完成必要回应：{rejection}",
-            addressed_to=[requester] if requester in state.agents else [],
-            reply_to_event_id=str(pending.get("event_id") or ""),
-            conversation_move="deflect",
-            urgency=fallback_urgency,
-        )
+        fallback_intent = safe_obligation_fallback(agent, pending, rejection)
         fallback_resolution = active_resolver.resolve(state, fallback_intent)
         if fallback_resolution.accepted and fallback_intent.reply_to_event_id:
             state.record_generation_success()

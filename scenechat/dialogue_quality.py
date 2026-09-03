@@ -66,8 +66,20 @@ def _known_parts(agent: AgentState) -> list[str]:
         part for part in (
             [*profile_lines, *agent.observations, *agent.private_memory]
         + list(agent.known_facts.values())
+        + [item.content for item in agent.belief_records if item.active]
         ) if str(part).strip()
     ]
+
+
+def _secret_units(value: str) -> list[str]:
+    text = str(value or "").strip()
+    units = [text, *re.split(r"[。！？!?；;\n]+", text)]
+    result = []
+    for unit in units:
+        candidate = unit.strip().lstrip("-* ").strip()
+        if len(_normalized(candidate)) >= 8 and candidate not in result:
+            result.append(candidate)
+    return result
 
 
 def _hidden_fragments(state: SimulationState, agent: AgentState) -> list[str]:
@@ -77,13 +89,23 @@ def _hidden_fragments(state: SimulationState, agent: AgentState) -> list[str]:
     for fact_id, fact in state.facts.items():
         content = str(getattr(fact, "content", "") or "").strip()
         normalized = _normalized(content)
+        if fact_id in agent.known_facts:
+            continue
         if (
-            fact_id not in agent.known_facts
-            and len(normalized) >= 8
+            len(normalized) >= 8
             and normalized not in normalized_known
             and not any(_looks_like_secret(content, part) for part in known_parts)
         ):
-            fragments.append(content)
+            fragments.extend(_secret_units(content))
+        for proposition in getattr(fact, "protected_propositions", []) or []:
+            value = str(proposition).strip()
+            proposition_normalized = _normalized(value)
+            if (
+                len(proposition_normalized) >= 8
+                and proposition_normalized not in normalized_known
+                and not any(_looks_like_secret(value, part) for part in known_parts)
+            ):
+                fragments.extend(_secret_units(value))
 
     for other in state.agents.values():
         if other.name == agent.name:
@@ -102,8 +124,8 @@ def _hidden_fragments(state: SimulationState, agent: AgentState) -> list[str]:
                 or line in {"无额外秘密", "未提供额外私有知识。"}
             ):
                 continue
-            fragments.append(line)
-    return fragments
+            fragments.extend(_secret_units(line))
+    return list(dict.fromkeys(fragments))
 
 
 def inspect_dialogue_intent(
@@ -173,6 +195,16 @@ def inspect_dialogue_intent(
         *[
             str(item.get("content") or "")
             for item in getattr(intent, "memory_candidates", [])
+            if isinstance(item, dict)
+        ],
+        *[
+            str(item.get("content") or "")
+            for item in getattr(intent, "claim_updates", [])
+            if isinstance(item, dict)
+        ],
+        *[
+            str(item.get("private_note") or "")
+            for item in getattr(intent, "relationship_updates", {}).values()
             if isinstance(item, dict)
         ],
     ])

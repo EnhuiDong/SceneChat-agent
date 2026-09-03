@@ -29,10 +29,15 @@ class Intent:
     addressed_to: list[str] = field(default_factory=list)
     mentioned_agents: list[str] = field(default_factory=list)
     reply_to_event_id: str = ""
+    thread_id: str = ""
+    reply_to_obligation_id: str = ""
+    obligation_resolution: str = ""
     conversation_move: str = "statement"
     urgency: float = 0.0
     short_term_state: dict[str, Any] = field(default_factory=dict)
     memory_candidates: list[dict[str, Any]] = field(default_factory=list)
+    used_memory_ids: list[str] = field(default_factory=list)
+    claim_updates: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_mapping(cls, actor: str, data: dict[str, Any]) -> "Intent":
@@ -67,6 +72,9 @@ class Intent:
                 if str(item).strip()
             ] if isinstance(data.get("mentioned_agents"), list) else [],
             reply_to_event_id=str(data.get("reply_to_event_id") or "").strip(),
+            thread_id=str(data.get("thread_id") or "").strip(),
+            reply_to_obligation_id=str(data.get("reply_to_obligation_id") or "").strip(),
+            obligation_resolution=str(data.get("obligation_resolution") or "").strip(),
             conversation_move=str(data.get("conversation_move") or "statement").strip(),
             urgency=urgency,
             short_term_state=(
@@ -78,6 +86,14 @@ class Intent:
                 dict(item) for item in data.get("memory_candidates") or []
                 if isinstance(item, dict)
             ] if isinstance(data.get("memory_candidates"), list) else [],
+            used_memory_ids=[
+                str(item).strip() for item in data.get("used_memory_ids") or []
+                if str(item).strip()
+            ] if isinstance(data.get("used_memory_ids"), list) else [],
+            claim_updates=[
+                dict(item) for item in data.get("claim_updates") or []
+                if isinstance(item, dict)
+            ] if isinstance(data.get("claim_updates"), list) else [],
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -228,6 +244,27 @@ class IntentResolver:
             for message in state.history[-30:]
             if state._agent_can_observe(actor, message)
         }
+        visible_thread_ids = {
+            thread.id for thread in state.active_threads_for(actor.name)
+            if any(event_id in visible_recent for event_id in thread.source_event_ids)
+        }
+        if intent.thread_id not in visible_thread_ids:
+            intent.thread_id = ""
+        obligation_pair = state.obligation_by_id(intent.reply_to_obligation_id)
+        if obligation_pair is None:
+            intent.reply_to_obligation_id = ""
+        else:
+            obligation_thread, obligation = obligation_pair
+            if (
+                obligation_thread.id not in visible_thread_ids
+                or obligation.target != actor.name
+                or obligation.status != "open"
+                or obligation.source_event_id not in visible_recent
+            ):
+                intent.reply_to_obligation_id = ""
+            else:
+                intent.thread_id = obligation_thread.id
+                intent.reply_to_event_id = obligation.source_event_id
         if intent.reply_to_event_id not in visible_recent:
             intent.reply_to_event_id = ""
         if (
@@ -254,6 +291,24 @@ class IntentResolver:
             candidate = str(pending.get("event_id") or "")
             if candidate in visible_recent:
                 intent.reply_to_event_id = candidate
+                intent.thread_id = str(pending.get("thread_id") or intent.thread_id)
+                intent.reply_to_obligation_id = str(
+                    pending.get("obligation_id") or intent.reply_to_obligation_id
+                )
+        if intent.reply_to_event_id:
+            reply_thread = state.thread_for_event(intent.reply_to_event_id)
+            if reply_thread is not None and reply_thread.id in visible_thread_ids:
+                intent.thread_id = reply_thread.id
+                matching_obligation = next((
+                    item for item in reversed(reply_thread.obligations)
+                    if item.source_event_id == intent.reply_to_event_id
+                    and item.target == actor.name
+                    and item.status == "open"
+                ), None)
+                if matching_obligation is not None:
+                    intent.reply_to_obligation_id = matching_obligation.id
+        if intent.obligation_resolution not in {"responded", "satisfied", "withdrawn"}:
+            intent.obligation_resolution = ""
         if intent.reply_to_event_id:
             speaker = visible_recent[intent.reply_to_event_id].speaker
             if speaker in state.agents and speaker != actor.name and speaker not in valid_addressees:
@@ -339,6 +394,70 @@ class IntentResolver:
             })
         intent.memory_candidates = candidates
 
+        available_memory_ids = {
+            item.event_id for item in actor.memories if item.event_id
+        } | {
+            item.id for item in actor.belief_records if item.active
+        } | set(actor.known_facts) | set(visible_recent)
+        intent.used_memory_ids = [
+            item for item in dict.fromkeys(intent.used_memory_ids)
+            if item in available_memory_ids
+        ][:12]
+
+        valid_belief_ids = {item.id for item in actor.belief_records}
+        claims = []
+        for item in intent.claim_updates[:6]:
+            content = str(item.get("content") or "").strip()[:500]
+            if not content:
+                continue
+            source_event_id = str(item.get("source_event_id") or "").strip()
+            if source_event_id not in visible_recent:
+                source_event_id = intent.reply_to_event_id
+            status = str(item.get("epistemic_status") or "heard").strip()
+            if status not in {"heard", "observed", "inferred", "believed", "verified", "disputed", "disproved"}:
+                status = "heard"
+            if status == "verified":
+                source_message = visible_recent.get(source_event_id)
+                is_world_evidence = bool(
+                    source_message
+                    and (
+                        source_message.kind in {"narration", "intervention"}
+                        or source_message.state_patch
+                    )
+                )
+                if not is_world_evidence:
+                    status = (
+                        "heard"
+                        if source_message is not None and source_message.speaker != actor.name
+                        else "believed"
+                    )
+            try:
+                confidence = max(0.0, min(float(item.get("confidence", 0.5)), 1.0))
+            except (TypeError, ValueError):
+                confidence = 0.5
+            related_agents = [
+                name for name in dict.fromkeys(
+                    str(value).strip() for value in item.get("related_agents") or []
+                )
+                if name in state.agents and name != actor.name
+            ][:6]
+            supersedes = str(item.get("supersedes") or "").strip()
+            if supersedes not in valid_belief_ids:
+                supersedes = ""
+            claims.append({
+                "content": content,
+                "source_event_id": source_event_id,
+                "source_agent": (
+                    visible_recent[source_event_id].speaker
+                    if source_event_id in visible_recent else actor.name
+                ),
+                "epistemic_status": status,
+                "confidence": confidence,
+                "related_agents": related_agents,
+                "supersedes": supersedes,
+            })
+        intent.claim_updates = claims
+
         relationship_updates = {}
         for target, update in intent.relationship_updates.items():
             if target not in state.agents or target == actor.name or not isinstance(update, dict):
@@ -346,24 +465,59 @@ class IntentResolver:
             reason_event_id = str(update.get("reason_event_id") or intent.reply_to_event_id).strip()
             if reason_event_id not in visible_recent:
                 continue
-
-            def bounded_delta(key: str) -> float:
+            source_message = visible_recent[reason_event_id]
+            source_move = str(source_message.intent.get("conversation_move") or "statement")
+            event_cap = {
+                "statement": 0.04, "question": 0.04, "request": 0.04,
+                "answer": 0.06, "support": 0.06, "acknowledge": 0.04,
+                "challenge": 0.08, "deflect": 0.06, "reveal": 0.10,
+                "silence": 0.04,
+            }.get(source_move, 0.06)
+            if source_message.kind in {"narration", "intervention"} or source_message.state_patch:
+                event_cap = min(0.15, event_cap + 0.06)
+            raw_facets = update.get("facets") if isinstance(update.get("facets"), dict) else {}
+            if not raw_facets:
                 try:
-                    return max(-0.2, min(float(update.get(key, 0.0)), 0.2))
+                    legacy_suspicion = -float(update.get("suspicion_delta", 0.0) or 0.0)
                 except (TypeError, ValueError):
-                    return 0.0
-
-            trust_delta = bounded_delta("trust_delta")
-            suspicion_delta = bounded_delta("suspicion_delta")
-            affinity_delta = bounded_delta("affinity_delta")
+                    legacy_suspicion = 0.0
+                raw_facets = {
+                    "confidence": update.get("trust_delta", 0.0),
+                    "cooperation": legacy_suspicion,
+                    "regard": update.get("affinity_delta", 0.0),
+                }
+            prior_evidence = (
+                actor.relationship_dynamics.get(target, {}).get("evidence") or []
+            )
+            used_facets = {
+                facet
+                for evidence in prior_evidence
+                if isinstance(evidence, dict)
+                and str(evidence.get("event_id") or "") == reason_event_id
+                for facet in (evidence.get("facets") or {})
+            }
+            facets = {}
+            proposed_facets = {}
+            for raw_key, raw_delta in raw_facets.items():
+                key = str(raw_key).strip()
+                if key not in state.relationship_dimensions or key in used_facets:
+                    continue
+                try:
+                    proposed = max(-0.2, min(float(raw_delta), 0.2))
+                except (TypeError, ValueError):
+                    continue
+                if not proposed:
+                    continue
+                proposed_facets[key] = proposed
+                facets[key] = max(-event_cap, min(proposed, event_cap))
             note = str(update.get("private_note") or "").strip()[:300]
             summary = str(update.get("summary") or "").strip()[:300]
-            if not any((trust_delta, suspicion_delta, affinity_delta)) or not note:
+            if not facets or not note:
                 continue
             relationship_updates[target] = {
-                "trust_delta": trust_delta,
-                "suspicion_delta": suspicion_delta,
-                "affinity_delta": affinity_delta,
+                "facets": facets,
+                "proposed_facets": proposed_facets,
+                "applied_cap": event_cap,
                 "reason_event_id": reason_event_id,
                 "private_note": note,
                 "summary": summary,

@@ -471,6 +471,8 @@ def message_to_frontend(msg: Message):
                 "relationship_updates",
                 "short_term_state",
                 "memory_candidates",
+                "used_memory_ids",
+                "claim_updates",
             }
         },
     }
@@ -1160,6 +1162,10 @@ def full_session_export(session_id: str, session: dict) -> dict:
             "failed_generation_count": state.failed_generation_count,
             "dialogue_quality_retry_count": state.dialogue_quality_retry_count,
             "dialogue_quality_issue_counts": dict(state.dialogue_quality_issue_counts),
+            "conversation_threads": [
+                asdict(item) for item in state.conversation_threads.values()
+            ],
+            "last_scheduler_decision": dict(state.last_scheduler_decision),
             "votes": state.votes,
             "pending_events": state.pending_events,
             "interventions": [asdict(item) for item in state.interventions],

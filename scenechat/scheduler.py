@@ -11,6 +11,9 @@ class SchedulerDecision:
     kind: str
     actor_name: str = ""
     reason: str = ""
+    thread_id: str = ""
+    obligation_id: str = ""
+    source_event_id: str = ""
 
 
 class SimulationScheduler:
@@ -18,26 +21,29 @@ class SimulationScheduler:
 
     def decide(self, state: SimulationState) -> SchedulerDecision:
         if state.pending_events and state.scheduler_strategy == "event_first":
-            return SchedulerDecision("event", reason="存在待处理公共环境事件")
+            return self._record(state, SchedulerDecision("event", reason="存在待处理公共环境事件"))
 
         phase = state.phase_specs.get(state.current_phase)
         if phase is not None and getattr(phase, "event_only", False):
-            return SchedulerDecision("event", reason="当前为环境事件阶段")
+            return self._record(state, SchedulerDecision("event", reason="当前为环境事件阶段"))
         strategy = getattr(phase, "scheduler", "") or state.scheduler_strategy
         eligible = self._eligible_for_phase(state, phase)
         if not eligible:
-            return SchedulerDecision("narration", reason="当前阶段没有可行动角色")
+            return self._record(state, SchedulerDecision("narration", reason="当前阶段没有可行动角色"))
 
         response_candidates = [agent for agent in eligible if agent.pending_intents]
         if response_candidates:
             actor = max(response_candidates, key=self._response_priority)
             pending = max(actor.pending_intents, key=self._pending_priority)
-            return SchedulerDecision(
+            return self._record(state, SchedulerDecision(
                 "agent",
                 actor.name,
                 f"优先回应 {pending.get('speaker') or '上一位角色'} 的直接"
                 f"{pending.get('move') or '发言'}",
-            )
+                str(pending.get("thread_id") or ""),
+                str(pending.get("obligation_id") or ""),
+                str(pending.get("event_id") or ""),
+            ))
         opportunities_by_agent = {
             agent.name: [
                 item for item in agent.conversation_opportunities
@@ -67,12 +73,15 @@ class SimulationScheduler:
                 opportunities_by_agent[actor.name],
                 key=self._pending_priority,
             )
-            return SchedulerDecision(
+            return self._record(state, SchedulerDecision(
                 "agent",
                 actor.name,
                 f"{opportunity.get('speaker') or '上一位角色'}提及了该角色，"
                 "允许其按相关性选择插话",
-            )
+                str(opportunity.get("thread_id") or ""),
+                "",
+                str(opportunity.get("event_id") or ""),
+            ))
         if strategy == "initiative":
             actor = sorted(eligible, key=lambda item: (-item.initiative, item.name))[0]
         elif strategy == "urgency_director":
@@ -84,7 +93,22 @@ class SimulationScheduler:
             actor = self._phase_order_actor(state, phase, eligible)
         else:
             actor = self._round_robin_actor(state, eligible)
-        return SchedulerDecision("agent", actor.name, f"使用 {strategy} 调度")
+        return self._record(
+            state, SchedulerDecision("agent", actor.name, f"使用 {strategy} 调度")
+        )
+
+    @staticmethod
+    def _record(state: SimulationState, decision: SchedulerDecision) -> SchedulerDecision:
+        state.last_scheduler_decision = {
+            "kind": decision.kind,
+            "actor_name": decision.actor_name,
+            "reason": decision.reason,
+            "thread_id": decision.thread_id,
+            "obligation_id": decision.obligation_id,
+            "source_event_id": decision.source_event_id,
+            "at_turn": state.turn_count,
+        }
+        return decision
 
     @staticmethod
     def _eligible_for_phase(state: SimulationState, phase) -> list[AgentState]:

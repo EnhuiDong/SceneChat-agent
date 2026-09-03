@@ -64,8 +64,11 @@ WORLD_JSON_INSTRUCTION = """在遵守上方所有世界设计规则的同时，�
   "phases": ["若题材有回合/昼夜/会议等阶段，按顺序列出；自由场景可只写自由推进"],
   "initial_state": {"公共状态变量名": "初始值"},
   "locations": ["推演中允许存在的地点"],
+  "relationship_dimensions": [
+    {"id":"cooperation","label":"合作倾向","low_label":"对抗","high_label":"协作","description":"本场景中这一关系维度的含义"}
+  ],
   "facts": [
-    {"id":"fact-1", "content":"一条原子事实", "visibility":["public|director_only|audience_only|agent:姓名|role:身份|location:地点"], "source":"user|world|inferred", "covered_constraint_ids":["对应约束 ID"]}
+    {"id":"fact-1", "content":"一条原子事实", "visibility":["public|director_only|audience_only|agent:姓名|role:身份|location:地点"], "source":"user|world|inferred", "protected_propositions":["非公开事实的 1–3 条不可被未知角色直接断言的核心命题；公开事实可为空"], "covered_constraint_ids":["对应约束 ID"]}
   ],
   "state_schema": {
     "状态变量名": {"value_type":"string|integer|boolean|enum|any", "visibility":["public"], "mutable_by":["resolver"], "allowed_values":[]}
@@ -100,7 +103,9 @@ WORLD_JSON_INSTRUCTION = """在遵守上方所有世界设计规则的同时，�
 
 beat_specs 必须与 target_beats 一一对应并使用稳定 ID。用户明确要求必须发生的节点标 required=true；普通期望节点不得标成硬约束。description 和 resolution_signals 必须描述可观察结果，不能要求某角色违背自主判断作出指定选择；prerequisites 只引用前面已声明的 beat ID。
 
-特别注意：公共世界会直接成为所有角色的知识。任何并非所有角色都知道的信息只能进入 director_notes_markdown 或带精确非 public scope 的 facts。桌游、审判、比赛等规则题材必须给出可执行 phase_specs、rules 与 termination_rules；自由谈话可以保持精简。天亮公布、结算、广播等没有角色行动的阶段必须设置 scheduler=event_first、advance_when=after_event、event_only=true，并给出 next_phase。"""
+特别注意：公共世界会直接成为所有角色的知识。任何并非所有角色都知道的信息只能进入 director_notes_markdown 或带精确非 public scope 的 facts。桌游、审判、比赛等规则题材必须给出可执行 phase_specs、rules 与 termination_rules；自由谈话可以保持精简。天亮公布、结算、广播等没有角色行动的阶段必须设置 scheduler=event_first、advance_when=after_event、event_only=true，并给出 next_phase。
+
+relationship_dimensions 应选择 2–5 个对本场景真正有用、含义互不重复的主观关系维度，必须兼容题材而不是默认套用猜疑游戏：战斗可使用敌对/协作、威胁判断、敬重或服从；职场可使用合作、可靠判断、影响力；家庭或情感场景可使用亲密、信赖、依赖或边界感。不要把战斗胜负、生命值、距离等客观状态伪装成关系维度。若题材没有特殊需要，可使用 cooperation、confidence、regard 三个通用维度。"""
 
 
 CHARACTER_JSON_INSTRUCTION = """在遵守上方所有角色设计规则的同时，只输出一个 JSON 对象，不要使用 Markdown 代码块：
@@ -118,6 +123,7 @@ CHARACTER_JSON_INSTRUCTION = """在遵守上方所有角色设计规则的同时
       "private_identity": "隐藏身份、秘密、底牌和私有任务",
       "personality": "性格结构及成因",
       "goals": ["目标、顾虑和可接受代价"],
+      "core_beliefs": ["只有当用户设定或人物经历确实支持时，填写会持续影响选择的价值信念；否则为空数组"],
       "knowledge": {
         "确定知道": "...",
         "不知道": "...",
@@ -137,6 +143,7 @@ CHARACTER_JSON_INSTRUCTION = """在遵守上方所有角色设计规则的同时
         "vocabulary_hints": ["符合身份与时代的少量自然词汇"]
       },
       "relationships": {"其他角色姓名": "该角色的主观认知，不得包含无权知道的秘密"},
+      "relationship_facets": {"其他角色姓名": {"world.relationship_dimensions 中的维度 ID": 0.5}},
       "observation_value": "该角色的互动观察价值",
       "resources": {"资源名":"初始数量或状态"},
       "abilities": [
@@ -151,7 +158,9 @@ CHARACTER_JSON_INSTRUCTION = """在遵守上方所有角色设计规则的同时
 
 角色数量必须与约束账本的 requested_character_count 完全一致。公开字段不能泄露 private_identity、faction、私有知识、隐藏阵营或秘密任务。能力必须结构化且引用真实阶段；普通交谈能力可以为空。夜袭、查验、守护等秘密技能默认 director_only；只有在场角色可直接观察的技能才标 public。inspect/protect/eliminate/heal/move/vote 已有通用 Resolver 行为，effects 可留空；只有额外题材状态变化才填写 effects。
 
-voice_profile 只负责稳定语言倾向，不得用夸张口癖替代人物塑造。用户明确写过语气、时代用语、措辞禁忌或表达习惯时必须原样落实；用户未写时仅根据身份、年龄、时代和性格做克制推断。不同角色至少应在直接程度、情绪外显、礼貌程度或表达策略中的两项存在可解释差异。"""
+voice_profile 只负责稳定语言倾向，不得用夸张口癖替代人物塑造。用户明确写过语气、时代用语、措辞禁忌或表达习惯时必须原样落实；用户未写时仅根据身份、年龄、时代和性格做克制推断。不同角色至少应在直接程度、情绪外显、礼貌程度或表达策略中的两项存在可解释差异。
+
+core_beliefs 是可选的人物驱动力，不是必填装饰。只有用户明确给出，或人物经历足以支持一种会跨情境影响选择的价值信念时才填写；普通人物允许为空。relationship_facets 只能引用世界已经声明的 relationship_dimensions，数值 0–1 表示从 low_label 到 high_label 的位置；战斗人物也不能被强制套用亲密或猜疑维度。"""
 
 
 def _content(response: Any) -> str:

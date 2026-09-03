@@ -14,10 +14,13 @@ class AgentView:
     authority: str
     private_profile: str
     goals: str
+    core_beliefs: str
     abilities: str
     relationships: str
     colocated_public_profiles: str
     known_facts: str
+    beliefs: str
+    active_threads: str
     observations: str
     private_memory: str
     story_memory: str
@@ -42,6 +45,9 @@ class AgentView:
 【你的当前目标】
 {self.goals}
 
+【会持续影响选择的核心信念——可能为空】
+{self.core_beliefs}
+
 【你的可用能力与资源】
 {self.abilities}
 
@@ -53,6 +59,12 @@ class AgentView:
 
 【你确定知道的结构化事实】
 {self.known_facts}
+
+【你的主张与认知记录——不等于客观事实】
+{self.beliefs}
+
+【与你有关的活跃议题】
+{self.active_threads}
 
 【你亲自观察到的近期事件】
 {self.observations}
@@ -109,7 +121,7 @@ def _voice_summary(agent: AgentState) -> str:
     return "\n".join(lines)
 
 
-def _short_term_summary(agent: AgentState) -> str:
+def _short_term_summary(state: SimulationState, agent: AgentState) -> str:
     commitments = "；".join(agent.pending_commitments) or "无"
     waiting_items = []
     for item in agent.unanswered_questions[-5:]:
@@ -121,10 +133,15 @@ def _short_term_summary(agent: AgentState) -> str:
             f"等待{names or '相关人物'}回应：{str(item.get('question') or '').strip()}"
         )
     waiting = "；".join(waiting_items) or "无"
+    pressure_lines = []
+    for thread in state.active_threads_for(agent.name)[:4]:
+        pressure = agent.disclosure_pressure_by_thread.get(thread.id, 0.0)
+        pressure_lines.append(f"{thread.topic[:50]}={pressure:.2f}")
+    pressure_text = "；".join(pressure_lines) or f"一般={agent.disclosure_pressure:.2f}"
     return (
         f"- 当前情绪：{agent.current_emotion}（强度 {agent.emotion_intensity:.2f}）\n"
         f"- 当前对话目标：{agent.current_conversation_goal or '依据长期目标判断'}\n"
-        f"- 信息披露压力：{agent.disclosure_pressure:.2f}（越高越难继续完全回避，但仍由人设决定如何回应）\n"
+        f"- 分议题信息披露压力：{pressure_text}（只影响对应议题，不强制公开秘密）\n"
         f"- 尚未履行的承诺：{commitments}\n"
         f"- 自己仍在等待回答的问题：{waiting}"
     )
@@ -132,12 +149,15 @@ def _short_term_summary(agent: AgentState) -> str:
 
 def _response_obligations(agent: AgentState) -> str:
     required = [
-        f"- event_id={item.get('event_id')}；{item.get('speaker')}向你提出"
+        f"- thread_id={item.get('thread_id') or 'general'}；"
+        f"obligation_id={item.get('obligation_id') or 'legacy'}；"
+        f"event_id={item.get('event_id')}；{item.get('speaker')}向你提出"
         f"{item.get('move')}：{item.get('summary')}（紧迫度 {item.get('urgency', 0)}）"
         for item in agent.pending_intents[-6:]
     ]
     opportunities = [
-        f"- 可选择插话 event_id={item.get('event_id')}：{item.get('speaker')}提到了你——"
+        f"- 可选择插话 thread_id={item.get('thread_id') or 'general'}；"
+        f"event_id={item.get('event_id')}：{item.get('speaker')}提到了你——"
         f"{item.get('summary')}（相关度 {item.get('urgency', 0)}）"
         for item in agent.conversation_opportunities[-4:]
     ]
@@ -152,16 +172,22 @@ def build_agent_view(
     goals = "\n".join(
         f"- {goal}（{agent.goal_status.get(goal, 'active')}）" for goal in agent.goals
     ) or "- 依据自己的人设行动"
+    core_beliefs = "\n".join(f"- {item}" for item in agent.core_beliefs) or (
+        "- 未设定额外核心信念；不要为了填充字段而虚构一种信条"
+    )
     relationship_targets = set(agent.relationships) | set(agent.relationship_dynamics)
     relationship_lines = []
     for target in sorted(relationship_targets):
         narrative = agent.relationships.get(target, "暂无稳定描述")
         dynamic = agent.relationship_dynamics.get(target)
         if isinstance(dynamic, dict):
-            relationship_lines.append(
-                f"- {target}：{narrative}；信任 {dynamic.get('trust', 0.5)}，"
-                f"怀疑 {dynamic.get('suspicion', 0.5)}，亲近 {dynamic.get('affinity', 0.5)}"
+            facets = dynamic.get("facets") if isinstance(dynamic.get("facets"), dict) else {}
+            facet_text = "，".join(
+                f"{state.relationship_dimensions[key].get('label', key)} {value}"
+                for key, value in facets.items()
+                if key in state.relationship_dimensions
             )
+            relationship_lines.append(f"- {target}：{narrative}{f'；{facet_text}' if facet_text else ''}")
         else:
             relationship_lines.append(f"- {target}：{narrative}")
     relationships = "\n".join(relationship_lines) or "- 暂无额外关系信息"
@@ -174,6 +200,17 @@ def build_agent_view(
     facts = "\n".join(
         f"- [{fact_id}] {content}" for fact_id, content in agent.known_facts.items() if content
     ) or "- 暂无额外结构化事实"
+    beliefs = "\n".join(
+        f"- [{item.id}|{item.epistemic_status}|可信度 {item.confidence:.2f}] "
+        f"{item.content}（来源：{item.source_agent or '自身判断'}"
+        f"{f' / event_id={item.source_event_id}' if item.source_event_id else ''}）"
+        for item in agent.belief_records[-12:] if item.active
+    ) or "- 暂无额外主张或信念记录"
+    active_threads = "\n".join(
+        f"- [{thread.id}] {thread.topic}；参与者：{'、'.join(thread.participants)}；"
+        f"张力 {thread.tension:.2f}"
+        for thread in state.active_threads_for(agent.name)[:4]
+    ) or "- 当前没有与你有关的活跃议题"
     focus_agents = [agent.last_addressed_by] if agent.last_addressed_by else []
     for item in agent.pending_intents:
         speaker = str(item.get("speaker") or "")
@@ -186,15 +223,18 @@ def build_agent_view(
         authority=state.state_summary_for(agent),
         private_profile=agent.profile,
         goals=goals,
+        core_beliefs=core_beliefs,
         abilities=_ability_summary(agent),
         relationships=relationships,
         colocated_public_profiles="\n\n".join(colocated) or "当前地点没有其他可见角色。",
         known_facts=facts,
+        beliefs=beliefs,
+        active_threads=active_threads,
         observations=agent.recent_observations(),
         private_memory=agent.recent_private_memory(6),
         story_memory=agent.layered_memory(focus_agents),
         voice_profile=_voice_summary(agent),
-        short_term_state=_short_term_summary(agent),
+        short_term_state=_short_term_summary(state, agent),
         response_obligations=_response_obligations(agent),
         retrieved_background=retrieved_background,
     )

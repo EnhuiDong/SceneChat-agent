@@ -84,6 +84,13 @@ def _state_dict(value: Any) -> dict[str, Any]:
     }
 
 
+def _unit_float(value: Any) -> float | None:
+    try:
+        return max(0.0, min(float(value), 1.0))
+    except (TypeError, ValueError):
+        return None
+
+
 def extract_json_object(raw: str) -> dict[str, Any]:
     """Extract the first JSON object from a model response.
 
@@ -216,6 +223,7 @@ class FactSpec:
     visibility: list[str] = field(default_factory=lambda: ["public"])
     source: str = "world"
     covered_constraint_ids: list[str] = field(default_factory=list)
+    protected_propositions: list[str] = field(default_factory=list)
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any], index: int) -> "FactSpec":
@@ -225,6 +233,7 @@ class FactSpec:
             visibility=normalize_scopes(data.get("visibility")),
             source=_text(data.get("source"), "world"),
             covered_constraint_ids=_string_list(data.get("covered_constraint_ids")),
+            protected_propositions=_string_list(data.get("protected_propositions"))[:4],
         )
 
 
@@ -408,6 +417,29 @@ class BeatSpec:
 
 
 @dataclass
+class RelationshipDimensionSpec:
+    """A scenario-neutral axis used to describe one character's stance toward another."""
+
+    id: str
+    label: str
+    low_label: str
+    high_label: str
+    description: str = ""
+
+    @classmethod
+    def from_mapping(cls, data: Any, index: int) -> "RelationshipDimensionSpec":
+        source = data if isinstance(data, dict) else {}
+        raw_id = re.sub(r"[^a-z0-9_-]+", "_", _text(source.get("id")).lower()).strip("_")
+        return cls(
+            id=raw_id or f"relation_{index}",
+            label=_text(source.get("label"), f"关系维度 {index}"),
+            low_label=_text(source.get("low_label"), "低"),
+            high_label=_text(source.get("high_label"), "高"),
+            description=_text(source.get("description")),
+        )
+
+
+@dataclass
 class WorldSpec:
     title: str
     opening_scene: str
@@ -428,6 +460,7 @@ class WorldSpec:
     phase_specs: list[PhaseSpec] = field(default_factory=list)
     rules: list[RuleSpec] = field(default_factory=list)
     termination_rules: list[TerminationRule] = field(default_factory=list)
+    relationship_dimensions: list[RelationshipDimensionSpec] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.beat_specs and self.target_beats:
@@ -504,6 +537,11 @@ class WorldSpec:
                 for index, item in enumerate(data.get("termination_rules") or [], start=1)
                 if isinstance(item, dict)
             ],
+            relationship_dimensions=[
+                RelationshipDimensionSpec.from_mapping(item, index)
+                for index, item in enumerate(data.get("relationship_dimensions") or [], start=1)
+                if isinstance(item, dict)
+            ][:5],
         )
 
     def to_markdown(self, include_director: bool = True) -> str:
@@ -518,6 +556,13 @@ class WorldSpec:
         if self.phases:
             runtime.append(f"- **阶段顺序**：{' → '.join(self.phases)}")
         runtime.append(f"- **调度策略**：{self.scheduler}")
+        if self.relationship_dimensions:
+            runtime.append(
+                "- **关系维度**：" + "；".join(
+                    f"{item.label}（{item.low_label} ↔ {item.high_label}）"
+                    for item in self.relationship_dimensions
+                )
+            )
         if state_lines:
             runtime.extend(["", "### 初始公共状态", state_lines])
         result = f"{public}\n\n" + "\n".join(runtime)
@@ -665,6 +710,8 @@ class CharacterSpec:
     resources: dict[str, Any] = field(default_factory=dict)
     known_fact_ids: list[str] = field(default_factory=list)
     false_beliefs: list[str] = field(default_factory=list)
+    core_beliefs: list[str] = field(default_factory=list)
+    relationship_facets: dict[str, dict[str, float]] = field(default_factory=dict)
     voice_profile: VoiceProfile = field(default_factory=VoiceProfile)
 
     @classmethod
@@ -693,6 +740,16 @@ class CharacterSpec:
             resources=dict(data.get("resources") or {}) if isinstance(data.get("resources"), dict) else {},
             known_fact_ids=_string_list(data.get("known_fact_ids")),
             false_beliefs=_string_list(data.get("false_beliefs")),
+            core_beliefs=_string_list(data.get("core_beliefs"))[:6],
+            relationship_facets={
+                str(target): {
+                    str(key): parsed
+                    for key, value in facets.items()
+                    if (parsed := _unit_float(value)) is not None
+                }
+                for target, facets in (data.get("relationship_facets") or {}).items()
+                if isinstance(facets, dict)
+            } if isinstance(data.get("relationship_facets"), dict) else {},
             voice_profile=VoiceProfile.from_mapping(data.get("voice_profile")),
         )
 
@@ -713,6 +770,7 @@ class CharacterSpec:
             f"- **{key}**：{value}" for key, value in self.relationships.items()
         )
         goals = "\n".join(f"- {goal}" for goal in self.goals) or "- 依据人设与当前局势行动"
+        beliefs = "\n".join(f"- {item}" for item in self.core_beliefs)
         abilities = "\n".join(
             f"- {ability.name}（{ability.action_type}；"
             f"{'不限次数' if ability.uses is None else f'剩余 {ability.uses} 次'}）"
@@ -746,6 +804,9 @@ class CharacterSpec:
 
 ### 7. 核心目标与顾虑
 {goals}
+
+### 7.1 可选的核心信念
+{beliefs or '未设定额外核心信念；依据性格、目标和处境判断。'}
 
 ### 8. 初始知识与信息边界
 {knowledge or '未提供额外私有知识。'}
@@ -892,6 +953,11 @@ def validate_scenario_package(package: ScenarioPackage) -> list[str]:
     if len(set(names)) != len(names):
         issues.append("角色姓名不唯一")
 
+    dimension_ids = [item.id for item in package.world.relationship_dimensions]
+    if len(set(dimension_ids)) != len(dimension_ids):
+        issues.append("关系维度 ID 不唯一")
+    known_dimension_ids = set(dimension_ids) or {"cooperation", "confidence", "regard"}
+
     for character in package.characters:
         if not character.public_identity:
             issues.append(f"角色“{character.name or character.id}”缺少公开身份")
@@ -899,6 +965,15 @@ def validate_scenario_package(package: ScenarioPackage) -> list[str]:
             issues.append(f"角色“{character.name or character.id}”缺少决策逻辑")
         if not character.goals:
             issues.append(f"角色“{character.name or character.id}”缺少目标")
+        for target, facets in character.relationship_facets.items():
+            if target not in names or target == character.name:
+                issues.append(f"角色“{character.name}”的初始关系引用未知或自身角色“{target}”")
+            unknown_facets = set(facets) - known_dimension_ids
+            if unknown_facets:
+                issues.append(
+                    f"角色“{character.name}”的初始关系引用未知维度："
+                    f"{', '.join(sorted(unknown_facets))}"
+                )
         if (
             character.initial_location
             and package.world.locations
@@ -1085,7 +1160,7 @@ def validate_scenario_package(package: ScenarioPackage) -> list[str]:
 
 
 def agents_from_character_specs(characters: list[CharacterSpec]):
-    from .models import AbilityState, AgentState
+    from .models import AbilityState, AgentState, BeliefRecord
 
     agents = []
     for index, character in enumerate(characters, start=1):
@@ -1100,6 +1175,10 @@ def agents_from_character_specs(characters: list[CharacterSpec]):
                 goals=list(character.goals),
                 private_memory=[f"我的初始知识边界：{knowledge}"] if knowledge else [],
                 relationships=dict(character.relationships),
+                relationship_dynamics={
+                    target: {"facets": dict(facets), "evidence": []}
+                    for target, facets in character.relationship_facets.items()
+                },
                 role=character.role,
                 abilities=[ability.name for ability in character.abilities],
                 id=character.id,
@@ -1123,6 +1202,17 @@ def agents_from_character_specs(characters: list[CharacterSpec]):
                 goal_status={goal: "active" for goal in character.goals},
                 known_facts={fact_id: "" for fact_id in character.known_fact_ids},
                 false_beliefs=list(character.false_beliefs),
+                core_beliefs=list(character.core_beliefs),
+                belief_records=[
+                    BeliefRecord(
+                        content=value,
+                        source_agent=character.name,
+                        epistemic_status="believed",
+                        confidence=0.65,
+                    )
+                    for value in character.false_beliefs
+                    if value.strip()
+                ],
                 voice_profile=asdict(character.voice_profile),
             )
         )

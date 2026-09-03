@@ -148,7 +148,11 @@ def evaluate_trace(
     }
     responsiveness = len(obligations.intersection(replies)) / max(len(obligations), 1)
     threaded = sum(
-        bool(message.intent.get("reply_to_event_id") or message.intent.get("mentioned_agents"))
+        bool(
+            message.intent.get("thread_id")
+            or message.intent.get("reply_to_event_id")
+            or message.intent.get("mentioned_agents")
+        )
         for message in dialogue
         if isinstance(message.intent, dict)
     ) / max(len(dialogue), 1)
@@ -198,6 +202,53 @@ def evaluate_trace(
         ),
     }
     if state is not None:
+        thread_obligations = [
+            obligation
+            for thread in state.conversation_threads.values()
+            for obligation in thread.obligations
+        ]
+        if thread_obligations:
+            responded_obligations = sum(
+                item.status in {"responded", "satisfied", "withdrawn"}
+                for item in thread_obligations
+            )
+            metrics["conversation_responsiveness"] = _score(
+                responded_obligations / len(thread_obligations),
+                f"thread obligations responded={responded_obligations}/{len(thread_obligations)}",
+                0.75,
+            )
+        active_beliefs = [
+            belief
+            for agent in state.agents.values()
+            for belief in agent.belief_records
+            if belief.active
+        ]
+        sourced_beliefs = sum(
+            bool(item.source_event_id)
+            or item.epistemic_status in {"inferred", "believed"}
+            for item in active_beliefs
+        )
+        metrics["belief_provenance"] = _score(
+            sourced_beliefs / max(len(active_beliefs), 1) if active_beliefs else 1.0,
+            f"traceable beliefs={sourced_beliefs}/{len(active_beliefs)}",
+            0.9,
+        )
+        evidence_keys = []
+        for agent in state.agents.values():
+            for target, relationship in agent.relationship_dynamics.items():
+                for evidence in relationship.get("evidence") or []:
+                    if not isinstance(evidence, dict):
+                        continue
+                    for facet in (evidence.get("facets") or {}):
+                        evidence_keys.append(
+                            (agent.name, target, str(evidence.get("event_id") or ""), facet)
+                        )
+        unique_evidence = len(set(evidence_keys))
+        metrics["relationship_evidence_reuse"] = _score(
+            unique_evidence / max(len(evidence_keys), 1) if evidence_keys else 1.0,
+            f"unique event/facet applications={unique_evidence}/{len(evidence_keys)}",
+            1.0,
+        )
         structured_memories = sum(
             memory.memory_type != "event"
             for agent in state.agents.values()

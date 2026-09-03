@@ -57,6 +57,15 @@ def parse_character_agents(markdown: str) -> List[AgentState]:
         knowledge_title, knowledge_value = sections.get(8, ("", ""))
         if knowledge_value and ("知识" in knowledge_title or "信息边界" in knowledge_title):
             private_memory.append(f"我的初始知识边界：{knowledge_value}")
+        belief_match = re.search(
+            r"^###\s*7\.1\s*[^\n]*\n(.*?)(?=^###\s*\d+\.|\Z)",
+            profile,
+            re.MULTILINE | re.DOTALL,
+        )
+        belief_text = _clean_value(belief_match.group(1)) if belief_match else ""
+        core_beliefs = [] if (
+            not belief_text or belief_text == "未设定额外核心信念"
+        ) else [belief_text]
 
         agents.append(
             AgentState(
@@ -66,6 +75,7 @@ def parse_character_agents(markdown: str) -> List[AgentState]:
                 goals=goals,
                 private_memory=private_memory,
                 relationships=relationships,
+                core_beliefs=core_beliefs,
             )
         )
 
