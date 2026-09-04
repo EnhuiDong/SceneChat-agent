@@ -106,8 +106,17 @@ def evaluate_trace(
     """Score only public, user-observable properties of a simulation trace."""
     trace = list(messages)
     dialogue = [message for message in trace if message.kind != "narration" and message.speech.strip()]
+    agent_events = [
+        message for message in trace
+        if message.kind not in {"narration", "intervention"}
+    ]
+    narrations = [
+        message.speech for message in trace
+        if message.kind == "narration" and message.speech.strip()
+    ]
     speeches = [message.speech for message in dialogue]
     duplicate_rate = _near_duplicate_rate(speeches)
+    narration_duplicate_rate = _near_duplicate_rate(narrations)
     counts = Counter(message.speaker for message in dialogue)
     expected = list(expected_characters)
     participation = len(set(counts).intersection(expected)) / max(len(expected), 1) if expected else (1.0 if counts else 0.0)
@@ -133,6 +142,7 @@ def evaluate_trace(
     ended = bool(state and state.ended)
     natural_end = ended and bool(state.end_reason) and state.end_kind not in {"max_turns", "blocked"}
     failure_count = state.failed_generation_count if state else 0
+    fallback_count = getattr(state, "structured_output_fallback_count", 0) if state else 0
     blocked = bool(state and state.run_status == "blocked")
     obligations = {
         message.event_id
@@ -179,7 +189,23 @@ def evaluate_trace(
         "cast_participation": _score(participation, f"{len(set(counts).intersection(expected))}/{len(expected)} expected characters spoke" if expected else f"{len(counts)} speakers"),
         "turn_balance": _score(balance, f"normalized speaker entropy={balance:.3f}", 0.65),
         "role_differentiation": _score(differentiation, f"lexical differentiation={differentiation:.3f}", 0.45),
-        "generation_stability": _score(0.0 if blocked else 1 / (1 + failure_count), f"failed generations={failure_count}, blocked={blocked}", 0.8),
+        "generation_stability": _score(
+            0.0 if blocked else 1 / (
+                1 + failure_count + fallback_count / max(len(agent_events), 1)
+            ),
+            f"consecutive failures={failure_count}, structured fallbacks={fallback_count}/{len(agent_events)}, blocked={blocked}",
+            0.8,
+        ),
+        "narration_freshness": _score(
+            1 - narration_duplicate_rate,
+            f"near-duplicate narration rate={narration_duplicate_rate:.3f}",
+            0.8,
+        ),
+        "agent_event_share": _score(
+            len(agent_events) / max(len(trace), 1),
+            f"agent events={len(agent_events)}/{len(trace)} total events",
+            0.35,
+        ),
         "conversation_responsiveness": _score(
             responsiveness if obligations else 1.0,
             f"answered obligations={len(obligations.intersection(replies))}/{len(obligations)}",
@@ -202,6 +228,29 @@ def evaluate_trace(
         ),
     }
     if state is not None:
+        phase = state.phase_specs.get(state.current_phase)
+        eligible = [agent for agent in state.agents.values() if agent.eligible]
+        exhausted_manual_phase = bool(
+            eligible
+            and phase is not None
+            and getattr(phase, "advance_when", "") == "manual"
+            and state.last_scheduler_decision.get("kind") == "narration"
+            and "没有可行动角色" in str(state.last_scheduler_decision.get("reason") or "")
+        )
+        metrics["scheduler_liveness"] = _score(
+            0.0 if exhausted_manual_phase else 1.0,
+            "manual phase exhausted despite eligible actors"
+            if exhausted_manual_phase else "scheduler retains an executable path",
+            1.0,
+        )
+        beats = list(getattr(state.world_spec, "beat_specs", []) or [])
+        if beats:
+            momentum = 1 / (1 + state.arc_state.turns_since_progress / max(len(state.agents), 1))
+            metrics["arc_momentum"] = _score(
+                momentum,
+                f"resolved={len(state.arc_state.resolved_beat_ids)}/{len(beats)}, turns since progress={state.arc_state.turns_since_progress}",
+                0.4,
+            )
         thread_obligations = [
             obligation
             for thread in state.conversation_threads.values()

@@ -139,6 +139,10 @@ def update_arc_after_message(state: SimulationState, message: Message) -> None:
 
     try:
         proposed_tension = float(arc_updates.get("tension", state.arc_state.tension))
+        # Older and compatible models sometimes return a percentage despite
+        # the ratio schema.  Accept 25/100 as 0.25 while keeping 0..1 intact.
+        if 1.0 < proposed_tension <= 100.0:
+            proposed_tension /= 100.0
         state.arc_state.tension = max(0.0, min(proposed_tension, 1.0))
     except (TypeError, ValueError):
         pass

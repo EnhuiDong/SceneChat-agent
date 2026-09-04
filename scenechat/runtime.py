@@ -26,6 +26,7 @@ class Intent:
     expected_effect: str = ""
     proposed_patch: list[dict[str, Any]] = field(default_factory=list)
     relationship_updates: dict[str, Any] = field(default_factory=dict)
+    address_scope: str = "none"
     addressed_to: list[str] = field(default_factory=list)
     mentioned_agents: list[str] = field(default_factory=list)
     reply_to_event_id: str = ""
@@ -46,6 +47,18 @@ class Intent:
             urgency = max(0.0, min(float(data.get("urgency", 0.0)), 1.0))
         except (TypeError, ValueError):
             urgency = 0.0
+        raw_addressees = data.get("addressed_to") or []
+        address_scope = str(data.get("address_scope") or "none").strip().lower()
+        broadcast_aliases = {
+            "*", "all", "everyone", "everybody", "all_present",
+            "大家", "各位", "所有人", "全体", "在场所有人",
+        }
+        if isinstance(raw_addressees, list) and any(
+            str(item).strip().lower() in broadcast_aliases for item in raw_addressees
+        ):
+            address_scope = "all_present"
+        if address_scope not in {"none", "specific", "all_present"}:
+            address_scope = "none"
         return cls(
             actor=actor,
             action_type=str(data.get("action_type") or "speak").strip(),
@@ -63,10 +76,11 @@ class Intent:
                 for key, value in (data.get("relationship_updates") or {}).items()
                 if isinstance(value, (dict, str))
             } if isinstance(data.get("relationship_updates"), dict) else {},
+            address_scope=address_scope,
             addressed_to=[
-                str(item).strip() for item in data.get("addressed_to") or []
-                if str(item).strip()
-            ] if isinstance(data.get("addressed_to"), list) else [],
+                str(item).strip() for item in raw_addressees
+                if str(item).strip().lower() not in broadcast_aliases
+            ] if isinstance(raw_addressees, list) else [],
             mentioned_agents=[
                 str(item).strip() for item in data.get("mentioned_agents") or []
                 if str(item).strip()
@@ -154,6 +168,32 @@ class IntentResolver:
 
         phase = state.phase_specs.get(state.current_phase)
         allowed_actions = list(getattr(phase, "allowed_action_types", []) or [])
+        declared_action_types = (
+            SAFE_FREE_ACTIONS
+            | TARGETED_ACTIONS
+            | set(allowed_actions)
+            | {rule.action_type for rule in state.rules if rule.action_type}
+            | {
+                ability.action_type
+                for candidate in state.agents.values()
+                for ability in candidate.ability_states.values()
+                if ability.action_type
+            }
+        )
+        if intent.action_type not in declared_action_types and not intent.ability:
+            observation_markers = (
+                "观察", "查看", "倾听", "环顾", "注视", "留意",
+                "observe", "watch", "look", "listen",
+            )
+            if intent.speech:
+                intent.action_type = "speak"
+            elif any(
+                marker in f"{intent.action} {intent.action_type}".lower()
+                for marker in observation_markers
+            ):
+                intent.action_type = "observe"
+            else:
+                intent.action_type = "act"
         if allowed_actions and intent.action_type not in allowed_actions:
             return Resolution(
                 False,
@@ -222,7 +262,27 @@ class IntentResolver:
         except (TypeError, ValueError):
             intent.urgency = 0.0
 
+        collective_markers = (
+            "大家", "各位", "所有人", "每个人", "你们", "诸位",
+            "everyone", "everybody", "all of you",
+        )
+        combined_text = f"{intent.action}\n{intent.speech}".lower()
+        if (
+            intent.address_scope != "all_present"
+            and intent.conversation_move in {"question", "request", "challenge"}
+            and any(marker in combined_text for marker in collective_markers)
+        ):
+            intent.address_scope = "all_present"
+
         valid_addressees = []
+        if intent.address_scope == "all_present":
+            valid_addressees.extend(
+                target.name
+                for target in state.agents.values()
+                if target.name != actor.name
+                and target.eligible
+                and target.current_location == actor.current_location
+            )
         for name in intent.addressed_to:
             target = state.agents.get(name)
             if (
@@ -313,13 +373,15 @@ class IntentResolver:
             speaker = visible_recent[intent.reply_to_event_id].speaker
             if speaker in state.agents and speaker != actor.name and speaker not in valid_addressees:
                 valid_addressees.append(speaker)
-        intent.addressed_to = valid_addressees[:6]
+        intent.addressed_to = valid_addressees[:12]
+        intent.address_scope = "all_present" if intent.address_scope == "all_present" else (
+            "specific" if intent.addressed_to else "none"
+        )
         mentioned = []
         explicit_mentions = list(intent.mentioned_agents)
-        combined_text = f"{intent.action}\n{intent.speech}"
         explicit_mentions.extend(
             name for name in state.agents
-            if name != actor.name and len(name) >= 2 and name in combined_text
+            if name != actor.name and len(name) >= 2 and name.lower() in combined_text
         )
         for name in explicit_mentions:
             target = state.agents.get(name)

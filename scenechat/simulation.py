@@ -1,10 +1,14 @@
 import json
-import os
 import re
 from typing import Optional, Protocol
 
 from .context import build_agent_view, director_context
-from .dialogue_quality import inspect_dialogue_intent, quality_retry_instruction
+from .config import config_int
+from .dialogue_quality import (
+    inspect_dialogue_intent,
+    inspect_narration_event,
+    quality_retry_instruction,
+)
 from .dialogue_policy import safe_obligation_fallback
 from .models import AgentState, Message, SimulationState
 from .interventions import (
@@ -22,17 +26,19 @@ from .pacing import (
 )
 from .providers import get_simulation_llm
 from .runtime import Intent, IntentResolver
+from .scenario import extract_json_object
 from .scheduler import SimulationScheduler
 
 
 MAX_VISIBLE_OBSERVATIONS = 15
 
 
-def _single_retry_setting(name: str, default: str = "1") -> int:
-    try:
-        return max(0, min(int(os.getenv(name, default)), 1))
-    except (TypeError, ValueError):
-        return int(default)
+def _single_retry_setting(key: str, default: int = 1) -> int:
+    return config_int("simulation", key, default, minimum=0, maximum=1)
+
+
+def _token_budget(key: str, default: int, minimum: int, maximum: int) -> int:
+    return config_int("simulation", key, default, minimum=minimum, maximum=maximum)
 
 
 class AgentKnowledge(Protocol):
@@ -82,62 +88,36 @@ def build_agent_prompt(
 2. 每轮只推进一个主要意图。优先对最近的具体言行作出反应，不要重新介绍人物、世界背景或复述双方已经知道的事实。
 3. 遵循语言画像，但不要机械重复口癖。让句长、礼貌、直接程度、情绪外显和信息披露方式体现人物差异。
 4. 角色通常不会把完整动机、秘密和推理过程直接说出口。允许潜台词、停顿、试探、反问、转移、沉默，以及动作与台词不完全一致。
-5. 除非题材或当前情境要求正式陈述，speech 通常控制在一至三句；没有必要说话时可以只行动或保持沉默。
+5. 除非题材或当前情境要求正式陈述，speech 通常控制在一至三句；没有必要说话时可以只行动或保持沉默。面向全场提问、请求或质疑时，address_scope 必须填 all_present；只对具体角色说话时填 specific。
 6. 本场景的关系维度为：{relationship_dimensions}。relationship_updates.facets 只能使用这些维度 ID；它们是题材相关的主观关系，不是固定的狼人杀式猜疑参数，也不能代替生命值、距离或胜负等客观战斗状态。每次变化必须引用新观察到的历史事件。
 7. 信息披露压力按议题隔离。某个议题压力较高时，角色更难完全无视该议题的追问，但仍可以有限回答、转移、撒谎或反问；不要因此公开其他议题的秘密。
 8. 他人的发言首先只是主张，不是客观事实。只有权威事件才能直接成为 verified；普通听闻、观察和推断用 claim_updates 保存来源。used_memory_ids 只填写本轮确实使用的已知事实、记忆或主张 ID。
 
-你只提交 Intent，不直接修改世界状态。action_type、ability 和 target 必须来自上面的当前阶段、能力与在场角色；不能凭空宣布自己获胜、获得能力、知道秘密或强迫他人完成重大决定。private_reason 只解释本轮决策，不会公开，也不会自动写入长期记忆。
+你只提交 Intent，不直接修改世界状态。普通发言的 action_type 必须原样填写英文枚举 `speak`，普通行动/观察/跳过分别填写 `act`、`observe`、`pass`，不得翻译或自造“公开行动”“对话行动”等值。专用 action_type、ability 和 target 必须逐字来自上面的当前阶段、能力与在场角色；没有使用能力时省略 ability，不能把能力说明或期望效果填成能力名。不能凭空宣布自己获胜、获得能力、知道秘密或强迫他人完成重大决定。private_reason 只解释本轮决策，不会公开，也不会自动写入长期记忆。
 
-只输出一个 JSON 对象，不要使用 Markdown 代码块：
+只输出一个紧凑 JSON 对象，不要使用 Markdown 代码块。前三个字段必填；其余字段没有实际变化时可以省略，不要为了字段齐全输出大段空数组：
 {{
   "action": "动作描述",
-  "speech": "角色说出的话，没有台词时可为空字符串",
-  "action_type": "speak|act|observe|pass|move|vote|inspect|protect|eliminate|heal|poison|场景定义的类型",
-  "target": "目标角色或地点；不需要目标时为空",
-  "ability": "能力 ID 或名称；不使用能力时为空",
-  "private_reason": "该角色不会说出口的一句理由",
-  "relationship_updates": {{
-    "其他角色姓名": {{
-      "facets": {{"本场景声明的关系维度 ID": 0.0}},
-      "reason_event_id": "造成变化的可见历史 event_id",
-      "private_note": "该事件为何改变了判断",
-      "summary": "可选：更新后的简短主观关系描述"
-    }}
-  }},
-  "addressed_to": ["本轮明确对话或行动指向的角色姓名"],
-  "mentioned_agents": ["被谈及、可能因此选择插话，但本轮并非直接对话对象的角色"],
-  "reply_to_event_id": "正在回应的可见消息 event_id；没有时为空",
-  "thread_id": "正在延续的可见议题 thread_id；新议题或无关行动时为空",
-  "reply_to_obligation_id": "正在回应的 obligation_id；没有时为空",
-  "obligation_resolution": "responded|satisfied|withdrawn；回避和反问只能填 responded",
+  "speech": "角色台词，没有时为空字符串",
+  "action_type": "当前阶段允许的行动类型",
+  "target": "目标角色或地点",
+  "ability": "能力 ID 或名称",
+  "private_reason": "不会说出口的一句理由",
+  "address_scope": "none|specific|all_present",
+  "addressed_to": ["直接对话对象"],
+  "mentioned_agents": ["被谈及但不是对话对象的角色"],
+  "reply_to_event_id": "正在回应的 event_id",
+  "thread_id": "正在延续的 thread_id",
+  "reply_to_obligation_id": "正在回应的 obligation_id",
+  "obligation_resolution": "responded|satisfied|withdrawn",
   "conversation_move": "statement|answer|question|request|challenge|deflect|support|reveal|acknowledge|silence",
   "urgency": 0.0,
-  "short_term_state": {{
-    "emotion": {{"label": "本轮后的具体情绪", "intensity": 0.0}},
-    "conversation_goal": "接下来几轮希望通过交流达成什么",
-    "disclosure_pressure_delta": 0.0,
-    "commitments_add": ["本轮新作出的、之后需要履行的承诺"],
-    "commitments_resolve": ["本轮已经履行的既有承诺，文字必须与列表一致"]
-  }},
-  "memory_candidates": [{{
-    "type": "claim|clue|commitment|relationship_evidence|revelation|decision",
-    "content": "本轮值得跨多轮保留的一条具体信息；普通动作和泛泛心理不要填写",
-    "importance": 1,
-    "related_agents": ["与这条记忆直接相关的角色"],
-    "source_event_id": "信息来自某条可见历史消息时填写，否则为空"
-  }}],
-  "used_memory_ids": ["本轮实际使用的可见事实、记忆或认知记录 ID"],
-  "claim_updates": [{{
-    "content": "值得保留的具体主张或认知，不要把普通台词全部复制进来",
-    "source_event_id": "来源事件；自身本轮新主张可为空",
-    "epistemic_status": "heard|observed|inferred|believed|verified|disputed|disproved",
-    "confidence": 0.5,
-    "related_agents": ["相关角色"],
-    "supersedes": "被本条认知修正或推翻的既有 belief ID；没有时为空"
-  }}],
-  "expected_effect": "角色期望发生什么，不代表一定成功",
-  "proposed_patch": []
+  "short_term_state": {{"emotion":{{"label":"情绪","intensity":0.0}},"conversation_goal":"交流目标","disclosure_pressure_delta":0.0,"commitments_add":[],"commitments_resolve":[]}},
+  "relationship_updates": {{"角色名":{{"facets":{{"维度 ID":0.0}},"reason_event_id":"可见 event_id","private_note":"变化依据","summary":"关系摘要"}}}},
+  "memory_candidates": [{{"type":"claim|clue|commitment|relationship_evidence|revelation|decision","content":"跨轮信息","importance":1,"related_agents":[],"source_event_id":""}}],
+  "used_memory_ids": ["实际使用的事实、记忆或认知 ID"],
+  "claim_updates": [{{"content":"具体主张","source_event_id":"","epistemic_status":"heard|observed|inferred|believed|verified|disputed|disproved","confidence":0.5,"related_agents":[],"supersedes":""}}],
+  "expected_effect": "期望效果，不代表实际结果"
 }}
 """
 
@@ -172,8 +152,12 @@ def parse_agent_intent(raw: str) -> Optional[dict]:
     if fenced:
         text = fenced.group(1).strip()
     try:
-        payload = json.loads(text)
-    except (json.JSONDecodeError, TypeError):
+        payload = extract_json_object(text)
+    except (ValueError, json.JSONDecodeError, TypeError):
+        # A response that started as JSON but was truncated must not be
+        # reinterpreted as the legacy prose format.
+        if text.lstrip().startswith(("{", "[")):
+            return None
         parsed = parse_agent_response(raw)
         if parsed is None:
             return None
@@ -187,6 +171,7 @@ def parse_agent_intent(raw: str) -> Optional[dict]:
             "expected_effect": "",
             "proposed_patch": [],
             "relationship_updates": {},
+            "address_scope": "none",
             "addressed_to": [],
             "mentioned_agents": [],
             "reply_to_event_id": "",
@@ -220,6 +205,7 @@ def parse_agent_intent(raw: str) -> Optional[dict]:
         "relationship_updates": payload.get("relationship_updates")
         if isinstance(payload.get("relationship_updates"), dict)
         else {},
+        "address_scope": str(payload.get("address_scope") or "none").strip(),
         "addressed_to": payload.get("addressed_to")
         if isinstance(payload.get("addressed_to"), list)
         else [],
@@ -289,13 +275,17 @@ def build_narrator_prompt(
 
 {mode_instruction}
 
+读者镜头也必须保护推理体验：在身份公开揭晓或结算前，只能给出存在多种解释的线索，不得直接确认隐藏身份，也不得反复用代码流、后台进程、异常同步等单一答案式暗示。只能把当前角色名单中的人物写成下一位行动者。先检查近期历史：如果某个当前节点已经由最近的角色行动实际完成，本轮应在 resolved_beat_ids 中结算它，不必要求完成必须发生在本句旁白里。
+
+tension 必须使用 0.0—1.0 的小数比例，不能填写百分制的 25 或 100。
+
 只输出一个 JSON 对象，不要使用 Markdown：
 {{
   "narration": "一至三句自然的叙述",
   "visibility": "{visibility}",
   "location": "事件只发生在某个地点时填写；全局广播或读者镜头可为空",
   "state_updates": {{"公共状态变量": "环境事件或规则裁决造成的新值"}},
-  "resolved_beat_ids": ["只有本轮已经实际完成的当前可推进节点 ID；不要把刚埋下的线索算作完成"],
+  "resolved_beat_ids": ["本轮或最近尚未结算的已完成节点 ID；只埋下线索时不要填写"],
   "tension": 0.0,
   "end_signal": false,
   "end_reason": "只有确实满足结束条件时填写"
@@ -309,10 +299,10 @@ def parse_narrator_response(raw: str) -> Optional[tuple[str, str]]:
     if fenced:
         raw = fenced.group(1).strip()
     try:
-        payload = json.loads(raw)
+        payload = extract_json_object(raw)
         narration = str(payload.get("narration") or "").strip()
         visibility = str(payload.get("visibility") or "public").strip()
-    except (json.JSONDecodeError, AttributeError, TypeError):
+    except (ValueError, json.JSONDecodeError, AttributeError, TypeError):
         return None
     if not narration:
         return None
@@ -327,8 +317,8 @@ def parse_narrator_event(raw: str) -> Optional[dict]:
     if fenced:
         text = fenced.group(1).strip()
     try:
-        payload = json.loads(text)
-    except (json.JSONDecodeError, TypeError):
+        payload = extract_json_object(text)
+    except (ValueError, json.JSONDecodeError, TypeError):
         return None
     if not isinstance(payload, dict):
         return None
@@ -385,8 +375,8 @@ def simulate_next_turn(
     active_llm = llm or get_simulation_llm()
     active_resolver = resolver or IntentResolver()
     retries = max(
-        _single_retry_setting("SIMULATION_PARSE_RETRIES"),
-        _single_retry_setting("SIMULATION_QUALITY_RETRIES"),
+        _single_retry_setting("parse_retries"),
+        _single_retry_setting("quality_retries"),
     )
     rejection = ""
     for attempt in range(retries + 1):
@@ -396,14 +386,32 @@ def simulate_next_turn(
                 "\n\n【上一次 Intent 被拒绝】\n"
                 f"{rejection}\n请保持角色目标不变，改为提交一项当前阶段合法的 Intent。"
             )
-        response = active_llm.complete(attempt_prompt, max_tokens=520)
+        response = active_llm.complete(
+            attempt_prompt,
+            max_tokens=_token_budget("intent_max_tokens", 900, 520, 1800),
+        )
         parsed = parse_agent_intent(response.text)
         if parsed is None:
-            rejection = "输出不是合法的 Intent JSON"
+            finish_reason = str(getattr(response, "finish_reason", "") or "")
+            truncated = finish_reason == "length" or (
+                str(response.text or "").lstrip().startswith("{")
+                and not str(response.text or "").rstrip().endswith("}")
+            )
+            code = "intent_json_truncated" if truncated else "intent_json_invalid"
+            should_retry = attempt < retries
+            state.record_structured_output_issue(code, retried=should_retry)
+            rejection = (
+                "Intent JSON 输出被截断。省略所有没有变化的可选字段，优先闭合一个简短 JSON 对象。"
+                if truncated else
+                "输出不是合法的 Intent JSON。只输出一个 JSON 对象，并省略未使用的可选字段。"
+            )
             continue
         intent = Intent.from_mapping(agent.name, parsed)
         resolution = active_resolver.resolve(state, intent)
         if not resolution.accepted:
+            state.record_structured_output_issue(
+                "intent_rule_rejected", retried=attempt < retries
+            )
             rejection = resolution.reason
             continue
         quality_issues = inspect_dialogue_intent(state, agent, intent)
@@ -430,6 +438,7 @@ def simulate_next_turn(
         fallback_intent = safe_obligation_fallback(agent, pending, rejection)
         fallback_resolution = active_resolver.resolve(state, fallback_intent)
         if fallback_resolution.accepted and fallback_intent.reply_to_event_id:
+            state.record_structured_output_fallback()
             state.record_generation_success()
             return _message_from_resolution(
                 state,
@@ -450,6 +459,7 @@ def simulate_next_turn(
         )
         fallback_resolution = active_resolver.resolve(state, fallback_intent)
         if fallback_resolution.accepted:
+            state.record_structured_output_fallback()
             state.record_generation_success()
             return _message_from_resolution(
                 state,
@@ -491,8 +501,23 @@ def simulate_narration(
 ) -> Optional[Message]:
     # Public narration never receives private character documents. Reader-only
     # narration may use them, but is never broadcast into character observations.
+    factions = {
+        agent.faction.strip() for agent in state.agents.values()
+        if agent.faction.strip()
+    }
+    reveal_phase = any(
+        marker in state.current_phase.lower()
+        for marker in ("reveal", "result", "settlement", "揭晓", "公布", "结算", "复盘")
+    )
+    protect_hidden_competition = (
+        len(factions) > 1
+        and not reveal_phase
+        and state.arc_state.progress < 0.65
+    )
     visibility = forced_visibility or (
-        "public" if state.narration_count % 2 == 0 else "audience_only"
+        "public"
+        if protect_hidden_competition or state.narration_count % 2 == 0
+        else "audience_only"
     )
     public_only = visibility == "public"
     query = (
@@ -510,15 +535,49 @@ def simulate_narration(
     prompt = build_narrator_prompt(state, narrator_context, visibility)
     active_llm = llm or get_simulation_llm()
     parsed = None
-    retries = _single_retry_setting("SIMULATION_PARSE_RETRIES")
+    retries = max(
+        _single_retry_setting("parse_retries"),
+        _single_retry_setting("quality_retries"),
+    )
+    rejection = ""
     for attempt in range(retries + 1):
-        attempt_prompt = prompt if attempt == 0 else (
-            prompt + "\n\n上一次输出无法解析。只重新输出一个符合 schema 的完整 JSON 对象。"
+        attempt_prompt = prompt if not rejection else (
+            prompt + "\n\n【上一次旁白被拒绝】\n" + rejection
+            + "\n只输出修正后的完整 JSON 对象。"
         )
-        response = active_llm.complete(attempt_prompt, max_tokens=360)
+        response = active_llm.complete(
+            attempt_prompt,
+            max_tokens=_token_budget("narration_max_tokens", 480, 360, 900),
+        )
         parsed = parse_narrator_event(response.text)
-        if parsed is not None:
-            break
+        if parsed is None:
+            finish_reason = str(getattr(response, "finish_reason", "") or "")
+            truncated = finish_reason == "length" or (
+                str(response.text or "").lstrip().startswith("{")
+                and not str(response.text or "").rstrip().endswith("}")
+            )
+            code = "narration_json_truncated" if truncated else "narration_json_invalid"
+            state.record_structured_output_issue(code, retried=attempt < retries)
+            rejection = "旁白 JSON 被截断，请缩短 narration 并闭合 JSON。" if truncated else (
+                "旁白不是合法 JSON，请严格按 schema 输出。"
+            )
+            continue
+        quality_issues = inspect_narration_event(
+            state,
+            parsed["narration"],
+            visibility=visibility,
+        )
+        if quality_issues:
+            should_retry = attempt < retries
+            state.record_narration_quality_issues(
+                [issue.code for issue in quality_issues],
+                retried=should_retry,
+            )
+            rejection = quality_retry_instruction(quality_issues)
+            if should_retry or any(issue.hard for issue in quality_issues):
+                parsed = None
+                continue
+        break
     if parsed is None:
         state.record_generation_failure()
         return None

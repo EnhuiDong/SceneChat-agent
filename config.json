@@ -1,0 +1,41 @@
+{
+  "llm": {
+    "provider": "dashscope",
+    "api_base": "",
+    "model": "qwen-plus",
+    "request_timeout_seconds": 180,
+    "max_retries": 1,
+    "json_mode": "auto",
+    "token_limit_parameter": "max_tokens",
+    "enable_thinking": false
+  },
+  "embedding": {
+    "provider": "dashscope",
+    "api_base": "",
+    "model": "text-embedding-v2",
+    "batch_size": 20,
+    "request_timeout_seconds": 180,
+    "max_retries": 1
+  },
+  "scenario": {
+    "json_repair_retries": 2,
+    "semantic_repair_retries": 2,
+    "transport_retries": 1
+  },
+  "simulation": {
+    "parse_retries": 1,
+    "quality_retries": 1,
+    "intent_max_tokens": 900,
+    "narration_max_tokens": 480,
+    "max_turns": 120
+  },
+  "storage": {
+    "database_path": "data/scenechat.db"
+  },
+  "server": {
+    "cors_origins": [
+      "http://localhost:5173",
+      "http://127.0.0.1:5173"
+    ]
+  }
+}

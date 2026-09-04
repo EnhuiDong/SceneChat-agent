@@ -745,8 +745,13 @@ class SimulationState:
         self.arc_state = ArcState()
         self.protected_agents: set[str] = set()
         self.failed_generation_count = 0
+        self.structured_output_retry_count = 0
+        self.structured_output_fallback_count = 0
+        self.structured_output_issue_counts: Dict[str, int] = {}
         self.dialogue_quality_retry_count = 0
         self.dialogue_quality_issue_counts: Dict[str, int] = {}
+        self.narration_quality_retry_count = 0
+        self.narration_quality_issue_counts: Dict[str, int] = {}
         self.run_status = "running"
 
         default_location = self.locations[0] if self.locations else scene
@@ -1442,6 +1447,19 @@ class SimulationState:
     def record_generation_success(self) -> None:
         self.failed_generation_count = 0
 
+    def record_structured_output_issue(self, code: str, *, retried: bool) -> None:
+        value = str(code).strip()
+        if not value:
+            return
+        if retried:
+            self.structured_output_retry_count += 1
+        self.structured_output_issue_counts[value] = (
+            self.structured_output_issue_counts.get(value, 0) + 1
+        )
+
+    def record_structured_output_fallback(self) -> None:
+        self.structured_output_fallback_count += 1
+
     def record_dialogue_quality_issues(self, codes: List[str], *, retried: bool) -> None:
         if retried:
             self.dialogue_quality_retry_count += 1
@@ -1450,6 +1468,16 @@ class SimulationState:
             if value:
                 self.dialogue_quality_issue_counts[value] = (
                     self.dialogue_quality_issue_counts.get(value, 0) + 1
+                )
+
+    def record_narration_quality_issues(self, codes: List[str], *, retried: bool) -> None:
+        if retried:
+            self.narration_quality_retry_count += 1
+        for code in codes:
+            value = str(code).strip()
+            if value:
+                self.narration_quality_issue_counts[value] = (
+                    self.narration_quality_issue_counts.get(value, 0) + 1
                 )
 
     def apply_state_updates(

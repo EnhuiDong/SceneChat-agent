@@ -113,19 +113,24 @@ class SimulationScheduler:
     @staticmethod
     def _eligible_for_phase(state: SimulationState, phase) -> list[AgentState]:
         roles = list(getattr(phase, "actor_roles", []) or [])
-        unacted = [
+        eligible = [
             agent
             for agent in state.agents.values()
             if agent.eligible
             and (not roles or agent.role in roles)
-            and agent.name not in state.phase_action_log
+        ]
+        # A manual phase is deliberately open-ended.  phase_action_log tracks
+        # who acted in the current structured cycle, but must never exhaust an
+        # ongoing discussion, negotiation, exploration, or combat phase.
+        if phase is None or getattr(phase, "advance_when", "") == "manual":
+            return eligible
+        unacted = [
+            agent for agent in eligible if agent.name not in state.phase_action_log
         ]
         if unacted:
             return unacted
-        # Free-running phases may continue round-robin. Structured phases wait
-        # for their resolver transition instead of selecting an invalid actor.
-        if phase is None:
-            return [agent for agent in state.agents.values() if agent.eligible]
+        # Structured phases wait for their resolver transition instead of
+        # selecting an actor twice inside the same cycle.
         return []
 
     @staticmethod

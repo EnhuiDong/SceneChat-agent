@@ -44,7 +44,7 @@ def configuration_error(variable: str, description: str) -> SceneChatError:
 def unsupported_provider_error(provider: str, service: str) -> SceneChatError:
     return SceneChatError(
         "model_provider_unsupported",
-        f"当前后端暂不支持配置的{service}提供商“{provider}”，请检查 .env。",
+        f"当前后端暂不支持配置的{service}提供商“{provider}”，请检查 config.json。",
         stage="preflight",
         status_code=503,
     )

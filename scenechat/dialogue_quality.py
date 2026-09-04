@@ -223,3 +223,78 @@ def inspect_dialogue_intent(
 
 def quality_retry_instruction(issues: list[DialogueQualityIssue]) -> str:
     return "\n".join(f"- [{issue.code}] {issue.message}" for issue in issues)
+
+
+def inspect_narration_event(
+    state: SimulationState,
+    narration: str,
+    *,
+    visibility: str,
+) -> list[DialogueQualityIssue]:
+    """Reject narrator loops and impossible closed-cast references."""
+
+    text = str(narration or "").strip()
+    issues: list[DialogueQualityIssue] = []
+    recent = [
+        message.speech for message in state.history[-12:]
+        if message.kind == "narration" and message.speech.strip()
+    ]
+    if any(
+        _similar(text, previous, 0.82)
+        or (
+            len(_normalized(previous)) >= 8
+            and (
+                _normalized(previous) in _normalized(text)
+                or _normalized(text) in _normalized(previous)
+            )
+        )
+        for previous in recent[-6:]
+    ):
+        issues.append(DialogueQualityIssue(
+            "narration_repetition",
+            "旁白与近期事件重复；不要再次描述同一灯光、倒计时、广播或人物小动作，必须带来新的可观察变化。",
+            hard=True,
+        ))
+
+    # The runtime cannot create new actors.  Names introduced specifically as
+    # the next speaker/selected participant are therefore always invalid,
+    # while ordinary place names and background NPC prose remain untouched.
+    ignored = {"所有人", "每个人", "下一位", "参与者", "玩家", "众人"}
+    selected_names = re.findall(
+        r"(?:点名(?:者)?|下一位(?:发言者|玩家|参与者)|轮到)\s*[:：]?\s*"
+        r"([A-Za-z][A-Za-z0-9_.-]{1,39}|[\u4e00-\u9fff]{2,4})",
+        text,
+    )
+    unknown = [
+        name for name in selected_names
+        if name not in state.agents and name not in ignored
+    ]
+    if unknown:
+        issues.append(DialogueQualityIssue(
+            "unknown_cast_reference",
+            f"旁白把不存在的角色“{unknown[0]}”当作行动者；只能点名当前角色名单中的人物。",
+            hard=True,
+        ))
+
+    if visibility == "audience_only" and not state.ended:
+        explicit_reveals = []
+        compact = _normalized(text)
+        for agent in state.agents.values():
+            faction = _normalized(agent.faction)
+            if not faction:
+                continue
+            for template in (
+                f"{agent.name}是{agent.faction}",
+                f"{agent.name}真实身份是{agent.faction}",
+                f"{agent.name}属于{agent.faction}",
+            ):
+                if _normalized(template) in compact:
+                    explicit_reveals.append(agent.name)
+                    break
+        if explicit_reveals:
+            issues.append(DialogueQualityIssue(
+                "premature_identity_reveal",
+                "读者镜头在公开揭晓或结算前直接确认了隐藏身份；改成可多重解释的线索。",
+                hard=True,
+            ))
+    return issues

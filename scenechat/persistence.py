@@ -21,10 +21,17 @@ from .models import (
     Message,
     SimulationState,
 )
-from .scenario import CharacterSpec, ScenarioBrief, ScenarioPackage, VoiceProfile, WorldSpec
+from .scenario import (
+    CharacterSpec,
+    ScenarioBrief,
+    ScenarioPackage,
+    VoiceProfile,
+    WorldSpec,
+    normalize_scenario_phase_references,
+)
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def utc_now() -> str:
@@ -145,7 +152,7 @@ class SessionStore:
 
 
 def scenario_from_dict(data: dict[str, Any]) -> ScenarioPackage:
-    return ScenarioPackage(
+    package = ScenarioPackage(
         brief=ScenarioBrief.from_mapping(data.get("brief") or {}),
         world=WorldSpec.from_mapping(data.get("world") or {}),
         characters=[
@@ -155,6 +162,8 @@ def scenario_from_dict(data: dict[str, Any]) -> ScenarioPackage:
         ],
         warnings=[str(item) for item in data.get("warnings") or []],
     )
+    normalize_scenario_phase_references(package)
+    return package
 
 
 def _known_fields(cls, data: dict[str, Any]) -> dict[str, Any]:
@@ -437,6 +446,17 @@ def state_from_dict(
     state.winner = str(data.get("winner") or "")
     state.run_status = str(data.get("run_status") or "running")
     state.failed_generation_count = int(data.get("failed_generation_count", 0))
+    state.structured_output_retry_count = _nonnegative_int(
+        data.get("structured_output_retry_count"), 0
+    )
+    state.structured_output_fallback_count = _nonnegative_int(
+        data.get("structured_output_fallback_count"), 0
+    )
+    state.structured_output_issue_counts = {
+        str(key)[:80]: _nonnegative_int(value, 0)
+        for key, value in (data.get("structured_output_issue_counts") or {}).items()
+        if str(key).strip()
+    } if isinstance(data.get("structured_output_issue_counts"), dict) else {}
     state.dialogue_quality_retry_count = _nonnegative_int(
         data.get("dialogue_quality_retry_count"), 0
     )
@@ -445,6 +465,14 @@ def state_from_dict(
         for key, value in (data.get("dialogue_quality_issue_counts") or {}).items()
         if str(key).strip()
     } if isinstance(data.get("dialogue_quality_issue_counts"), dict) else {}
+    state.narration_quality_retry_count = _nonnegative_int(
+        data.get("narration_quality_retry_count"), 0
+    )
+    state.narration_quality_issue_counts = {
+        str(key)[:80]: _nonnegative_int(value, 0)
+        for key, value in (data.get("narration_quality_issue_counts") or {}).items()
+        if str(key).strip()
+    } if isinstance(data.get("narration_quality_issue_counts"), dict) else {}
     state.conversation_threads = {
         thread.id: thread
         for item in data.get("conversation_threads") or []

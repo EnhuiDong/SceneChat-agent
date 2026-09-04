@@ -893,8 +893,6 @@ def normalize_scenario_phase_references(package: ScenarioPackage) -> None:
     """
 
     phases = list(package.world.phases)
-    if not phases:
-        return
     keyed = {phase: _phase_reference_key(phase) for phase in phases}
 
     def resolve(value: str) -> str:
@@ -920,10 +918,90 @@ def normalize_scenario_phase_references(package: ScenarioPackage) -> None:
     for beat in package.world.beat_specs:
         beat.phase_hint = resolve(beat.phase_hint) if beat.phase_hint else ""
 
+    factions = {
+        character.faction.strip()
+        for character in package.characters
+        if character.faction.strip()
+    }
+    termination_aliases = {
+        "state_equals": "world_equals",
+        "state_equal": "world_equals",
+        "world_state_equals": "world_equals",
+        "flag_equals": "world_equals",
+        "faction_defeated": "faction_eliminated",
+        "faction_gone": "faction_eliminated",
+        "team_eliminated": "faction_eliminated",
+        "faction_majority": "faction_parity",
+        "team_parity": "faction_parity",
+        "goals_completed": "all_goals_completed",
+        "all_goals_complete": "all_goals_completed",
+        "everyone_at_location": "all_active_at_location",
+        "and": "all_of",
+        "or": "any_of",
+        "manual_trigger": "manual",
+    }
+    valid_termination_kinds = {
+        "faction_eliminated", "faction_parity", "world_equals",
+        "all_goals_completed", "all_active_at_location", "all_of",
+        "any_of", "manual",
+    }
+
+    def winner_faction(winner: str) -> str:
+        normalized_winner = re.sub(r"(?:阵营|faction|team)", "", winner.lower()).strip()
+        return next((
+            faction for faction in factions
+            if re.sub(r"(?:阵营|faction|team)", "", faction.lower()).strip()
+            == normalized_winner
+        ), "")
+
     def normalize_termination(rule: TerminationRule) -> None:
         rule.phases = [resolve(phase) for phase in rule.phases]
         for child in rule.conditions:
             normalize_termination(child)
+        raw_kind = re.sub(r"[\s\-]+", "_", rule.kind.strip().lower())
+        rule.kind = termination_aliases.get(raw_kind, raw_kind)
+        if rule.kind in valid_termination_kinds:
+            return
+
+        # Models often invent descriptive `human_win` / `ai_win` kinds even
+        # though the surrounding fields already describe a standard rule.
+        # Normalize only when the available fields make the mapping
+        # deterministic; genuinely incomplete rules still fail validation.
+        if rule.key:
+            rule.kind = "world_equals"
+            return
+        if rule.conditions:
+            rule.kind = "all_of" if any(
+                marker in rule.description.lower()
+                for marker in ("同时", "全部满足", "all", " and ")
+            ) else "any_of"
+            return
+        description = f"{rule.id} {rule.description}".lower()
+        mentioned_factions = [faction for faction in factions if faction.lower() in description]
+        eliminated_markers = ("淘汰", "出局", "消灭", "清除", "eliminat", "defeat", "no surviving")
+        parity_markers = ("平票", "持平", "不少于", "达到或超过", "parity", "majority")
+        if any(marker in description for marker in eliminated_markers):
+            candidates = [
+                faction for faction in mentioned_factions
+                if faction != rule.winner
+            ] or list(rule.opposing_factions)
+            if rule.faction:
+                candidates.insert(0, rule.faction)
+            if candidates:
+                rule.kind = "faction_eliminated"
+                rule.faction = candidates[0]
+                return
+        if any(marker in description for marker in parity_markers):
+            faction = rule.faction or winner_faction(rule.winner)
+            if faction:
+                rule.kind = "faction_parity"
+                rule.faction = faction
+                return
+        if raw_kind.endswith("_win") or raw_kind.endswith("_wins"):
+            faction = rule.faction or winner_faction(rule.winner)
+            if faction:
+                rule.kind = "faction_parity"
+                rule.faction = faction
 
     for termination_rule in package.world.termination_rules:
         normalize_termination(termination_rule)
@@ -1109,6 +1187,12 @@ def validate_scenario_package(package: ScenarioPackage) -> list[str]:
             issues.append("规则型场景缺少可执行 rules")
         if not package.world.termination_rules:
             issues.append("规则型场景缺少结构化 termination_rules")
+        missing_phase_specs = set(package.world.phases) - set(phase_names)
+        if missing_phase_specs:
+            issues.append(
+                "以下运行阶段缺少 phase_specs："
+                + ", ".join(sorted(missing_phase_specs))
+            )
         for phase in package.world.phase_specs:
             if not phase.allowed_action_types and not phase.event_only:
                 issues.append(f"规则型阶段“{phase.name}”缺少 allowed_action_types")
@@ -1124,6 +1208,50 @@ def validate_scenario_package(package: ScenarioPackage) -> list[str]:
                 )
             if phase.next_phase and phase.next_phase not in package.world.phases:
                 issues.append(f"阶段“{phase.name}”引用未知 next_phase")
+            if phase.advance_when == "all_active_voted":
+                if "vote" not in phase.allowed_action_types:
+                    issues.append(f"投票阶段“{phase.name}”没有允许 vote 行动")
+                if not any(
+                    rule.action_type == "vote"
+                    and (not rule.phases or phase.name in rule.phases)
+                    for rule in package.world.rules
+                ):
+                    issues.append(f"投票阶段“{phase.name}”没有可执行 vote 规则")
+            if phase.advance_when == "manual" and phase.next_phase:
+                has_transition = any(
+                    (not rule.phases or phase.name in rule.phases)
+                    and any(
+                        effect.op == "set_phase"
+                        and str(effect.value or "") == phase.next_phase
+                        for effect in rule.effects
+                    )
+                    for rule in package.world.rules
+                )
+                if not has_transition:
+                    issues.append(
+                        f"手动阶段“{phase.name}”没有通往“{phase.next_phase}”的可执行 set_phase 规则"
+                    )
+        factions = {
+            character.faction.strip()
+            for character in package.characters
+            if character.faction.strip()
+        }
+        competitive = len(factions) > 1 and any(
+            marker in " ".join(package.world.termination_conditions)
+            for marker in ("胜", "获胜", "胜利", "winner")
+        )
+
+        def declared_winners(rule: TerminationRule) -> set[str]:
+            values = {rule.winner.strip()} if rule.winner.strip() else set()
+            for child in rule.conditions:
+                values.update(declared_winners(child))
+            return values
+
+        winners = set().union(*(
+            declared_winners(rule) for rule in package.world.termination_rules
+        )) if package.world.termination_rules else set()
+        if competitive and not winners:
+            issues.append("阵营胜负场景的 termination_rules 没有声明任何 winner")
         compound_text = " ".join(package.world.termination_conditions)
         if (
             len(package.world.termination_rules) > 1

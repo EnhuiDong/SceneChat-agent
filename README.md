@@ -8,7 +8,7 @@ SceneChat-Agent 是一个共享大模型、角色上下文隔离的社会情境�
 
 1. 先把用户原文整理成结构化 `ScenarioBrief` 约束账本，区分短输入、部分设定与详细设定，并保留人数、人物、规则、固定事实、目标剧情节点和信息可见性。
 2. 根据同一份约束账本分别生成 `WorldSpec` 和定长 `CharacterSpec[]`；用户详细设定优先原样落实，短输入只补足可运行所需的信息。
-3. 执行确定性校验：开场、角色数量与姓名、目标、决策逻辑、结束条件和所有锁定约束都必须通过；失败时只允许一次结构化修复。
+3. 执行确定性校验：开场、角色数量与姓名、目标、决策逻辑、阶段转换、胜负归属和所有锁定约束都必须通过；失败时按配置进行有限次数的定向结构化修复。
 4. 直接从结构化角色对象建立 `AgentState`，Markdown 仅用于归档和兼容旧入口，不再承担新流程的数据协议。
 5. 公共世界、导演信息、角色/身份/地点事实分别带 `public`、`director_only`、`audience_only`、`agent:*`、`role:*` 或 `location:*` scope。短背景直接按 scope 注入，只有长背景进入临时 Chroma。
 6. 调度器根据公共资格、当前阶段和策略选择行动者，再构造不含越权事实的 `AgentView`；同地、异地、离场角色会获得不同观察。
@@ -35,11 +35,13 @@ Web 界面按“写下设定 → 真实构建进度 → 公开信息审阅 → �
 .
 ├── app.py                         # Flask Web API
 ├── main.py                        # 命令行入口：生成设定并开始推演
+├── config.json                    # 可公开的模型、运行时与服务配置
 ├── history.py                     # 命令行模拟入口
 ├── World.py                       # 世界观生成 Prompt
 ├── Character.py                   # 角色生成 Prompt
 ├── scenechat/
 │   ├── character_parser.py        # Markdown 角色档案解析
+│   ├── config.py                  # config.json 读取与范围校验
 │   ├── context.py                 # AgentView 与导演上下文
 │   ├── dialogue_quality.py        # 运行时对话质量门与秘密泄漏检查
 │   ├── dialogue_policy.py         # 场景中立的回应策略与安全降级
@@ -67,42 +69,42 @@ Web 界面按“写下设定 → 真实构建进度 → 公开信息审阅 → �
 
 ## 环境配置
 
-需要 Python 3.10+ 和 Node.js。复制 `.env.example` 为 `.env`，然后填写模型配置：
+需要 Python 3.10+ 和 Node.js。非敏感参数统一保存在仓库根目录的 `config.json`，包括模型类型、地址、超时、生成预算、自动修复次数、数据库路径和 CORS。根据实际服务修改对应字段即可。
 
-```dotenv
-# dashscope | openai | openai_compatible
-LLM_PROVIDER=dashscope
-LLM_API_KEY=your_api_key
-LLM_API_BASE=https://dashscope.aliyuncs.com/compatible-mode/v1
-LLM_MODEL=qwen-plus
-LLM_REQUEST_TIMEOUT_SECONDS=180
-LLM_MAX_RETRIES=1
-LLM_JSON_MODE=auto
-LLM_TOKEN_LIMIT_PARAMETER=max_tokens
-LLM_ENABLE_THINKING=false
-SIMULATION_PARSE_RETRIES=1
-SIMULATION_QUALITY_RETRIES=1
-
-# dashscope | dashscope_native | dashscope_compatible | openai | openai_compatible
-EMBEDDING_PROVIDER=dashscope
-EMBEDDING_API_KEY=your_api_key
-EMBEDDING_API_BASE=
-EMBEDDING_MODEL=text-embedding-v2
-EMBEDDING_BATCH_SIZE=20
-EMBEDDING_REQUEST_TIMEOUT_SECONDS=180
-EMBEDDING_MAX_RETRIES=1
+```json
+{
+  "scenario": {
+    "json_repair_retries": 2,
+    "semantic_repair_retries": 2,
+    "transport_retries": 1
+  },
+  "simulation": {
+    "intent_max_tokens": 900,
+    "narration_max_tokens": 480,
+    "max_turns": 120
+  }
+}
 ```
 
-文本模型与向量模型可以使用不同的供应商、地址和 API Key。`openai` 使用 OpenAI 默认地址；`openai_compatible` 必须填写对应的 `*_API_BASE`。`MODEL_PROVIDER` 仍作为旧 `.env` 的兼容别名，但新配置应使用 `LLM_PROVIDER`。
+复制 `.env.example` 为 `.env`，只填写不能提交到仓库的凭据：
+
+```dotenv
+LLM_API_KEY=your_api_key
+EMBEDDING_API_KEY=your_api_key
+```
+
+文本模型与向量模型可以在 `config.json` 中使用不同的供应商、地址和模型。`openai` 使用 OpenAI 默认地址；`openai_compatible` 必须填写对应的 `api_base`。`.env` 仅用于 API Key，不读取其他运行参数。
 
 | 配置值 | 文本生成 | 向量生成 |
 | --- | --- | --- |
-| `dashscope` | OpenAI 兼容接口，并支持 `LLM_ENABLE_THINKING` | DashScope 原生 LlamaIndex 适配器，批次不超过 20 |
+| `dashscope` | OpenAI 兼容接口，并支持 `llm.enable_thinking` | DashScope 原生 LlamaIndex 适配器，批次不超过 20 |
 | `openai` | OpenAI 默认或自定义地址 | OpenAI `/embeddings` |
 | `openai_compatible` | 自定义兼容地址 | 自定义兼容 `/embeddings` 地址 |
 | `dashscope_compatible` | — | 用 OpenAI Client 调用 DashScope 兼容地址 |
 
-`LLM_JSON_MODE=auto` 时，OpenAI 与 DashScope 使用原生 JSON Mode，未知兼容服务只依赖严格 Prompt 和本地 JSON 校验；确认服务支持 `response_format` 后可改为 `native`。结构化长文本默认关闭 DashScope thinking，避免推理 token 占满输出预算而截断 JSON。
+`llm.json_mode` 为 `auto` 时，OpenAI 与 DashScope 使用原生 JSON Mode，未知兼容服务只依赖严格 Prompt 和本地 JSON 校验；确认服务支持 `response_format` 后可改为 `native`。结构化长文本默认关闭 DashScope thinking，避免推理 token 占满输出预算而截断 JSON。
+
+`scenario.json_repair_retries` 控制不完整 JSON 的重新生成次数，`scenario.semantic_repair_retries` 控制设定未通过确定性校验时的定向修复次数，`scenario.transport_retries` 只在超时、断连或网关临时故障时重发当前步骤；三者有效范围均为 0–2。鉴权、额度、模型名称和请求参数错误不会重复发送。`simulation.intent_max_tokens` 与 `simulation.narration_max_tokens` 分别控制单轮角色 Intent 和旁白 JSON 的输出预算。
 
 ## 运行
 
@@ -132,23 +134,23 @@ python main.py
 
 - 每个新实验使用独立的内存向量集合，不会读取旧 `storage_chroma` 数据。
 - 生成的世界观、角色档案和完整结构化 `scenario.json` 保存在 `data/experiments/<experiment_id>/`。
-- Web 会话会在每一幕完成后写入本机 SQLite，默认文件为 `data/scenechat.db`；可通过 `SCENECHAT_DB_PATH` 修改位置。后端重启后可从首页继续，不要求用户安装或操作数据库。
+- Web 会话会在每一幕完成后写入本机 SQLite，默认文件为 `data/scenechat.db`；可通过 `config.json` 的 `storage.database_path` 修改位置。后端重启后可从首页继续，不要求用户安装或操作数据库。
 - SQLite 文件包含导演信息、人物秘密和私人记忆，内容未额外加密；不要将该文件提交到仓库或放入公开同步目录。项目已默认忽略数据库及 WAL/SHM 文件。
 - 推演页可随时导出一份完整 JSON 档案自行保存；SQLite 恢复与 JSON 导出互不替代。
-- 单次推演默认安全上限为 120 轮，可通过 `SCENECHAT_MAX_TURNS` 调整（有效范围 1–1000）；每页请求仍会受批次上限和剩余总轮数限制。
+- 单次推演默认安全上限为 120 轮，可通过 `config.json` 的 `simulation.max_turns` 调整（有效范围 1–1000）；每页请求仍会受批次上限和剩余总轮数限制。
 - `/api/story/next-stream` 支持稳定 `request_id` 和 `expected_page`；完成请求可安全重放，断流重试会从已经提交的消息继续，不会重复推进世界状态。
 - 新页面请求还可携带 `expected_revision`；状态已经变化时返回 `409 state_revision_conflict`。同一会话生成期间会拒绝并发状态操作，旧客户端不传版本号时仍保持兼容。
 - `POST /api/story/session/<id>/interventions/preview` 只生成预检结果，不改变剧情；确认、取消和节奏更新接口都接受 `expected_revision`，并与页面生成共享同一会话操作锁。
 - 柔性引导支持“下一步”“持续若干轮”和“持续到取消”。事件注入只能执行安全的公共状态/移动更新；涉及既有事实、角色状态或阶段的强制改写必须由用户在冲突卡上二次确认。
 - 干预预检同时读取固定事实和等待执行的干预。对同一状态字段给出互斥结果时，代码层会阻止后提交的普通事件静默覆盖；用户可以先取消旧干预，或明确确认强制改写。
-- 仅观众可见的镜头统一作为 `audience_only` 事件进入时间线，不写入任何角色观察或公共状态。公开事件会按可见范围自动形成观察，不接受模型额外注入角色知识。
+- 仅观众可见的镜头统一作为 `audience_only` 事件进入时间线，不写入任何角色观察或公共状态。存在对立阵营且尚未进入揭晓阶段时，自动旁白只读取公共信息，避免读者镜头过早泄露隐藏身份；公开事件会按可见范围自动形成观察，不接受模型额外注入角色知识。
 - 节奏滑块是导演软控制：慢速保留更多反应和关系细节，快速提高关键事件密度并更早寻求自然收束，但不会绕过阶段规则、结束条件、固定设定或角色信息边界。
-- `scenechat.evaluation` 提供可重复的导演干预生命周期、时间线可追踪性、私密镜头隔离、patch 边界以及慢/快节奏对照指标，便于部署方在自己的模型配置上进行质量回归。
+- `scenechat.evaluation` 提供可重复的导演干预生命周期、时间线可追踪性、旁白新鲜度、角色事件占比、调度存活性、剧情推进动量、私密镜头隔离、patch 边界以及慢/快节奏对照指标，便于部署方在自己的模型配置上进行质量回归。
 - 普通时间线会公开回应对象、被回复事件和对话动作，以维持可追踪的多人交互；`private_reason`、私人关系判断、`short_term_state` 以及结构化记忆候选不会返回给浏览器，只保存在本机完整会话中。
 - 普通浏览器会话 API 只返回公共世界和公开角色卡；用户主动调用导出功能时，下载内容会包含完整导演设定、人物秘密、私人记忆、状态和全部事件历史，请妥善保管。
 - 首页的单项删除和“清除全部”会永久删除对应 SQLite 记录；执行前会再次确认。右上角“保存并退出”只退出页面，不删除推演。
-- API 默认只接受本机 Vite 前端来源；远程部署时使用 `SCENECHAT_CORS_ORIGINS` 明确填写实际前端来源，不建议配置为 `*`。
-- 持久化与导出格式当前为 schema v2；v1 存档在恢复时会自动补齐默认 revision、剧情弧和空干预记录。
+- API 默认只接受本机 Vite 前端来源；远程部署时使用 `config.json` 的 `server.cors_origins` 明确填写实际前端来源，不建议配置为 `*`。
+- 持久化与导出格式当前为 schema v4；旧存档在恢复时会自动补齐 revision、剧情弧、干预记录和结构化输出质量统计。
 - API 错误使用稳定的 `code`、`stage` 和中文 `message`；供应商原始错误与请求 ID 只记录在后端日志中，不直接显示给前端用户。
 - 世界观、角色和每轮行动都会调用外部模型，请关注服务商额度和费用。
 - 每次点击“预检干预”会额外调用一次文本模型；返回修改但不重新预检不会产生新调用。

@@ -1,6 +1,5 @@
 import uuid
 import json
-import os
 import threading
 import time
 from dataclasses import asdict
@@ -10,6 +9,7 @@ from typing import Dict
 from flask import Flask, jsonify, request, Response, stream_with_context
 from flask_cors import CORS
 
+from scenechat.config import config_int, config_value
 from scenechat.errors import SceneChatError, stage_error
 from scenechat.generation import (
     generate_character_specs,
@@ -17,6 +17,7 @@ from scenechat.generation import (
     generate_scenario_brief,
     generate_world_spec,
     repair_scenario_package,
+    scenario_semantic_repair_attempts,
 )
 from scenechat.knowledge import build_experiment_knowledge_base, requires_vector_index
 from scenechat.models import Intervention, Message, SimulationState
@@ -45,40 +46,25 @@ from scenechat.simulation import simulate_next_event
 from scenechat.storage import save_experiment_documents
 
 app = Flask(__name__)
+cors_setting = config_value(
+    "server", "cors_origins", ["http://localhost:5173", "http://127.0.0.1:5173"]
+)
+cors_values = cors_setting if isinstance(cors_setting, list) else str(cors_setting).split(",")
 cors_origins = [
-    item.strip()
-    for item in os.getenv(
-        "SCENECHAT_CORS_ORIGINS",
-        "http://localhost:5173,http://127.0.0.1:5173",
-    ).split(",")
-    if item.strip()
+    str(item).strip() for item in cors_values if str(item).strip()
 ]
 CORS(app, resources={r"/api/*": {"origins": cors_origins}})
 
 story_sessions: Dict[str, dict] = {}
-session_store = SessionStore(os.getenv("SCENECHAT_DB_PATH", "data/scenechat.db"))
+session_store = SessionStore(
+    str(config_value("storage", "database_path", "data/scenechat.db"))
+)
 
 DEFAULT_BATCH_SIZE = 10
 MAX_BATCH_SIZE = 10
 
 
-def positive_int_env(name: str, default: int, *, maximum: int) -> int:
-    """Read a bounded positive integer without making startup fragile."""
-    raw_value = os.getenv(name, "").strip()
-    if not raw_value:
-        return default
-    try:
-        value = int(raw_value)
-    except ValueError:
-        app.logger.warning("config.invalid name=%s value=%r fallback=%s", name, raw_value, default)
-        return default
-    if value < 1 or value > maximum:
-        app.logger.warning("config.out_of_range name=%s value=%s fallback=%s", name, value, default)
-        return default
-    return value
-
-
-MAX_TURNS = positive_int_env("SCENECHAT_MAX_TURNS", 120, maximum=1000)
+MAX_TURNS = config_int("simulation", "max_turns", 120, minimum=1, maximum=1000)
 
 
 def load_story_session(session_id: str) -> dict | None:
@@ -334,9 +320,21 @@ def build_story_events(user_prompt: str, scene_override: str, session_id: str):
     package = ScenarioPackage(brief=brief, world=world, characters=characters)
     normalize_scenario_phase_references(package)
     issues = validate_scenario_package(package)
-    repaired = False
-    if issues:
-        repaired = True
+    repair_attempts = 0
+    for attempt in range(scenario_semantic_repair_attempts()):
+        if not issues:
+            break
+        repair_attempts += 1
+        yield build_progress_event(
+            "validation",
+            "started",
+            reason=(
+                f"发现 {len(issues)} 项可修复问题，正在自动修复 "
+                f"{attempt + 1}/{scenario_semantic_repair_attempts()}"
+            ),
+            repair_attempt=attempt + 1,
+            issue_count=len(issues),
+        )
         package = run_stage(
             session_id,
             "scenario_generation",
@@ -350,7 +348,8 @@ def build_story_events(user_prompt: str, scene_override: str, session_id: str):
     yield build_progress_event(
         "validation",
         "completed",
-        repaired=repaired,
+        repaired=repair_attempts > 0,
+        repair_attempts=repair_attempts,
         warning_count=len(package.warnings),
     )
 
@@ -1192,8 +1191,13 @@ def full_session_export(session_id: str, session: dict) -> dict:
             "winner": state.winner,
             "run_status": state.run_status,
             "failed_generation_count": state.failed_generation_count,
+            "structured_output_retry_count": state.structured_output_retry_count,
+            "structured_output_fallback_count": state.structured_output_fallback_count,
+            "structured_output_issue_counts": dict(state.structured_output_issue_counts),
             "dialogue_quality_retry_count": state.dialogue_quality_retry_count,
             "dialogue_quality_issue_counts": dict(state.dialogue_quality_issue_counts),
+            "narration_quality_retry_count": state.narration_quality_retry_count,
+            "narration_quality_issue_counts": dict(state.narration_quality_issue_counts),
             "conversation_threads": [
                 asdict(item) for item in state.conversation_threads.values()
             ],

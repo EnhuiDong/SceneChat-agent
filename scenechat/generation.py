@@ -6,6 +6,7 @@ from typing import Any
 
 from Character import CHARACTER_SYSTEM_PROMPT
 from World import WORLD_SYSTEM_PROMPT
+from .config import config_int
 
 from .providers import get_generation_chat_model
 from .scenario import (
@@ -29,6 +30,7 @@ BRIEF_SYSTEM_PROMPT = """你是 SceneChat 的用户约束分析器。你的任�
 4. 识别信息可见性：公开信息用 public，导演秘密用 director_only，指定角色或身份可见时用 agent:<名称> 或 role:<身份>。
 5. 对轻微歧义选择最符合上下文的解释并写入 assumptions。互相冲突的硬约束写入 contradictions，并采用“更具体、明确列举、位置更靠后的要求优先”的可重复规则解决。
 6. requested_character_count 必须是本次实际应生成的人数。用户未指定时，根据题材合理选择；单人场景允许 1 人。
+7. 不得从单个概念词擅自推导整体时代或审美。“AI 玩家”不等于赛博朋克；没有明确风格要求时，采用最少额外假设的现实实现。
 
 只输出一个 JSON 对象，不要使用 Markdown 代码块：
 {
@@ -97,6 +99,7 @@ WORLD_JSON_INSTRUCTION = """在遵守上方所有世界设计规则的同时，�
 运行时已经内置 move、vote、inspect、protect、eliminate、poison、heal 的标准效果和能力次数扣减。此类 rule 的 effects 应留空，不能重复填写淘汰、查验、保护、投票、移动或 consume_ability；只有题材额外要求的世界状态、资源、目标或关系变化才写入 effects。普通 speak、observe、pass、act 规则也不得借 effects 越权执行专用行动。
 
 每个非 event_only 阶段的 allowed_action_types 必须至少包含 pass、observe、speak、act 之一作为安全兜底，即使该阶段主要执行投票、查验或自定义行动；兜底行动用于模型连续提交非法 Intent 时保持阶段可推进，不能省略。
+advance_when=manual 表示阶段可无限持续；如果同时填写 next_phase，必须提供一条在本阶段可执行且包含 set_phase 到 next_phase 的规则，不能只在自然语言中说“之后进入下一阶段”。阵营对抗或比赛场景的 termination_rules 必须明确 winner，并能区分主要胜负结果。
 有夜间技能、治疗、反制或结算顺序时，termination rule 必须用 phases 限制到结算/公布阶段，不能在中间行动后提前判胜。
 
 状态 effect 仅允许 set_world、increment_world、move_agent、set_agent_status、set_resource、consume_resource、set_goal_status、set_relationship、record_vote、clear_votes、set_phase、add_known_fact、protect_agent、clear_protections。模板中的 $actor、$target、$value 会在运行时由 Resolver 安全替换。
@@ -173,6 +176,33 @@ def _content(response: Any) -> str:
     return str(content or "")
 
 
+def _repair_attempts(key: str, default: int) -> int:
+    return config_int("scenario", key, default, minimum=0, maximum=2)
+
+
+def scenario_semantic_repair_attempts() -> int:
+    return _repair_attempts("semantic_repair_retries", 2)
+
+
+def _is_transient_transport_error(exc: Exception) -> bool:
+    name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    terminal_markers = (
+        "authentication", "unauthorized", "invalid api key", "invalid_api_key",
+        "insufficient", "quota exhausted", "model not found", "invalid model",
+    )
+    if any(marker in text for marker in terminal_markers):
+        return False
+    return (
+        name in {"apitimeouterror", "apiconnectionerror", "internalservererror"}
+        or any(marker in text for marker in (
+            "timed out", "timeout", "connection reset", "connection error",
+            "temporarily unavailable", "bad gateway", "service unavailable",
+            "gateway timeout", "502", "503", "504",
+        ))
+    )
+
+
 def _invoke_json(
     system_prompt: str,
     user_prompt: str,
@@ -180,30 +210,48 @@ def _invoke_json(
     max_tokens: int = 12000,
     allow_json_repair: bool = True,
 ) -> dict[str, Any]:
-    llm = get_generation_chat_model(temperature=temperature, max_tokens=max_tokens)
-    response = llm.invoke(
-        [("system", system_prompt), ("user", user_prompt)],
-        response_format={"type": "json_object"},
-    )
-    raw = _content(response)
-    try:
-        return extract_json_object(raw)
-    except (ValueError, json.JSONDecodeError):
-        if not allow_json_repair:
-            raise
-        repair_llm = get_generation_chat_model(temperature=0, max_tokens=max_tokens)
-        repair_response = repair_llm.invoke(
-            [
-                (
-                    "system",
-                    f"{system_prompt}\n\n上一次响应不是合法 JSON。请重新生成一次完整结果，"
-                    "严格遵守原 schema；不要解释，不要复述错误响应。",
-                ),
-                ("user", user_prompt),
-            ],
-            response_format={"type": "json_object"},
+    repairs = _repair_attempts("json_repair_retries", 2) if allow_json_repair else 0
+    last_error: Exception | None = None
+    for attempt in range(repairs + 1):
+        llm = get_generation_chat_model(
+            temperature=temperature if attempt == 0 else 0,
+            max_tokens=max_tokens,
         )
-        return extract_json_object(_content(repair_response))
+        correction = "" if attempt == 0 else (
+            f"\n\n第 {attempt} 次自动修复：上一次响应不是完整合法的 JSON。"
+            "保留任务约束，省略不必要解释，严格生成一份完整且闭合的 JSON；不要复述失败输出。"
+        )
+        transport_retries = _repair_attempts("transport_retries", 1)
+        for transport_attempt in range(transport_retries + 1):
+            try:
+                response = llm.invoke(
+                    [("system", system_prompt + correction), ("user", user_prompt)],
+                    response_format={"type": "json_object"},
+                )
+                break
+            except Exception as exc:
+                if (
+                    transport_attempt >= transport_retries
+                    or not _is_transient_transport_error(exc)
+                ):
+                    raise
+        try:
+            return extract_json_object(_content(response))
+        except (ValueError, json.JSONDecodeError) as exc:
+            last_error = exc
+    assert last_error is not None
+    raise last_error
+
+
+def _brief_issues(brief: ScenarioBrief) -> list[str]:
+    issues = []
+    if not brief.premise:
+        issues.append("约束分析缺少核心设想 premise")
+    if brief.requested_character_count is None or brief.requested_character_count < 1:
+        issues.append("约束分析没有给出有效角色数量")
+    if not brief.constraints:
+        issues.append("约束分析没有提取任何用户约束")
+    return issues
 
 
 def generate_scenario_brief(user_prompt: str, scene_override: str = "") -> ScenarioBrief:
@@ -219,12 +267,27 @@ def generate_scenario_brief(user_prompt: str, scene_override: str = "") -> Scena
     brief = ScenarioBrief.from_mapping(payload)
     if scene_override.strip():
         brief.requested_opening_scene = scene_override.strip()
-    if not brief.premise:
-        raise ScenarioValidationError(["约束分析缺少核心设想 premise"])
-    if brief.requested_character_count is None or brief.requested_character_count < 1:
-        raise ScenarioValidationError(["约束分析没有给出有效角色数量"])
-    if not brief.constraints:
-        raise ScenarioValidationError(["约束分析没有提取任何用户约束"])
+    issues = _brief_issues(brief)
+    for attempt in range(scenario_semantic_repair_attempts()):
+        if not issues:
+            break
+        repair_payload = _invoke_json(
+            BRIEF_SYSTEM_PROMPT,
+            "【用户原始输入】\n"
+            f"{user_prompt}\n\n【需要修复的约束账本】\n"
+            f"{json.dumps(brief.to_dict(), ensure_ascii=False, indent=2)}\n\n"
+            "【确定性校验错误】\n"
+            f"{json.dumps(issues, ensure_ascii=False)}\n\n"
+            "只修复这些错误，不得丢失用户原文约束。",
+            temperature=0.0,
+            max_tokens=4000,
+        )
+        brief = ScenarioBrief.from_mapping(repair_payload)
+        if scene_override.strip():
+            brief.requested_opening_scene = scene_override.strip()
+        issues = _brief_issues(brief)
+    if issues:
+        raise ScenarioValidationError(issues)
     return brief
 
 
@@ -282,7 +345,7 @@ def repair_scenario_package(
   "warnings": ["必要的非阻断说明"]
 }
 所有 covered_constraint_ids 必须真实对应其落实位置。公共世界仍不得包含导演秘密。
-如果错误涉及规则运行时，必须补全 phase_specs、rules、state_schema 和 termination_rules。每个非 event_only 阶段必须在 allowed_action_types 中保留 pass、observe、speak、act 至少一种安全兜底。move、vote、inspect、protect、eliminate、poison、heal 的标准效果以及能力次数扣减由 Resolver 内置执行，对应 rule/ability 的 effects 留空；只有额外的题材状态变化才能使用与行动类型匹配的 set_world、increment_world、set_resource、consume_resource、set_goal_status、set_relationship 等 effect。不要退回自然语言规则代替结构化字段。"""
+如果错误涉及规则运行时，必须补全 phase_specs、rules、state_schema 和 termination_rules。termination_rules.kind 只能从 faction_eliminated、faction_parity、world_equals、all_goals_completed、all_active_at_location、all_of、any_of、manual 中选择，禁止创造 ai_win、human_win、team_win 等新 kind；胜方只能写入 winner。每个非 event_only 阶段必须在 allowed_action_types 中保留 pass、observe、speak、act 至少一种安全兜底。advance_when=manual 且存在 next_phase 时，必须提供一个作用于该阶段、effect 为 set_phase 到 next_phase 的可执行规则。阵营胜负场景必须用带 winner 的结构化结束规则覆盖胜负结果。move、vote、inspect、protect、eliminate、poison、heal 的标准效果以及能力次数扣减由 Resolver 内置执行，对应 rule/ability 的 effects 留空；只有额外的题材状态变化才能使用与行动类型匹配的 set_world、increment_world、set_resource、consume_resource、set_goal_status、set_relationship、set_phase 等 effect。不要退回自然语言规则代替结构化字段。"""
     payload = _invoke_json(
         repair_prompt,
         "【用户原始输入】\n"
@@ -318,7 +381,9 @@ def generate_scenario_package(user_prompt: str, scene_override: str = "") -> Sce
     package = ScenarioPackage(brief=brief, world=world, characters=characters)
     normalize_scenario_phase_references(package)
     issues = validate_scenario_package(package)
-    if issues:
+    for _ in range(scenario_semantic_repair_attempts()):
+        if not issues:
+            break
         package = repair_scenario_package(user_prompt, package, issues)
         normalize_scenario_phase_references(package)
         issues = validate_scenario_package(package)
