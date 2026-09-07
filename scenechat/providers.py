@@ -59,7 +59,7 @@ def _normalized_provider(value: str) -> str:
 
 
 def _required_env(name: str, description: str) -> str:
-    value = os.getenv(name)
+    value = (os.getenv(name) or "").strip()
     if not value:
         raise configuration_error(name, description)
     return value
@@ -119,7 +119,9 @@ def _setting_float(
 
 
 def _chat_provider() -> str:
-    provider = _normalized_provider(str(config_value("llm", "provider", "dashscope")))
+    provider = _normalized_provider(
+        os.getenv("LLM_PROVIDER") or os.getenv("MODEL_PROVIDER") or "dashscope"
+    )
     if provider not in CHAT_PROVIDERS:
         raise unsupported_provider_error(provider, "生成模型")
     return provider
@@ -149,17 +151,15 @@ def get_generation_chat_model(
 ):
     provider = _chat_provider()
     api_key = _required_env("LLM_API_KEY", "生成模型 API Key")
-    model_name = str(config_value("llm", "model", "")).strip()
-    if not model_name:
-        raise _invalid_setting("llm.model", "生成模型名称")
+    model_name = _required_env("LLM_MODEL", "生成模型名称")
 
-    configured_base_url = str(config_value("llm", "api_base", "") or "").strip() or None
+    configured_base_url = (os.getenv("LLM_API_BASE") or "").strip() or None
     if provider == "dashscope":
         base_url = configured_base_url or DASHSCOPE_COMPATIBLE_BASE_URL
     elif provider == "openai_compatible":
         base_url = configured_base_url
         if not base_url:
-            raise _invalid_setting("llm.api_base", "OpenAI 兼容生成模型 API 地址")
+            raise configuration_error("LLM_API_BASE", "OpenAI 兼容生成模型 API 地址")
     else:
         base_url = configured_base_url
 
@@ -196,7 +196,7 @@ def _embedding_provider() -> str:
     # Embeddings deliberately do not inherit the chat provider: the two services
     # can use different vendors, credentials and base URLs.
     provider = _normalized_provider(
-        str(config_value("embedding", "provider", "dashscope"))
+        os.getenv("EMBEDDING_PROVIDER") or "dashscope"
     )
     if provider not in EMBEDDING_PROVIDERS:
         raise unsupported_provider_error(provider, "向量模型")
@@ -223,32 +223,28 @@ def _embedding_batch_size(provider: str) -> int:
 
 def get_embedding_model():
     provider = _embedding_provider()
-    model_name = str(config_value("embedding", "model", "")).strip()
-    if not model_name:
-        raise _invalid_setting("embedding.model", "向量模型名称")
+    model_name = _required_env("EMBEDDING_MODEL", "向量模型名称")
     api_key = os.getenv("EMBEDDING_API_KEY") or os.getenv("LLM_API_KEY")
     if not api_key:
         raise configuration_error("EMBEDDING_API_KEY", "向量模型 API Key")
     batch_size = _embedding_batch_size(provider)
 
     if provider in {"dashscope", "dashscope_native"}:
-        from llama_index.embeddings.dashscope import DashScopeEmbedding
+        from .dashscope_embedding import CheckedDashScopeEmbedding
 
-        return DashScopeEmbedding(
+        return CheckedDashScopeEmbedding(
             model_name=model_name,
             api_key=api_key,
             embed_batch_size=batch_size,
         )
 
-    configured_base_url = (
-        str(config_value("embedding", "api_base", "") or "").strip() or None
-    )
+    configured_base_url = (os.getenv("EMBEDDING_API_BASE") or "").strip() or None
     if provider == "dashscope_compatible":
         base_url = configured_base_url or DASHSCOPE_COMPATIBLE_BASE_URL
     elif provider == "openai_compatible":
         base_url = configured_base_url
         if not base_url:
-            raise _invalid_setting("embedding.api_base", "OpenAI 兼容向量模型 API 地址")
+            raise configuration_error("EMBEDDING_API_BASE", "OpenAI 兼容向量模型 API 地址")
     else:
         base_url = configured_base_url
 

@@ -238,9 +238,13 @@ def evaluate_trace(
             and "没有可行动角色" in str(state.last_scheduler_decision.get("reason") or "")
         )
         metrics["scheduler_liveness"] = _score(
-            0.0 if exhausted_manual_phase else 1.0,
+            0.0 if exhausted_manual_phase or state.last_scheduler_decision.get("kind") == "blocked" else 1.0,
             "manual phase exhausted despite eligible actors"
-            if exhausted_manual_phase else "scheduler retains an executable path",
+            if exhausted_manual_phase else (
+                "scheduler blocked: no eligible actor or executable phase exit"
+                if state.last_scheduler_decision.get("kind") == "blocked"
+                else "scheduler retains an executable path"
+            ),
             1.0,
         )
         beats = list(getattr(state.world_spec, "beat_specs", []) or [])

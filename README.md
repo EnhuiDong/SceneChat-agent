@@ -25,7 +25,9 @@ SceneChat-Agent 是一个共享大模型、角色上下文隔离的社会情境�
 
 Web 界面按“写下设定 → 真实构建进度 → 公开信息审阅 → 实时模拟”组织。审阅页提供约束覆盖、运行阶段、公开规则和角色卡，但不会返回导演信息或角色秘密；模拟工作台提供可点开的公开人物卡、公开世界状态、导演干预预检卡、剧情进度与节奏滑块、分页条数、暂停/恢复、跳过打字和可选自动推进。用户开始输入或预检干预时，自动推进会暂停并保留倒计时。首页会列出保存在本机的历史推演，可继续、逐个删除或一键清空。
 
-启动实验前先通过与正式生成相同的 JSON 路径探测生成模型。生成结构化设定后，只有背景长度达到 RAG 阈值时才探测向量模型并建立索引；短场景不会因为 Embedding 不可用而无法运行。
+启动实验时先检查向量模型，再通过与正式生成相同的 JSON 路径检查生成模型；两项检查均通过后才生成约束、世界和角色，避免完成部分生成后才发现服务不可用。向量检查使用实际索引所用的批量接口；背景达到 RAG 阈值时才建立向量索引，短背景仍直接注入。
+
+场景校验会核对阶段和规则能否由真实角色执行、纯环境阶段是否有角色行动出口，以及结束条件的类型和状态更新来源。`all_active` 等全体角色选择器按全体可行动角色处理；未知职能和不存在的主持人会触发定向修复。运行中如果角色阶段没有合法行动者，会明确暂停并报告原因，不再用连续旁白填充。用户未指定称呼时，角色使用独立姓名，职业保留在身份字段；用户给出的姓名、编号和代号保持原样。
 
 文本生成统一通过 OpenAI Python Client 的 Chat Completions 接口调用，可使用 OpenAI、DashScope 或其他实现该协议的兼容服务。向量模型独立配置：兼容服务通过项目内的 LlamaIndex `BaseEmbedding` 适配器接入，DashScope 原生 Embedding 保留为兜底。
 
@@ -35,7 +37,7 @@ Web 界面按“写下设定 → 真实构建进度 → 公开信息审阅 → �
 .
 ├── app.py                         # Flask Web API
 ├── main.py                        # 命令行入口：生成设定并开始推演
-├── config.json                    # 可公开的模型、运行时与服务配置
+├── config.json                    # 超时、重试、生成预算等运行与服务参数
 ├── history.py                     # 命令行模拟入口
 ├── World.py                       # 世界观生成 Prompt
 ├── Character.py                   # 角色生成 Prompt
@@ -69,7 +71,7 @@ Web 界面按“写下设定 → 真实构建进度 → 公开信息审阅 → �
 
 ## 环境配置
 
-需要 Python 3.10+ 和 Node.js。非敏感参数统一保存在仓库根目录的 `config.json`，包括模型类型、地址、超时、生成预算、自动修复次数、数据库路径和 CORS。根据实际服务修改对应字段即可。
+需要 Python 3.10+ 和 Node.js。模型供应商、模型名称、API 地址和 API Key 从 `.env` 读取；超时、重试次数、生成预算、批次大小、JSON 模式、thinking 开关、数据库路径和 CORS 等运行参数保存在仓库根目录的 `config.json`。修改配置后重启后端生效。
 
 ```json
 {
@@ -86,14 +88,21 @@ Web 界面按“写下设定 → 真实构建进度 → 公开信息审阅 → �
 }
 ```
 
-复制 `.env.example` 为 `.env`，只填写不能提交到仓库的凭据：
+复制 `.env.example` 为 `.env`，填写模型连接配置（本地 `.env` 不提交到仓库）：
 
 ```dotenv
+LLM_PROVIDER=dashscope
 LLM_API_KEY=your_api_key
+LLM_API_BASE=
+LLM_MODEL=qwen-plus
+
+EMBEDDING_PROVIDER=dashscope
 EMBEDDING_API_KEY=your_api_key
+EMBEDDING_API_BASE=
+EMBEDDING_MODEL=text-embedding-v2
 ```
 
-文本模型与向量模型可以在 `config.json` 中使用不同的供应商、地址和模型。`openai` 使用 OpenAI 默认地址；`openai_compatible` 必须填写对应的 `api_base`。`.env` 仅用于 API Key，不读取其他运行参数。
+文本模型与向量模型可以在 `.env` 中使用不同的供应商、地址和模型。`*_API_BASE` 留空时，`openai` 使用 OpenAI 默认地址，`dashscope` 文本生成与 `dashscope_compatible` 向量生成使用 DashScope 默认兼容地址；`openai_compatible` 必须填写对应的 `*_API_BASE`。`MODEL_PROVIDER` 保留为 `LLM_PROVIDER` 的旧别名。`config.json` 不再读取 `provider`、`model`、`api_base` 字段；旧 `.env` 中的超时、重试次数和 Token 预算也不覆盖 `config.json`。
 
 | 配置值 | 文本生成 | 向量生成 |
 | --- | --- | --- |

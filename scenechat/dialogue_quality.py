@@ -35,6 +35,16 @@ def _similar(left: str, right: str, threshold: float) -> bool:
     return SequenceMatcher(None, first, second).ratio() >= threshold
 
 
+def _reordered_narration(left: str, right: str) -> bool:
+    first, second = _normalized(left), _normalized(right)
+    if min(len(first), len(second)) < 20:
+        return False
+    first_pairs = {first[i:i + 2] for i in range(len(first) - 1)}
+    second_pairs = {second[i:i + 2] for i in range(len(second) - 1)}
+    shared = len(first_pairs & second_pairs)
+    return shared >= 12 and 2 * shared / max(len(first_pairs) + len(second_pairs), 1) >= 0.68
+
+
 def _looks_like_secret(fragment: str, output: str) -> bool:
     secret = _normalized(fragment)
     candidate = _normalized(output)
@@ -241,6 +251,7 @@ def inspect_narration_event(
     ]
     if any(
         _similar(text, previous, 0.82)
+        or _reordered_narration(text, previous)
         or (
             len(_normalized(previous)) >= 8
             and (

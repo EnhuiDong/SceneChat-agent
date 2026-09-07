@@ -44,7 +44,7 @@ def configuration_error(variable: str, description: str) -> SceneChatError:
 def unsupported_provider_error(provider: str, service: str) -> SceneChatError:
     return SceneChatError(
         "model_provider_unsupported",
-        f"当前后端暂不支持配置的{service}提供商“{provider}”，请检查 config.json。",
+        f"当前后端暂不支持配置的{service}提供商“{provider}”，请检查 .env。",
         stage="preflight",
         status_code=503,
     )
@@ -96,7 +96,7 @@ def classify_provider_error(
     if any(marker in text for marker in quota_markers):
         return SceneChatError(
             f"{service_code}_quota_exhausted",
-            f"{service}额度不足或免费额度已用尽，请在模型服务控制台补充额度后重试。",
+            f"{service}额度不足或免费额度已用尽，请检查模型服务控制台的额度及“仅使用免费额度”设置后重试。",
             stage=stage,
             cause=exc,
         )

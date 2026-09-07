@@ -6,12 +6,12 @@ import { startStoryBuild } from "./storyApi";
 import "./BuildReview.css";
 
 const BUILD_STAGES = [
+  ["embedding_preflight", "检查向量模型", "开始生成前确认知识检索服务可用"],
   ["generation_preflight", "检查模型", "确认生成服务和 JSON 能力"],
   ["brief", "理解设定", "提取硬约束、题材和信息边界"],
   ["world", "构建世界", "生成场景、规则、阶段和结束条件"],
   ["characters", "生成角色", "创建公开档案和隔离的私密上下文"],
   ["validation", "一致性校验", "核对人数、约束、可见性和规则"],
-  ["embedding_preflight", "准备知识", "仅在长背景需要 RAG 时检查向量模型"],
   ["runtime", "准备模拟", "建立角色状态、知识边界和推演客户端"],
   ["storage", "保存档案", "归档完整结构化实验"],
 ];

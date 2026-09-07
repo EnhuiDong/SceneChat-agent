@@ -2,7 +2,6 @@ import history
 import uuid
 from scenechat.errors import SceneChatError, stage_error
 from scenechat.generation import generate_scenario_package
-from scenechat.knowledge import requires_vector_index
 from scenechat.preflight import (
     validate_embedding_model_availability,
     validate_generation_model_availability,
@@ -20,6 +19,9 @@ def main():
         return
 
     try:
+        print("\n正在检查向量模型...")
+        validate_embedding_model_availability()
+        print("向量模型检查通过。")
         print("\n正在检查生成模型...")
         validate_generation_model_availability()
         print("生成模型检查通过。")
@@ -41,15 +43,6 @@ def main():
         print(worldview)
 
         characters = package.characters_markdown
-
-        if requires_vector_index(
-            package.public_worldview_markdown,
-            characters,
-            package.world.director_notes_markdown,
-            package.world.facts,
-        ):
-            print("\n检测到长背景，正在检查向量模型...")
-            validate_embedding_model_availability()
 
         print("=" * 60)
         print("【生成的角色设定】")

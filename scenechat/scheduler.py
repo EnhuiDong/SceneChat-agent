@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .models import AgentState, SimulationState
+from .role_selectors import matches_role
 
 
 @dataclass(frozen=True)
@@ -25,11 +26,19 @@ class SimulationScheduler:
 
         phase = state.phase_specs.get(state.current_phase)
         if phase is not None and getattr(phase, "event_only", False):
+            if not phase.next_phase and state.history:
+                previous = state.history[-1]
+                if previous.kind == "narration" and previous.intent.get("narration_phase") == phase.name:
+                    return self._record(state, SchedulerDecision(
+                        "blocked", reason=f"终局阶段“{phase.name}”已执行环境事件，但结束条件仍未满足"
+                    ))
             return self._record(state, SchedulerDecision("event", reason="当前为环境事件阶段"))
         strategy = getattr(phase, "scheduler", "") or state.scheduler_strategy
         eligible = self._eligible_for_phase(state, phase)
         if not eligible:
-            return self._record(state, SchedulerDecision("narration", reason="当前阶段没有可行动角色"))
+            return self._record(state, SchedulerDecision(
+                "blocked", reason=f"阶段“{state.current_phase}”没有符合规则的可行动角色，或阶段行动已耗尽但未完成切换"
+            ))
 
         response_candidates = [agent for agent in eligible if agent.pending_intents]
         if response_candidates:
@@ -117,7 +126,7 @@ class SimulationScheduler:
             agent
             for agent in state.agents.values()
             if agent.eligible
-            and (not roles or agent.role in roles)
+            and matches_role(agent.role, roles)
         ]
         # A manual phase is deliberately open-ended.  phase_action_log tracks
         # who acted in the current structured cycle, but must never exhaust an

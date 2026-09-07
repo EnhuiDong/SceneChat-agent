@@ -31,6 +31,7 @@ BRIEF_SYSTEM_PROMPT = """你是 SceneChat 的用户约束分析器。你的任�
 5. 对轻微歧义选择最符合上下文的解释并写入 assumptions。互相冲突的硬约束写入 contradictions，并采用“更具体、明确列举、位置更靠后的要求优先”的可重复规则解决。
 6. requested_character_count 必须是本次实际应生成的人数。用户未指定时，根据题材合理选择；单人场景允许 1 人。
 7. 不得从单个概念词擅自推导整体时代或审美。“AI 玩家”不等于赛博朋克；没有明确风格要求时，采用最少额外假设的现实实现。
+8. 用户未命名时，只记录需要生成独立姓名，不要在 assumptions 预先安排“林探长/苏医生”等职业姓名模板。公开的阵营人数与具体谁属于该阵营是不同事实，不能因为身份隐藏就把用户明确的游戏构成一并当作秘密。
 
 只输出一个 JSON 对象，不要使用 Markdown 代码块：
 {
@@ -106,9 +107,20 @@ advance_when=manual 表示阶段可无限持续；如果同时填写 next_phase�
 
 beat_specs 必须与 target_beats 一一对应并使用稳定 ID。用户明确要求必须发生的节点标 required=true；普通期望节点不得标成硬约束。description 和 resolution_signals 必须描述可观察结果，不能要求某角色违背自主判断作出指定选择；prerequisites 只引用前面已声明的 beat ID。
 
-特别注意：公共世界会直接成为所有角色的知识。任何并非所有角色都知道的信息只能进入 director_notes_markdown 或带精确非 public scope 的 facts。桌游、审判、比赛等规则题材必须给出可执行 phase_specs、rules 与 termination_rules；自由谈话可以保持精简。天亮公布、结算、广播等没有角色行动的阶段必须设置 scheduler=event_first、advance_when=after_event、event_only=true，并给出 next_phase。
+特别注意：公共世界会直接成为所有角色的知识。任何并非所有角色都知道的信息只能进入 director_notes_markdown 或带精确非 public scope 的 facts。桌游、审判、比赛等规则题材必须给出可执行 phase_specs、rules 与 termination_rules；自由谈话可以保持精简。天亮公布、结算、广播等没有角色行动的阶段必须设置 scheduler=event_first、advance_when=after_event、event_only=true，并给出 next_phase；唯一例外是有适用结构化结束规则的终局阶段，可以不设 next_phase。
 
 relationship_dimensions 应选择 2–5 个对本场景真正有用、含义互不重复的主观关系维度，必须兼容题材而不是默认套用猜疑游戏：战斗可使用敌对/协作、威胁判断、敬重或服从；职场可使用合作、可靠判断、影响力；家庭或情感场景可使用亲密、信赖、依赖或边界感。不要把战斗胜负、生命值、距离等客观状态伪装成关系维度。若题材没有特殊需要，可使用 cooperation、confidence、regard 三个通用维度。"""
+
+RUNTIME_GENERATION_GUIDANCE = """
+运行可达性与人物命名约束：
+- actor_roles/allowed_roles 为空数组表示所有可行动角色；非空时必须与实际 CharacterSpec.role 一致，禁止虚构 all_active 职业或名单外的 host。规则 action_type 必须在其阶段 allowed_action_types 中。
+- 主持流程由公开环境事件或已有角色完成，不能为了主持额外增加用户未要求的角色。有限回合的讨论优先 all_eligible_acted；只有确实允许无限讨论时才用 manual。manual 的退出规则必须有真实有权执行的角色和被允许的动作。
+- 普通环境事件阶段使用 after_event 并明确 next_phase；事件阶段链必须能回到角色行动阶段。终局可以没有 next_phase，但必须有在该阶段适用的结构化结束规则；不得依赖旁白永远循环。
+- world_equals 是类型严格的相等比较，不执行 >=、<= 或表达式；存活阵营数量的胜负使用 faction_eliminated/faction_parity，不能依赖无人维护的计数字段。
+- 普通问答或质疑使用 speak + question/challenge，inspect 仅用于场景明确授权的事实查验能力，不得让普通玩家提问就读取秘密阵营。
+- 用户未指定姓名时为每人生成符合时代文化的独立姓名，职业只写在身份字段；不得用“姓氏+职业”代替姓名。用户明确给出的姓名、称呼、编号或代号必须保留。导演笔记若出现角色信息必须与角色表一致，不能把身份写成“示例、稍后随机、根据表现动态分配”。
+- 只有用户明确要求必经的节点才标 required=true，系统补全的剧情目标不得自动升级成硬约束；节点完成必须有实际事件支持，灯光变化不能代替规则宣读或角色讨论。
+"""
 
 
 CHARACTER_JSON_INSTRUCTION = """在遵守上方所有角色设计规则的同时，只输出一个 JSON 对象，不要使用 Markdown 代码块：
@@ -293,7 +305,7 @@ def generate_scenario_brief(user_prompt: str, scene_override: str = "") -> Scena
 
 def generate_world_spec(user_prompt: str, brief: ScenarioBrief) -> WorldSpec:
     payload = _invoke_json(
-        f"{WORLD_SYSTEM_PROMPT}\n\n{WORLD_JSON_INSTRUCTION}",
+        f"{WORLD_SYSTEM_PROMPT}\n\n{WORLD_JSON_INSTRUCTION}\n\n{RUNTIME_GENERATION_GUIDANCE}",
         "【用户原始输入——最高约束】\n"
         f"{user_prompt}\n\n"
         "【结构化约束账本】\n"
@@ -313,7 +325,7 @@ def generate_character_specs(
     world: WorldSpec,
 ) -> list[CharacterSpec]:
     payload = _invoke_json(
-        f"{CHARACTER_SYSTEM_PROMPT}\n\n{CHARACTER_JSON_INSTRUCTION}",
+        f"{CHARACTER_SYSTEM_PROMPT}\n\n{CHARACTER_JSON_INSTRUCTION}\n\n{RUNTIME_GENERATION_GUIDANCE}",
         "【用户原始输入——所有明确细节均为最高级约束】\n"
         f"{user_prompt}\n\n"
         "【结构化约束账本】\n"
@@ -347,7 +359,7 @@ def repair_scenario_package(
 所有 covered_constraint_ids 必须真实对应其落实位置。公共世界仍不得包含导演秘密。
 如果错误涉及规则运行时，必须补全 phase_specs、rules、state_schema 和 termination_rules。termination_rules.kind 只能从 faction_eliminated、faction_parity、world_equals、all_goals_completed、all_active_at_location、all_of、any_of、manual 中选择，禁止创造 ai_win、human_win、team_win 等新 kind；胜方只能写入 winner。每个非 event_only 阶段必须在 allowed_action_types 中保留 pass、observe、speak、act 至少一种安全兜底。advance_when=manual 且存在 next_phase 时，必须提供一个作用于该阶段、effect 为 set_phase 到 next_phase 的可执行规则。阵营胜负场景必须用带 winner 的结构化结束规则覆盖胜负结果。move、vote、inspect、protect、eliminate、poison、heal 的标准效果以及能力次数扣减由 Resolver 内置执行，对应 rule/ability 的 effects 留空；只有额外的题材状态变化才能使用与行动类型匹配的 set_world、increment_world、set_resource、consume_resource、set_goal_status、set_relationship、set_phase 等 effect。不要退回自然语言规则代替结构化字段。"""
     payload = _invoke_json(
-        repair_prompt,
+        repair_prompt + "\n\n" + RUNTIME_GENERATION_GUIDANCE,
         "【用户原始输入】\n"
         f"{user_prompt}\n\n"
         "【不可修改的约束账本】\n"
@@ -380,13 +392,13 @@ def generate_scenario_package(user_prompt: str, scene_override: str = "") -> Sce
     characters = generate_character_specs(user_prompt, brief, world)
     package = ScenarioPackage(brief=brief, world=world, characters=characters)
     normalize_scenario_phase_references(package)
-    issues = validate_scenario_package(package)
+    issues = validate_scenario_package(package, user_prompt=user_prompt)
     for _ in range(scenario_semantic_repair_attempts()):
         if not issues:
             break
         package = repair_scenario_package(user_prompt, package, issues)
         normalize_scenario_phase_references(package)
-        issues = validate_scenario_package(package)
+        issues = validate_scenario_package(package, user_prompt=user_prompt)
     if issues:
         raise ScenarioValidationError(issues)
     return package

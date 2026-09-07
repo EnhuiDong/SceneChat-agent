@@ -892,6 +892,12 @@ def normalize_scenario_phase_references(package: ScenarioPackage) -> None:
     validation to reject.
     """
 
+    from .role_selectors import normalize_role_selectors
+
+    for phase in package.world.phase_specs:
+        phase.actor_roles = normalize_role_selectors(phase.actor_roles)
+    for rule in package.world.rules:
+        rule.allowed_roles = normalize_role_selectors(rule.allowed_roles)
     phases = list(package.world.phases)
     keyed = {phase: _phase_reference_key(phase) for phase in phases}
 
@@ -1010,8 +1016,10 @@ def normalize_scenario_phase_references(package: ScenarioPackage) -> None:
             ability.phases = [resolve(phase) for phase in ability.phases]
 
 
-def validate_scenario_package(package: ScenarioPackage) -> list[str]:
-    issues: list[str] = []
+def validate_scenario_package(package: ScenarioPackage, *, user_prompt: str | None = None) -> list[str]:
+    from .scenario_checks import additional_scenario_issues, rule_actors
+
+    issues: list[str] = additional_scenario_issues(package, user_prompt)
     if not package.world.opening_scene:
         issues.append("缺少可直接运行的 opening_scene")
     if not package.world.public_world_markdown:
@@ -1220,6 +1228,7 @@ def validate_scenario_package(package: ScenarioPackage) -> list[str]:
             if phase.advance_when == "manual" and phase.next_phase:
                 has_transition = any(
                     (not rule.phases or phase.name in rule.phases)
+                    and bool(rule_actors(package, rule, phase))
                     and any(
                         effect.op == "set_phase"
                         and str(effect.value or "") == phase.next_phase

@@ -19,7 +19,7 @@ from scenechat.generation import (
     repair_scenario_package,
     scenario_semantic_repair_attempts,
 )
-from scenechat.knowledge import build_experiment_knowledge_base, requires_vector_index
+from scenechat.knowledge import build_experiment_knowledge_base
 from scenechat.models import Intervention, Message, SimulationState
 from scenechat.observability import director_observability_payload
 from scenechat.interventions import (
@@ -273,6 +273,12 @@ def story_ready_payload(
 
 
 def build_story_events(user_prompt: str, scene_override: str, session_id: str):
+    yield build_progress_event("embedding_preflight", "started")
+    run_stage(
+        session_id, "preflight", BUILD_STAGE_LABELS["embedding_preflight"],
+        validate_embedding_model_availability,
+    )
+    yield build_progress_event("embedding_preflight", "completed")
     yield build_progress_event("generation_preflight", "started")
     run_stage(
         session_id,
@@ -319,7 +325,7 @@ def build_story_events(user_prompt: str, scene_override: str, session_id: str):
     yield build_progress_event("validation", "started")
     package = ScenarioPackage(brief=brief, world=world, characters=characters)
     normalize_scenario_phase_references(package)
-    issues = validate_scenario_package(package)
+    issues = validate_scenario_package(package, user_prompt=user_prompt)
     repair_attempts = 0
     for attempt in range(scenario_semantic_repair_attempts()):
         if not issues:
@@ -342,7 +348,7 @@ def build_story_events(user_prompt: str, scene_override: str, session_id: str):
             lambda: repair_scenario_package(user_prompt, package, issues),
         )
         normalize_scenario_phase_references(package)
-        issues = validate_scenario_package(package)
+        issues = validate_scenario_package(package, user_prompt=user_prompt)
     if issues:
         raise stage_error("scenario_generation", ScenarioValidationError(issues))
     yield build_progress_event(
@@ -357,26 +363,6 @@ def build_story_events(user_prompt: str, scene_override: str, session_id: str):
     characters_markdown = package.characters_markdown
     public_characters = package.public_characters_markdown
     initial_scene = scene_override or package.world.opening_scene
-
-    needs_vector_index = requires_vector_index(
-        public_worldview,
-        characters_markdown,
-        package.world.director_notes_markdown,
-        package.world.facts,
-    )
-    yield build_progress_event(
-        "embedding_preflight",
-        "started" if needs_vector_index else "skipped",
-        reason="长背景需要语义索引" if needs_vector_index else "当前设定可直接注入",
-    )
-    if needs_vector_index:
-        run_stage(
-            session_id,
-            "preflight",
-            BUILD_STAGE_LABELS["embedding_preflight"],
-            validate_embedding_model_availability,
-        )
-        yield build_progress_event("embedding_preflight", "completed")
 
     yield build_progress_event("runtime", "started")
     agents = run_stage(
@@ -542,6 +528,10 @@ def start_story():
 
     try:
         run_stage(
+            session_id, "preflight", BUILD_STAGE_LABELS["embedding_preflight"],
+            validate_embedding_model_availability,
+        )
+        run_stage(
             session_id,
             "preflight",
             BUILD_STAGE_LABELS["generation_preflight"],
@@ -556,18 +546,6 @@ def start_story():
         public_worldview = package.public_worldview_markdown
         characters_markdown = package.characters_markdown
         initial_scene = scene_override or package.world.opening_scene
-        if requires_vector_index(
-            public_worldview,
-            characters_markdown,
-            package.world.director_notes_markdown,
-            package.world.facts,
-        ):
-            run_stage(
-                session_id,
-                "preflight",
-                BUILD_STAGE_LABELS["embedding_preflight"],
-                validate_embedding_model_availability,
-            )
         agents = run_stage(
             session_id,
             "character_parsing",
@@ -858,7 +836,12 @@ def next_story_page_stream():
             page_request["status"] = "retryable"
             raise
         except Exception as exc:
-            page_request["status"] = "retryable"
+            blocked = getattr(state, "run_status", "running") == "blocked"
+            page_request["status"] = "blocked" if blocked else "retryable"
+            if blocked:
+                session["ended"] = True
+                state.revision += 1
+                persist_story_session(session_id, session)
             error = stage_error("simulation", exc)
             app.logger.exception(
                 "story.stream status=failed session=%s page=%s code=%s",
@@ -870,7 +853,7 @@ def next_story_page_stream():
                 "type": "error",
                 "page": next_page_number,
                 "request_id": request_id,
-                "retryable": True,
+                "retryable": not blocked,
                 "committed_count": len(page_request["messages"]),
                 "error": error.to_payload()["error"],
             }, ensure_ascii=False) + "\n"

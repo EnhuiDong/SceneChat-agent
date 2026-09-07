@@ -4,6 +4,7 @@ from typing import Optional, Protocol
 
 from .context import build_agent_view, director_context
 from .config import config_int
+from .errors import SceneChatError
 from .dialogue_quality import (
     inspect_dialogue_intent,
     inspect_narration_event,
@@ -272,6 +273,7 @@ def build_narrator_prompt(
 {guidance_context(state)}
 
 请生成一个符合原题材的简短叙事事件，用于补充环境、节奏、动作结果、中立事件或面向读者的镜头信息。不要替角色说台词，不要强迫角色作出重大决定，不要突然转换题材，也不要无依据加入 AI、未来科技或宏大阴谋。
+旁白不能用反复改写灯光、计时器、涟漪、沉默来占用回合；须回应刚发生的实际行动或提供可观察的新事件。规则宣读、结算等环境阶段应完成该阶段的职责，可以由中立广播说明规则或已发生的结果；不能只写气氛就声称已宣读规则或完成讨论。resolved_beat_ids 缺少实际证据时留空。
 
 {mode_instruction}
 
@@ -594,6 +596,7 @@ def simulate_narration(
     state.record_generation_success()
     applied_guidance_ids = mark_guidance_applied(state)
     intent_payload = resolution.intent.to_dict()
+    intent_payload["narration_phase"] = state.current_phase
     intent_payload["arc_updates"] = {
         "resolved_beat_ids": resolved_beat_ids,
         "tension": parsed["tension"],
@@ -629,8 +632,25 @@ def simulate_next_event(
     director_event = pending_direct_event(state)
     if director_event is not None:
         return intervention_message(state, director_event)
+    state.evaluate_termination()
+    if state.ended:
+        return None
+    scheduler_index = state._scheduler_index
+    decision = (scheduler or SimulationScheduler()).decide(state)
+    if decision.kind == "blocked":
+        state.run_status = "blocked"
+        state.end_kind = "blocked"
+        state.end_reason = decision.reason
+        raise SceneChatError(
+            "simulation_scheduler_blocked",
+            decision.reason + "。请检查场景阶段与角色规则后重新生成；本轮未调用模型。",
+            stage="simulation",
+            status_code=409,
+        )
     guidance_waiting = any(item.status == "pending" for item in active_guidance(state))
-    should_narrate = guidance_waiting or should_insert_narration(state)
+    should_narrate = decision.kind == "agent" and (
+        guidance_waiting or should_insert_narration(state)
+    )
     if should_narrate:
         narration = simulate_narration(
             state,
@@ -640,8 +660,13 @@ def simulate_next_event(
             forced_visibility="public" if guidance_waiting else None,
         )
         if narration is not None:
+            # Inserting a narrator must not consume the selected actor's turn.
+            state._scheduler_index = scheduler_index
+            state.last_scheduler_decision = {
+                "kind": "narration", "actor_name": "", "at_turn": state.turn_count,
+                "reason": "应用导演引导" if guidance_waiting else "按节奏插入环境事件",
+            }
             return narration
-    decision = (scheduler or SimulationScheduler()).decide(state)
     if decision.kind in {"narration", "event"}:
         return simulate_narration(
             state,

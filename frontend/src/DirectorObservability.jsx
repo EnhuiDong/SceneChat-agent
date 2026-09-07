@@ -48,7 +48,7 @@ function SchedulerView({ data, onJumpToEvent }) {
   return <div className="observer-stack">
     <article className="scheduler-explanation">
       <span>最近一次调度</span>
-      <strong>{scheduler.actor_name ? `选择 ${scheduler.actor_name}` : scheduler.kind === "event" ? "处理环境事件" : "等待下一轮"}</strong>
+      <strong>{scheduler.actor_name ? `选择 ${scheduler.actor_name}` : scheduler.kind === "blocked" ? "阶段无法继续" : scheduler.kind === "event" ? "处理环境事件" : "等待下一轮"}</strong>
       <p>{scheduler.reason || "尚未形成调度决策。"}</p>
       {scheduler.thread_id ? <small>关联议题 · {scheduler.thread_id}</small> : null}
       {source ? <div className="source-preview"><b>触发事件</b><span>第 {source.turn} 回合 · {source.speaker}</span><p>{source.speech || source.action}</p><EventButton eventId={source.event_id} onJumpToEvent={onJumpToEvent} /></div> : null}

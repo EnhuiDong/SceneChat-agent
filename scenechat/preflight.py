@@ -69,7 +69,7 @@ def validate_generation_model_availability() -> str:
 
 
 def validate_embedding_model_availability() -> str:
-    """Probe Embedding only when the generated background requires vector RAG."""
+    """Probe the indexing batch API before spending tokens on scenario generation."""
     embedding_model = get_embedding_model()
     try:
         embedding_model.get_text_embedding_batch(

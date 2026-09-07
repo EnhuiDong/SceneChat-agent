@@ -1,8 +1,5 @@
 {
   "llm": {
-    "provider": "dashscope",
-    "api_base": "",
-    "model": "qwen-plus",
     "request_timeout_seconds": 180,
     "max_retries": 1,
     "json_mode": "auto",
@@ -10,9 +7,6 @@
     "enable_thinking": false
   },
   "embedding": {
-    "provider": "dashscope",
-    "api_base": "",
-    "model": "text-embedding-v2",
     "batch_size": 20,
     "request_timeout_seconds": 180,
     "max_retries": 1

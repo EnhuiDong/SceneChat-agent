@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from .models import AgentState, MEMORY_TYPES, SimulationState
+from .role_selectors import matches_role
 
 
 SAFE_FREE_ACTIONS = {"speak", "act", "observe", "pass"}
@@ -167,6 +168,10 @@ class IntentResolver:
             return Resolution(False, "行动者已经离场或失去行动资格", intent)
 
         phase = state.phase_specs.get(state.current_phase)
+        if phase is not None and (
+            phase.event_only or not matches_role(actor.role, phase.actor_roles)
+        ):
+            return Resolution(False, "当前角色不具备本阶段的行动资格", intent)
         allowed_actions = list(getattr(phase, "allowed_action_types", []) or [])
         declared_action_types = (
             SAFE_FREE_ACTIONS
@@ -601,14 +606,20 @@ class IntentResolver:
         patch = StatePatch()
         if visibility == "public":
             for key, value in list(proposed_updates.items())[:30]:
-                if state._valid_world_value(str(key), value):
+                field = state.state_schema.get(str(key))
+                if (
+                    state._valid_world_value(str(key), value)
+                    and (field is None or "public" in field.visibility)
+                    and state.world_state.get(str(key)) != value
+                ):
                     patch.add("set_world", key=str(key), value=value)
             phase = state.phase_specs.get(state.current_phase)
             if phase is not None and (
                 getattr(phase, "event_only", False)
                 or getattr(phase, "advance_when", "") == "after_event"
             ):
-                patch.add("set_phase", value=getattr(phase, "next_phase", ""))
+                if phase.next_phase:
+                    patch.add("set_phase", value=phase.next_phase)
         # Structured rule scenarios end only through deterministic termination
         # rules. Free-form scenes may still use a director-judged natural end.
         has_deterministic_termination = any(
@@ -639,7 +650,7 @@ class IntentResolver:
                 continue
             if rule.phases and state.current_phase not in rule.phases:
                 continue
-            if rule.allowed_roles and actor.role not in rule.allowed_roles:
+            if not matches_role(actor.role, rule.allowed_roles):
                 continue
             return rule
         return None
@@ -741,7 +752,7 @@ class IntentResolver:
         eligible = [
             item.name
             for item in state.agents.values()
-            if item.eligible and (not phase.actor_roles or item.role in phase.actor_roles)
+            if item.eligible and matches_role(item.role, phase.actor_roles)
         ]
         acted = set(state.phase_action_log)
         acted.add(actor.name)
