@@ -21,7 +21,7 @@ const PENDING_BUILD_KEY = "story_pending_build";
 function pendingBuild(prompt, scene) {
   try {
     const saved = JSON.parse(localStorage.getItem(PENDING_BUILD_KEY) || "null");
-    return saved?.prompt === prompt && saved?.scene === scene ? saved.buildId : null;
+    return saved?.prompt === prompt && saved?.scene === scene ? saved : null;
   } catch { return null; }
 }
 
@@ -37,7 +37,7 @@ function BuildPage() {
   const [errorMessage, setErrorMessage] = useState("");
   const [activity, setActivity] = useState(null);
   const [cancelling, setCancelling] = useState(false);
-  const buildIdRef = useRef(pendingBuild(prompt, scene));
+  const buildIdRef = useRef(pendingBuild(prompt, scene)?.buildId || null);
   const [canResume, setCanResume] = useState(Boolean(buildIdRef.current));
   const controllerRef = useRef(null);
   const cancellingRef = useRef(false);
@@ -53,6 +53,12 @@ function BuildPage() {
   useEffect(() => {
     if (!prompt) {
       navigate("/", { replace: true });
+      return;
+    }
+    const pending = pendingBuild(prompt, scene);
+    if (runId === 1 && pending?.resumable === false) {
+      setCanResume(false);
+      setErrorMessage(pending.message || "上次修复未取得进展，请修改设定或模型后重新生成。");
       return;
     }
     const controller = new AbortController();
@@ -80,6 +86,17 @@ function BuildPage() {
           localStorage.setItem(PENDING_BUILD_KEY, JSON.stringify({ buildId: event.build_id, prompt, scene }));
         }
         if (event.type === "build_activity") setActivity(event);
+        if (event.type === "error") {
+          setCanResume(event.resumable !== false);
+          if (event.resumable === false) {
+            // Retain the server checkpoint for inspection, but do not silently
+            // resume the same failed repair when this page mounts again.
+            localStorage.setItem(PENDING_BUILD_KEY, JSON.stringify({
+              buildId: event.build_id, prompt, scene, resumable: false,
+              message: event.error?.message,
+            }));
+          }
+        }
         if (event.type === "build_progress") {
           setStageState((previous) => ({
             ...previous,

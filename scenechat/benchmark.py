@@ -28,11 +28,11 @@ CASES = [
 
 def public_run_metadata():
     # Explicit allowlist: never serialize .env, endpoint URLs or arbitrary config.
-    keys = {"simulation": ("input_budget_bytes", "context_section_bytes", "intent_max_tokens", "narration_max_tokens", "max_turns", "parse_retries", "quality_retries"),
+    keys = {"simulation": ("input_budget_bytes", "context_section_bytes", "intent_max_tokens", "narration_max_tokens", "max_turns", "parse_retries", "quality_retries", "transport_retries", "operation_timeout_seconds", "max_requests_per_operation", "consecutive_fallback_limit"),
             "llm": ("max_retries", "request_timeout_seconds", "json_mode", "enable_thinking")}
     root = Path(__file__).parent
     digest = hashlib.sha256()
-    for name in ("simulation.py", "context.py", "memory.py", "generation.py", "mechanics.py"):
+    for name in ("simulation.py", "context.py", "memory.py", "generation.py", "mechanics.py", "recovery.py", "telemetry.py"):
         digest.update((root / name).read_bytes())
     return {"rubric_version": RUBRIC_VERSION, "prompt_code_sha256": digest.hexdigest(),
             "config": {section: {key: config_value(section, key) for key in names} for section, names in keys.items()}}

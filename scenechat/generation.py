@@ -9,6 +9,8 @@ from World import WORLD_SYSTEM_PROMPT
 from .config import config_int
 from .build_control import BuildControl, CURRENT_BUILD
 from .scenario_patch import apply_scenario_patch
+from .errors import SceneChatError
+from .recovery import fingerprint, is_transient, retry_delay, repair_local_fields
 
 from .providers import get_generation_chat_model
 from .scenario import (
@@ -123,6 +125,7 @@ beat_specs 必须与 target_beats 一一对应并使用稳定 ID。用户明确�
 relationship_dimensions 应选择 2–5 个对本场景真正有用、含义互不重复的主观关系维度，必须兼容题材而不是默认套用猜疑游戏：战斗可使用敌对/协作、威胁判断、敬重或服从；职场可使用合作、可靠判断、影响力；家庭或情感场景可使用亲密、信赖、依赖或边界感。不要把战斗胜负、生命值、距离等客观状态伪装成关系维度。若题材没有特殊需要，可使用 cooperation、confidence、regard 三个通用维度。"""
 
 RUNTIME_GENERATION_GUIDANCE = """
+set_phase 使用 value 存放目标阶段原文，例如 {"op":"set_phase","value":"秘密投票"}；target 不是目标阶段字段。不得写 value=null 再把阶段填入 target。
 结构化协议必须逐字段遵循：effects 是数组，每项操作的 op/key/target/value/amount 均在同一层，禁止嵌套 params、arguments、path 或自造操作（例如 check_condition_and_set）。set_agent_status 只允许 key=alive/active 和布尔 value；其他人物数值放 resources。实体结构必须是 {"实体ID":{"kind":"object或proposal","state":{"状态键":初始值}}}，不得把 state 改叫 properties。地点在 locations、opening_scene 与人物 initial_location 中使用一致的原文名称，不要混用英文 ID 和中文名。
 V2 提案表决的最小操作示例（仅在用户要求此机制时使用，不能强加给其他场景）：先声明 entities={"proposal-A":{"kind":"proposal","state":{"passed":false}}}，对应 rule.action_type=vote、target_scope=proposal、effect_mode=rule、effects=[{"op":"record_vote","target":"$target"},{"op":"settle_votes","target":"$target","key":"passed","amount":2}]。两人投票通过的结束规则为 {"id":"end","kind":"entity_equals","target":"proposal-A","key":"passed","value":true,"description":"提案通过"}。不得增加未经支持的条件脚本或把 passed 当成角色状态。
 运行可达性与人物命名约束：
@@ -211,22 +214,7 @@ def scenario_semantic_repair_attempts() -> int:
 
 
 def _is_transient_transport_error(exc: Exception) -> bool:
-    name = type(exc).__name__.lower()
-    text = str(exc).lower()
-    terminal_markers = (
-        "authentication", "unauthorized", "invalid api key", "invalid_api_key",
-        "insufficient", "quota exhausted", "model not found", "invalid model",
-    )
-    if any(marker in text for marker in terminal_markers):
-        return False
-    return (
-        name in {"apitimeouterror", "apiconnectionerror", "internalservererror"}
-        or any(marker in text for marker in (
-            "timed out", "timeout", "connection reset", "connection error",
-            "temporarily unavailable", "bad gateway", "service unavailable",
-            "gateway timeout", "502", "503", "504",
-        ))
-    )
+    return is_transient(exc)
 
 
 def _invoke_json(
@@ -243,6 +231,15 @@ def _invoke_json(
         with control.activate():
             return _invoke_json(system_prompt, user_prompt, temperature, max_tokens, allow_json_repair, validate_payload)
     control = CURRENT_BUILD.get()
+    key = fingerprint([system_prompt, user_prompt])
+    ledger = control.recovery.setdefault("json", {})
+    failures = ledger.setdefault(key, {"outputs": {}, "count": 0})
+    def check_stalled():
+        if failures["count"] >= 6 or max(failures["outputs"].values(), default=0) >= 2:
+            raise SceneChatError("structured_output_stalled",
+                                 "模型反复返回相同的无效结构，已停止自动重试。请调整模型或设定后重新生成；检查点已保留。",
+                                 stage=control.stage, status_code=422)
+    check_stalled()
     repairs = _repair_attempts("json_repair_retries", 2) if allow_json_repair else 0
     last_error: Exception | None = None
     request_limit = config_int("scenario", "max_requests_per_step", 4, minimum=1, maximum=8)
@@ -295,6 +292,7 @@ def _invoke_json(
                 ):
                     raise
                 control.progress(reason="模型请求超时或连接失败，准备进行一次受预算限制的重试")
+                retry_delay(control, transport_attempt)
             finally:
                 close = getattr(llm, "close", None)
                 if close:
@@ -303,9 +301,16 @@ def _invoke_json(
             payload = extract_json_object(_content(response))
             if validate_payload:
                 validate_payload(payload)
+            ledger.pop(key, None)
+            control.save_recovery()
             return payload
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
             last_error = exc
+            output_key = fingerprint(_content(response))
+            failures["outputs"][output_key] = failures["outputs"].get(output_key, 0) + 1
+            failures["count"] += 1
+            control.save_recovery()
+            check_stalled()
     assert last_error is not None
     raise last_error
 
@@ -322,6 +327,10 @@ def _brief_issues(brief: ScenarioBrief) -> list[str]:
 
 
 def generate_scenario_brief(user_prompt: str, scene_override: str = "") -> ScenarioBrief:
+    def validate_brief(candidate):
+        issues = _brief_issues(ScenarioBrief.from_mapping(candidate))
+        if issues:
+            raise ScenarioValidationError(issues)
     payload = _invoke_json(
         BRIEF_SYSTEM_PROMPT,
         "【用户原始输入】\n"
@@ -330,6 +339,7 @@ def generate_scenario_brief(user_prompt: str, scene_override: str = "") -> Scena
         f"{scene_override or '未填写，由系统从题材中生成'}",
         temperature=0.2,
         max_tokens=4000,
+        validate_payload=validate_brief,
     )
     brief = ScenarioBrief.from_mapping(payload)
     if scene_override.strip():
@@ -348,6 +358,7 @@ def generate_scenario_brief(user_prompt: str, scene_override: str = "") -> Scena
             "只修复这些错误，不得丢失用户原文约束。",
             temperature=0.0,
             max_tokens=4000,
+            validate_payload=validate_brief,
         )
         brief = ScenarioBrief.from_mapping(repair_payload)
         if scene_override.strip():
@@ -381,6 +392,14 @@ def generate_character_specs(
     brief: ScenarioBrief,
     world: WorldSpec,
 ) -> list[CharacterSpec]:
+    def validate_characters(candidate):
+        characters = candidate.get("characters")
+        if not isinstance(characters, list) or len(characters) != brief.requested_character_count:
+            raise ScenarioValidationError([f"/characters 必须是包含 {brief.requested_character_count} 名角色的数组"])
+        for index, item in enumerate(characters, 1):
+            if not isinstance(item, dict):
+                raise ScenarioValidationError([f"/characters/{index - 1} 必须是角色对象"])
+            CharacterSpec.from_mapping(item, index)
     payload = _invoke_json(
         f"{CHARACTER_SYSTEM_PROMPT}\n\n{CHARACTER_JSON_INSTRUCTION}\n\n{RUNTIME_GENERATION_GUIDANCE}",
         "【用户原始输入——所有明确细节均为最高级约束】\n"
@@ -391,6 +410,7 @@ def generate_character_specs(
         f"{json.dumps(asdict(world), ensure_ascii=False, indent=2)}",
         temperature=0.75,
         max_tokens=16000,
+        validate_payload=validate_characters,
     )
     raw_characters = payload.get("characters")
     if not isinstance(raw_characters, list):
@@ -416,6 +436,8 @@ path 使用 JSON Pointer，数字为从 0 开始的数组索引。仅可修改 /
 所有 covered_constraint_ids 必须真实对应其落实位置。公共世界仍不得包含导演秘密。
 如果错误涉及规则运行时，只修改报错涉及的 phase_specs、rules、state_schema、entities 或 termination_rules，以及必要关联。termination_rules.kind 只支持 faction_eliminated、faction_parity、world_equals、entity_equals、all_goals_completed、all_active_at_location、all_of、any_of、manual；禁止创造 ai_win、human_win、entity_state_equals 等新 kind。all_of/any_of 必须有非空 conditions。角色阶段保留 pass/observe/speak/act 至少一种兜底；manual 且有 next_phase 时必须有可执行 set_phase 规则。
 严格保留 world.execution_version。版本1才有 move/vote/inspect/protect/eliminate/poison/heal 的隐式内置效果。版本2行动名称没有隐式结果，必须填写白名单 effects；effect_mode=rule/ability/stack 控制来源，不得为了修复把正常 effects 清空。legacy_tabletop 仅可显式用于用户确实要求的传统桌游机制，不能套到会议、医疗、战斗等场景。consume_ability 由引擎处理，不得重复填写。禁止脚本、条件表达式和未支持操作，不要退回自然语言规则冒充可执行字段。"""
+    control = CURRENT_BUILD.get()
+    history = (control.recovery.get("semantic", {}).get("history", [])[-3:] if control else [])
     payload = _invoke_json(
         repair_prompt + "\n\n" + RUNTIME_GENERATION_GUIDANCE,
         "【用户原始输入】\n"
@@ -424,6 +446,8 @@ path 使用 JSON Pointer，数字为从 0 开始的数组索引。仅可修改 /
         f"{json.dumps(package.brief.to_dict(), ensure_ascii=False, indent=2)}\n\n"
         "【校验错误】\n"
         f"{json.dumps(issues, ensure_ascii=False, indent=2)}\n\n"
+        "【先前修复结果（不要重复无进展方案）】\n"
+        f"{json.dumps(history, ensure_ascii=False)}\n\n"
         "【待修复结果】\n"
         f"{json.dumps(package.to_dict(), ensure_ascii=False, indent=2)}",
         temperature=0.2,
@@ -435,6 +459,62 @@ path 使用 JSON Pointer，数字为从 0 开始的数组索引。仅可修改 /
     if control:
         control.progress(patched_paths=[item["path"] for item in payload["changes"]])
     return result
+
+
+def validate_and_repair_package(user_prompt, package, *, save=None, repair=None):
+    """Keep the best checkpoint; semantic retries must improve validation."""
+    if CURRENT_BUILD.get() is None:
+        with BuildControl().activate():
+            return validate_and_repair_package(user_prompt, package, save=save, repair=repair)
+    control = CURRENT_BUILD.get()
+    save = save or (lambda value: None)
+    repair = repair or repair_scenario_package
+    normalize_scenario_phase_references(package)
+    package, changes = repair_local_fields(package)
+    save(package)
+    issues = validate_scenario_package(package, user_prompt=user_prompt)
+    ledger = control.recovery.setdefault("semantic", {"attempts": 0, "no_progress": 0, "history": []})
+    attempts = 0
+    if changes:
+        control.progress(reason="已本地纠正明确的字段错位，无需请求模型",
+                         patched_paths=[item["path"] for item in changes])
+    def check_stalled():
+        if ledger["no_progress"] >= 2 or ledger["attempts"] >= config_int(
+                "scenario", "semantic_total_attempts", 6, minimum=1, maximum=12):
+            raise SceneChatError("scenario_repair_stalled",
+                                 "一致性修复未取得进展或已达累计上限，已保留较好的检查点。请修改设定或模型后重新生成；重复继续不会再调用修复模型。",
+                                 stage="validation", status_code=422)
+    for _ in range(scenario_semantic_repair_attempts()):
+        if not issues:
+            break
+        check_stalled()
+        control.progress(repair_attempt=ledger["attempts"] + 1, issue_count=len(issues), issues=issues[:30],
+                         reason="按具体校验错误进行局部修复，并比较修复前后结果")
+        # A transport failure does not count as a semantic result.
+        candidate = repair(user_prompt, package, issues)
+        normalize_scenario_phase_references(candidate)
+        candidate, _ = repair_local_fields(candidate)
+        candidate_issues = validate_scenario_package(candidate, user_prompt=user_prompt)
+        improved = set(candidate_issues) < set(issues) and fingerprint(candidate.to_dict()) != fingerprint(package.to_dict())
+        ledger["attempts"] += 1
+        attempts += 1
+        ledger["no_progress"] = 0 if improved else ledger["no_progress"] + 1
+        ledger["history"].append({"before_issues": issues[:30], "after_issues": candidate_issues[:30],
+                                  "accepted": improved,
+                                  "patched_paths": control.details.get("patched_paths", [])})
+        ledger["history"] = ledger["history"][-6:]
+        if improved:
+            package, issues = candidate, candidate_issues
+            save(package)
+        control.save_recovery()
+        if issues:
+            check_stalled()
+    if issues:
+        check_stalled()
+        raise ScenarioValidationError(issues)
+    ledger["no_progress"] = 0
+    control.save_recovery()
+    return package, attempts + bool(changes)
 
 
 def generate_scenario_package(user_prompt: str, scene_override: str = "") -> ScenarioPackage:
@@ -450,14 +530,4 @@ def generate_scenario_package(user_prompt: str, scene_override: str = "") -> Sce
     characters = generate_character_specs(user_prompt, brief, world)
     control.begin_step("validation")
     package = ScenarioPackage(brief=brief, world=world, characters=characters)
-    normalize_scenario_phase_references(package)
-    issues = validate_scenario_package(package, user_prompt=user_prompt)
-    for _ in range(scenario_semantic_repair_attempts()):
-        if not issues:
-            break
-        package = repair_scenario_package(user_prompt, package, issues)
-        normalize_scenario_phase_references(package)
-        issues = validate_scenario_package(package, user_prompt=user_prompt)
-    if issues:
-        raise ScenarioValidationError(issues)
-    return package
+    return validate_and_repair_package(user_prompt, package)[0]

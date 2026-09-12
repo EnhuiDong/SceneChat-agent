@@ -1,4 +1,5 @@
 import json
+import inspect
 import re
 from typing import Optional, Protocol
 
@@ -31,6 +32,7 @@ from .scenario import extract_json_object
 from .scheduler import SimulationScheduler
 from .telemetry import complete
 from .mechanics import visible_entities, action_context
+from .recovery import bounded_operation
 
 
 MAX_VISIBLE_OBSERVATIONS = 15
@@ -355,6 +357,7 @@ def parse_narrator_event(raw: str) -> Optional[dict]:
     }
 
 
+@bounded_operation("simulation")
 def simulate_next_turn(
     state: SimulationState,
     knowledge_base: AgentKnowledge,
@@ -376,16 +379,26 @@ def simulate_next_turn(
         f"活跃议题：{'；'.join(thread.topic for thread in state.active_threads_for(agent.name)[:4]) or '无'}\n"
         f"可选择插话数：{len(agent.conversation_opportunities)}"
     )
+    retrieve = knowledge_base.retrieve_for_agent
     try:
+        signature = inspect.signature(retrieve)
+    except (ValueError, TypeError):
+        signature = None
+    legacy_retrieval = False
+    if signature is not None:
+        try:
+            signature.bind(agent.name, query, role=agent.role, location=agent.current_location)
+        except TypeError:
+            legacy_retrieval = True
+    if legacy_retrieval:
+        retrieved_context = retrieve(agent.name, query)
+    else:
         retrieved_context = knowledge_base.retrieve_for_agent(
             agent.name,
             query,
             role=agent.role,
             location=agent.current_location,
         )
-    except TypeError:
-        # Compatibility for older custom knowledge-base implementations.
-        retrieved_context = knowledge_base.retrieve_for_agent(agent.name, query)
     prompt = build_agent_prompt(state, agent, retrieved_context)
     active_llm = llm or get_simulation_llm()
     active_resolver = resolver or IntentResolver()
@@ -414,21 +427,25 @@ def simulate_next_turn(
                 and not str(response.text or "").rstrip().endswith("}")
             )
             code = "intent_json_truncated" if truncated else "intent_json_invalid"
-            should_retry = attempt < retries
+            should_retry = attempt < _single_retry_setting("parse_retries")
             state.record_structured_output_issue(code, retried=should_retry)
             rejection = (
                 "Intent JSON 输出被截断。省略所有没有变化的可选字段，优先闭合一个简短 JSON 对象。"
                 if truncated else
                 "输出不是合法的 Intent JSON。只输出一个 JSON 对象，并省略未使用的可选字段。"
             )
+            if not should_retry:
+                break
             continue
         intent = Intent.from_mapping(agent.name, parsed)
         resolution = active_resolver.resolve(state, intent)
         if not resolution.accepted:
             state.record_structured_output_issue(
-                "intent_rule_rejected", retried=attempt < retries
+                "intent_rule_rejected", retried=attempt < _single_retry_setting("quality_retries")
             )
             rejection = resolution.reason
+            if attempt >= _single_retry_setting("quality_retries"):
+                break
             continue
         quality_issues = inspect_dialogue_intent(state, agent, intent)
         if quality_issues:
@@ -437,12 +454,14 @@ def simulate_next_turn(
                 f"{quality_retry_instruction(quality_issues)}\n"
                 "保持人物目标和行动方向不变，只修正上述问题。"
             )
-            should_retry = attempt < retries
+            should_retry = attempt < _single_retry_setting("quality_retries")
             state.record_dialogue_quality_issues(
                 [issue.code for issue in quality_issues],
                 retried=should_retry,
             )
             if should_retry or any(issue.hard for issue in quality_issues):
+                if not should_retry:
+                    break
                 continue
         state.record_generation_success()
         return _message_from_resolution(state, agent, intent, resolution)
@@ -455,8 +474,7 @@ def simulate_next_turn(
         fallback_resolution = active_resolver.resolve(state, fallback_intent)
         if fallback_resolution.accepted and fallback_intent.reply_to_event_id:
             state.record_structured_output_fallback()
-            state.record_generation_success()
-            return _message_from_resolution(
+            return _fallback_message(
                 state,
                 agent,
                 fallback_intent,
@@ -476,8 +494,7 @@ def simulate_next_turn(
         fallback_resolution = active_resolver.resolve(state, fallback_intent)
         if fallback_resolution.accepted:
             state.record_structured_output_fallback()
-            state.record_generation_success()
-            return _message_from_resolution(
+            return _fallback_message(
                 state,
                 agent,
                 fallback_intent,
@@ -485,6 +502,28 @@ def simulate_next_turn(
             )
     state.record_generation_failure()
     return None
+
+
+def _fallback_message(state, agent, intent, resolution):
+    # Narrator inserts must not hide a sequence of failed actor generations.
+    count = 1
+    for previous in reversed(state.history):
+        if previous.kind == "intervention":
+            break
+        if previous.speaker not in state.agents:
+            continue
+        if not previous.intent.get("generation_fallback"):
+            break
+        count += 1
+    limit = config_int("simulation", "consecutive_fallback_limit", 3, minimum=1, maximum=6)
+    state.failed_generation_count = count
+    if count >= limit:
+        state.run_status = "blocked"
+        state.end_kind = "blocked"
+        state.end_reason = f"连续 {count} 次角色生成只能采用安全兜底，已暂停以避免无效推演。请检查模型配置后，从暂停前的检查点创建分支继续，或调整设定重新生成。"
+    message = _message_from_resolution(state, agent, intent, resolution)
+    message.intent["generation_fallback"] = True
+    return message
 
 
 def _message_from_resolution(state, agent, intent, resolution) -> Message:
@@ -507,6 +546,7 @@ def _message_from_resolution(state, agent, intent, resolution) -> Message:
     )
 
 
+@bounded_operation("simulation")
 def simulate_narration(
     state: SimulationState,
     knowledge_base: AgentKnowledge,
@@ -578,10 +618,13 @@ def simulate_narration(
                 and not str(response.text or "").rstrip().endswith("}")
             )
             code = "narration_json_truncated" if truncated else "narration_json_invalid"
-            state.record_structured_output_issue(code, retried=attempt < retries)
+            should_retry = attempt < _single_retry_setting("parse_retries")
+            state.record_structured_output_issue(code, retried=should_retry)
             rejection = "旁白 JSON 被截断，请缩短 narration 并闭合 JSON。" if truncated else (
                 "旁白不是合法 JSON，请严格按 schema 输出。"
             )
+            if not should_retry:
+                break
             continue
         quality_issues = inspect_narration_event(
             state,
@@ -589,7 +632,7 @@ def simulate_narration(
             visibility=visibility,
         )
         if quality_issues:
-            should_retry = attempt < retries
+            should_retry = attempt < _single_retry_setting("quality_retries")
             state.record_narration_quality_issues(
                 [issue.code for issue in quality_issues],
                 retried=should_retry,
@@ -597,6 +640,8 @@ def simulate_narration(
             rejection = quality_retry_instruction(quality_issues)
             if should_retry or any(issue.hard for issue in quality_issues):
                 parsed = None
+                if not should_retry:
+                    break
                 continue
         break
     if parsed is None:
@@ -645,6 +690,7 @@ def simulate_narration(
     )
 
 
+@bounded_operation("simulation")
 def simulate_next_event(
     state: SimulationState,
     knowledge_base: AgentKnowledge,

@@ -25,6 +25,8 @@ class BuildControl:
         self.step_requests = 0
         self.guard = None
         self.model_requests = []
+        self.recovery = {}
+        self.save_recovery = lambda: None
 
     def check(self):
         if self.guard:
@@ -32,6 +34,10 @@ class BuildControl:
         if self.cancelled.is_set():
             raise SceneChatError("build_cancelled", "构建已取消，已完成的检查点已保留。", stage=self.stage, status_code=409)
         if time.monotonic() >= min(self.deadline, self.step_deadline):
+            if self.stage in {"simulation", "intervention"}:
+                raise SceneChatError("operation_deadline_exceeded",
+                                     "本次推演或干预预检已达到时间上限，已停止请求；已提交的剧情保留，可检查服务后重试。",
+                                     stage=self.stage, status_code=504)
             raise SceneChatError("build_deadline_exceeded", "构建已达到时间预算，已完成的检查点已保留，可从断点继续。", stage=self.stage, status_code=504)
 
     def begin_step(self, stage):

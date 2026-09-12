@@ -34,9 +34,19 @@ def measured_call(records, *, stage, purpose, model, operation):
 
 def complete(state, llm, prompt, *, purpose, max_tokens):
     from .context_budget import enforce
+    from .build_control import CURRENT_BUILD
+    from .config import config_int
+    from .recovery import bounded_operation, transport_call
+    if CURRENT_BUILD.get() is None:
+        return bounded_operation("simulation")(complete)(state, llm, prompt, purpose=purpose, max_tokens=max_tokens)
     enforce(prompt)
-    return measured_call(
-        state.model_requests, stage="simulation", purpose=purpose,
-        model=getattr(llm, "model_name", "configured"),
-        operation=lambda: llm.complete(prompt, max_tokens=max_tokens),
+    return transport_call(
+        lambda: measured_call(
+            state.model_requests, stage=CURRENT_BUILD.get().stage, purpose=purpose,
+            model=getattr(llm, "model_name", "configured"),
+            operation=lambda: llm.complete(prompt, max_tokens=max_tokens)),
+        control=CURRENT_BUILD.get(),
+        retries=0 if purpose == "beat_verification" else config_int(
+            "simulation", "transport_retries", 1, minimum=0, maximum=2),
+        limit=config_int("simulation", "max_requests_per_operation", 5, minimum=1, maximum=10),
     )

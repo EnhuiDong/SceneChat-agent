@@ -19,7 +19,7 @@ from scenechat.generation import (
     generate_scenario_brief,
     generate_world_spec,
     repair_scenario_package,
-    scenario_semantic_repair_attempts,
+    validate_and_repair_package,
 )
 from scenechat.knowledge import build_experiment_knowledge_base
 from scenechat.models import Intervention, Message, SimulationState
@@ -42,10 +42,7 @@ from scenechat.scenario import (
     ScenarioBrief,
     WorldSpec,
     CharacterSpec,
-    ScenarioValidationError,
     agents_from_character_specs,
-    normalize_scenario_phase_references,
-    validate_scenario_package,
 )
 from scenechat.simulation import simulate_next_event
 from scenechat.storage import save_experiment_documents
@@ -371,38 +368,11 @@ def build_story_events(user_prompt: str, scene_override: str, session_id: str):
     yield build_progress_event("validation", "started")
     checkpoint = getattr(control, "checkpoint", {})
     package = scenario_from_dict(checkpoint["package"]) if "package" in checkpoint else ScenarioPackage(brief=brief, world=world, characters=characters)
-    normalize_scenario_phase_references(package)
-    save_package(package)
-    issues = validate_scenario_package(package, user_prompt=user_prompt)
-    repair_attempts = 0
-    for attempt in range(scenario_semantic_repair_attempts()):
-        if not issues:
-            break
-        repair_attempts += 1
-        if control:
-            control.progress(repair_attempt=repair_attempts, issue_count=len(issues), issues=issues[:30])
-        app.logger.info("story.repair session=%s attempt=%d issues=%s", session_id, repair_attempts, issues)
-        yield build_progress_event(
-            "validation",
-            "started",
-            reason=(
-                f"发现 {len(issues)} 项可修复问题，正在自动修复 "
-                f"{attempt + 1}/{scenario_semantic_repair_attempts()}"
-            ),
-            repair_attempt=attempt + 1,
-            issue_count=len(issues),
-        )
-        package = run_stage(
-            session_id,
-            "scenario_generation",
-            "结构化场景局部修复",
-            lambda: repair_scenario_package(user_prompt, package, issues),
-        )
-        normalize_scenario_phase_references(package)
-        save_package(package)
-        issues = validate_scenario_package(package, user_prompt=user_prompt)
-    if issues:
-        raise stage_error("scenario_generation", ScenarioValidationError(issues))
+    package, repair_attempts = run_stage(
+        session_id, "scenario_generation", "结构化场景局部修复",
+        lambda: validate_and_repair_package(user_prompt, package, save=save_package,
+                                            repair=repair_scenario_package),
+    )
     yield build_progress_event(
         "validation",
         "completed",

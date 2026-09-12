@@ -7,6 +7,8 @@ from typing import Any
 
 from .context import director_context
 from .models import Intervention, Message, SimulationState
+from .recovery import bounded_operation
+from .telemetry import complete
 
 
 INTERVENTION_PROMPT = """你是互动故事的导演指令分析器。用户希望干预已经开始的剧情。
@@ -215,6 +217,7 @@ def validate_intervention(state: SimulationState, intervention: Intervention) ->
     return intervention
 
 
+@bounded_operation("intervention")
 def preview_intervention(
     state: SimulationState,
     raw_text: str,
@@ -238,8 +241,30 @@ def preview_intervention(
         f"【用户干预】\n{raw_text}\n\n"
         f"【作用范围】\n{scope}"
     )
-    response = llm.complete(f"{INTERVENTION_PROMPT}\n\n{user_prompt}", max_tokens=900)
-    payload = _extract_json(response.text)
+    from .config import config_int
+    retries = config_int("simulation", "parse_retries", 1, minimum=0, maximum=1)
+    correction = ""
+    for attempt in range(retries + 1):
+        response = complete(state, llm, f"{INTERVENTION_PROMPT}\n\n{user_prompt}{correction}",
+                            purpose="intervention_preview", max_tokens=900)
+        try:
+            payload = _extract_json(response.text)
+            if not isinstance(payload, dict) or payload.get("mode") not in {"guidance", "event", "override"}:
+                raise ValueError("缺少合法 mode；必须是 guidance、event 或 override")
+            for field in ("normalized_directive", "event_narration", "visibility"):
+                if field in payload and not isinstance(payload[field], str):
+                    raise ValueError(f"{field} 必须是字符串")
+            for field in ("proposed_patch", "conflicts"):
+                if field in payload and (not isinstance(payload[field], list)
+                                         or any(not isinstance(item, dict) for item in payload[field])):
+                    raise ValueError(f"{field} 必须是对象数组")
+            if not str(payload.get("normalized_directive") or payload.get("event_narration") or "").strip():
+                raise ValueError("必须提供 normalized_directive 或 event_narration")
+            break
+        except (ValueError, TypeError) as exc:
+            if attempt >= retries:
+                raise
+            correction = f"\n【结构修复】上次预检结构无效：{str(exc)[:400]}。只修复 JSON，不得扩大用户干预。"
     payload.update({
         "raw_text": raw_text,
         "scope": scope,

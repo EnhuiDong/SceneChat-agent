@@ -7,6 +7,7 @@ import uuid
 
 from .build_control import BuildControl
 from .errors import SceneChatError, stage_error
+from .recovery import recovery_advice
 
 
 class BuildJobs:
@@ -18,8 +19,16 @@ class BuildJobs:
 
     def start(self, prompt, scene, build_id=None):
         store = self.store_getter()
-        if build_id and store.load_build(build_id) is None:
+        previous = store.load_build(build_id) if build_id else None
+        if build_id and previous is None:
             raise SceneChatError("build_not_found", "构建检查点不存在，请重新开始。", stage="request", status_code=404)
+        if (previous and previous["status"] == "failed"
+                and previous["payload"].get("last_error", {}).get("resumable") is False
+                and previous["payload"].get("prompt") == prompt and previous["payload"].get("scene") == scene):
+            # Check before preflight: a stalled repair is not a transient outage.
+            def stopped():
+                yield {"type": "error", "build_id": build_id, **previous["payload"]["last_error"]}
+            return stopped()
         build_id = build_id or str(uuid.uuid4())
         owner = str(uuid.uuid4())
         events = queue.Queue()
@@ -32,6 +41,7 @@ class BuildJobs:
             raise SceneChatError(code, message, stage="request", status_code=409) from exc
         control.checkpoint = payload["checkpoint"]
         control.model_requests = payload.setdefault("model_requests", [])
+        control.recovery = payload.setdefault("recovery", {})
         control.owner = owner
         last_guard = [0.0]
 
@@ -53,6 +63,12 @@ class BuildJobs:
                 control.check()
 
         control.save_checkpoint = save_checkpoint
+        def save_recovery():
+            control.check()
+            if not store.update_build(build_id, owner, payload):
+                control.cancelled.set()
+                control.check()
+        control.save_recovery = save_recovery
         with self.lock:
             self.active[build_id] = control
 
@@ -66,10 +82,11 @@ class BuildJobs:
                     store.update_build(build_id, owner, payload, "completed")
             except Exception as exc:
                 error = stage_error("scenario_generation", exc)
+                payload["last_error"] = {**error.to_payload(), **recovery_advice(error)}
                 status = "cancelled" if control.cancelled.is_set() else "failed"
                 store.update_build(build_id, owner, payload, status)
                 events.put({"type": "error", "build_id": build_id,
-                            "resumable": True, "error": error.to_payload()["error"]})
+                            **recovery_advice(error), "error": error.to_payload()["error"]})
             finally:
                 with self.lock:
                     if self.active.get(build_id) is control:

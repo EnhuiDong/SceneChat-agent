@@ -5,6 +5,7 @@ import asyncio
 
 from .build_control import CURRENT_BUILD, await_controlled
 from .config import config_int
+from .recovery import transport_call
 
 from llama_index.core.base.embeddings.base import BaseEmbedding, Embedding
 from llama_index.core.bridge.pydantic import PrivateAttr
@@ -49,7 +50,9 @@ class OpenAICompatibleEmbedding(BaseEmbedding):
                 model=self.model_name, input=texts, encoding_format="float",
             )
         else:
-            response = asyncio.run(self._controlled_embed(texts, control))
+            response = transport_call(lambda: asyncio.run(self._controlled_embed(texts, control)),
+                                      control=control, retries=0 if "preflight" in control.stage else config_int(
+                                          "embedding", "max_retries", 1, minimum=0, maximum=2))
         data = list(getattr(response, "data", None) or [])
         ordered = sorted(
             enumerate(data),

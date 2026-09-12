@@ -83,6 +83,7 @@ def verify_narrative_candidates(state, llm, requested):
         deadline = time.monotonic() + config_int("simulation", "beat_verification_timeout_seconds", 45, minimum=5, maximum=120)
         control.deadline = control.step_deadline = min(deadline, parent.deadline, parent.step_deadline) if parent else deadline
         control.guard = parent.check if parent else None
+        control.request_owner = getattr(parent, "request_owner", parent) if parent else control
         with control.activate():
             response = complete(state, llm, prompt, purpose="beat_verification", max_tokens=config_int("simulation", "beat_verification_max_tokens", 700, minimum=200, maximum=1200))
         data = extract_json_object(response.text)

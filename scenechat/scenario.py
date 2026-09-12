@@ -1262,7 +1262,9 @@ def validate_scenario_package(package: ScenarioPackage, *, user_prompt: str | No
                 )
                 if not has_transition:
                     issues.append(
-                        f"手动阶段“{phase.name}”没有通往“{phase.next_phase}”的可执行 set_phase 规则"
+                        f"手动阶段“{phase.name}”没有通往“{phase.next_phase}”的可执行 set_phase 规则；"
+                        f"/world/rules/<索引>/effects/<索引>/value 必须为 {phase.next_phase!r}（不是 target），"
+                        "且规则的 action_type、phases、allowed_roles 必须允许本阶段的真实角色执行"
                     )
         factions = {
             character.faction.strip()

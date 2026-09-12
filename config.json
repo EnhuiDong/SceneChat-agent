@@ -14,6 +14,7 @@
   "scenario": {
     "json_repair_retries": 2,
     "semantic_repair_retries": 2,
+    "semantic_total_attempts": 6,
     "transport_retries": 1,
     "step_timeout_seconds": 240,
     "build_timeout_seconds": 600,
@@ -26,6 +27,10 @@
     "context_section_bytes": 6000,
     "parse_retries": 1,
     "quality_retries": 1,
+    "transport_retries": 1,
+    "max_requests_per_operation": 5,
+    "operation_timeout_seconds": 180,
+    "consecutive_fallback_limit": 3,
     "intent_max_tokens": 900,
     "narration_max_tokens": 480,
     "beat_verification_max_tokens": 700,

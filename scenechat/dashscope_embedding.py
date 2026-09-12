@@ -5,11 +5,20 @@ from llama_index.embeddings.dashscope import DashScopeEmbedding
 from .errors import classify_provider_error
 from .build_control import CURRENT_BUILD, await_controlled
 from .config import config_int
+from .recovery import transport_call
 import asyncio
 
 
 class CheckedDashScopeEmbedding(DashScopeEmbedding):
     def _checked_embeddings(self, texts: list[str], text_type: str) -> list[list[float]]:
+        control = CURRENT_BUILD.get()
+        if control is None:
+            return self._embedding_request(texts, text_type)
+        return transport_call(lambda: self._embedding_request(texts, text_type), control=control,
+                              retries=0 if "preflight" in control.stage else config_int(
+                                  "embedding", "max_retries", 1, minimum=0, maximum=2))
+
+    def _embedding_request(self, texts: list[str], text_type: str) -> list[list[float]]:
         import dashscope
 
         control = CURRENT_BUILD.get()
@@ -38,6 +47,7 @@ class CheckedDashScopeEmbedding(DashScopeEmbedding):
             cause = RuntimeError(
                 f"{response.status_code} {response.code}: {response.message}"
             )
+            cause.status_code = response.status_code
             raise classify_provider_error(cause, service="向量模型") from cause
         output = response.output or {}
         rows = sorted(output.get("embeddings") or [], key=lambda item: item["text_index"])

@@ -58,6 +58,7 @@ def classify_provider_error(
 ) -> SceneChatError:
     """Translate provider-specific failures without exposing raw responses."""
     text = str(exc).lower()
+    status = getattr(exc, "status_code", None)
     service_code = "embedding" if service == "向量模型" else "generation_model"
 
     quota_markers = (
@@ -100,14 +101,14 @@ def classify_provider_error(
             stage=stage,
             cause=exc,
         )
-    if any(marker in text for marker in auth_markers):
+    if status in {401, 403} or any(marker in text for marker in auth_markers):
         return SceneChatError(
             f"{service_code}_authentication_failed",
             f"{service}认证失败，请检查 API Key 是否正确且具有该模型的访问权限。",
             stage=stage,
             cause=exc,
         )
-    if any(marker in text for marker in model_markers):
+    if status == 404 or any(marker in text for marker in model_markers):
         return SceneChatError(
             f"{service_code}_not_found",
             f"配置的{service}不存在或当前账户无权使用，请检查模型名称和访问权限。",
@@ -172,6 +173,11 @@ STAGE_MESSAGES = {
 def stage_error(stage: str, exc: Exception) -> SceneChatError:
     if isinstance(exc, SceneChatError):
         return exc
+    from .recovery import is_transient
+    if is_transient(exc) or getattr(exc, "status_code", None) is not None or any(
+            marker in str(exc).lower() for marker in (
+                "allocationquota", "insufficient_quota", "quota exhausted", "invalid_api_key", "unauthorized")):
+        return classify_provider_error(exc, service="向量模型" if stage == "index" else "生成模型", stage=stage)
     code, message = STAGE_MESSAGES.get(
         stage,
         ("internal_error", "服务暂时无法完成请求，请稍后重试。"),
