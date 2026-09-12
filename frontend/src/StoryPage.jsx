@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { getApiErrorMessage, readApiError } from "./apiErrors";
-import { clearStoryStorage, loadStoredScenario } from "./scenarioStorage";
+import { clearStoryStorage, loadStoredScenario, saveStorySetup } from "./scenarioStorage";
+import { CheckpointBranches, EventChanges } from "./SessionTools";
 import {
   cancelStoryIntervention,
   confirmStoryIntervention,
@@ -12,7 +13,9 @@ import {
 } from "./storyApi";
 import { loadPageIndex, loadStoryPages } from "./storyStorage";
 import DirectorObservability from "./DirectorObservability";
+import BeatProgress from "./BeatProgress";
 import "./StoryPage.css";
+import "./SessionTools.css";
 
 const ROLE_COLORS = ["#44705a", "#8a5d3b", "#596b98", "#8b536b", "#6f6740", "#4f7180", "#795487", "#89704c"];
 
@@ -21,7 +24,7 @@ function roleColor(name = "") {
   return ROLE_COLORS[hash % ROLE_COLORS.length];
 }
 
-function MessageCard({ message, skipToken, focused }) {
+function MessageCard({ message, skipToken, focused, sessionId }) {
   const fullText = message.display_text || "";
   const instant = Boolean(message.replayed || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches || !fullText);
   const [visibleText, setVisibleText] = useState(instant ? fullText : "");
@@ -47,6 +50,7 @@ function MessageCard({ message, skipToken, focused }) {
       <header><span className="speaker-dot" /> <strong>{message.speaker || "旁白"}</strong><small>{kindLabel}</small></header>
       {message.action ? <p className="message-action">{message.action}</p> : null}
       <p>{renderedText}{renderedText.length < fullText.length ? <span className="typing-caret" /> : null}</p>
+      <EventChanges sessionId={sessionId} message={message} />
     </article>
   );
 }
@@ -64,7 +68,10 @@ function StoryPage() {
   const [snapshotReady, setSnapshotReady] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
-  const [pausedPage, setPausedPage] = useState(null);
+  const [pausedPage, setPausedPage] = useState(() => {
+    const index = initialPages.findIndex(p => ["retryable", "in_progress"].includes(p.requestStatus));
+    return index < 0 ? null : { index, page: initialPages[index].page };
+  });
   const [errorMessage, setErrorMessage] = useState("");
   const [showQuitModal, setShowQuitModal] = useState(false);
   const [selectedCharacterId, setSelectedCharacterId] = useState("");
@@ -102,7 +109,6 @@ function StoryPage() {
     if (item.scope === "persistent") return true;
     return item.scope === "turns" && snapshot.turn_count - item.applied_at_turn < (item.expires_after_turns || 1);
   });
-  const progressPercent = Math.round((snapshot.arc_state?.progress || 0) * 100);
 
   useEffect(() => { localStorage.setItem("story_pages", JSON.stringify(pages)); }, [pages]);
   useEffect(() => { localStorage.setItem("current_page_index", String(currentPageIndex)); }, [currentPageIndex]);
@@ -147,7 +153,7 @@ function StoryPage() {
     const existingPage = pages[targetIndex];
     const requestId = existingPage?.requestId || globalThis.crypto?.randomUUID?.() || `${sessionId}-${pageNumber}-${Date.now()}`;
     const baseMessages = existingPage?.messages || [];
-    const pendingPage = { page: pageNumber, messages: baseMessages, isEnd: false, requestId, runStatus: "running" };
+    const pendingPage = { page: pageNumber, messages: baseMessages, isEnd: false, requestId, runStatus: "running", requestStatus: "in_progress" };
     setPages((previous) => { const next = [...previous]; next[targetIndex] = pendingPage; return next; });
     setCurrentPageIndex(targetIndex);
     localStorage.setItem("story_pending_page_request", JSON.stringify({ requestId, page: pageNumber }));
@@ -167,6 +173,7 @@ function StoryPage() {
       streamReaderRef.current = reader;
       const decoder = new TextDecoder("utf-8");
       let buffer = "";
+      let pageCompleted = false;
       const consume = (line) => {
         if (!line.trim()) return;
         const event = JSON.parse(line);
@@ -182,6 +189,7 @@ function StoryPage() {
             turn_count: event.turn_count ?? previous.turn_count,
             current_phase: event.current_phase || previous.current_phase,
             world_state: event.world_state || previous.world_state,
+            arc_state: event.arc_state || previous.arc_state,
             director_observability: {
               ...(previous.director_observability || {}),
               ...(event.director_observability || {}),
@@ -189,8 +197,9 @@ function StoryPage() {
           }));
         }
         if (event.type === "page_done") {
+          pageCompleted = true;
           localStorage.removeItem("story_pending_page_request");
-          setPages((previous) => previous.map((page, index) => index === targetIndex ? { ...page, isEnd: event.isEnd, endReason: event.end_reason || "", endKind: event.end_kind || "", runStatus: event.run_status || "running" } : page));
+          setPages((previous) => previous.map((page, index) => index === targetIndex ? { ...page, requestStatus: "completed", isEnd: event.isEnd, endReason: event.end_reason || "", endKind: event.end_kind || "", runStatus: event.run_status || "running" } : page));
         }
       };
       while (true) {
@@ -202,6 +211,7 @@ function StoryPage() {
         lines.forEach(consume);
       }
       if (buffer.trim()) consume(buffer);
+      if (!pageCompleted) throw new Error("推演连接中断，已保存的事件不会丢失，请继续当前幕。");
       await syncSnapshot();
     } catch (error) {
       if (error.name === "AbortError" && intentionalAbortRef.current) {
@@ -253,6 +263,7 @@ function StoryPage() {
 
   const nextPage = () => {
     if (isGenerating) return;
+    if (pausedPage) { generatePage(pausedPage.index, pausedPage.page); return; }
     if (pages[currentPageIndex + 1]) setCurrentPageIndex((value) => value + 1);
     else if (!currentPage.isEnd) generatePage(currentPageIndex + 1, currentPage.page + 1);
   };
@@ -377,20 +388,27 @@ function StoryPage() {
         <details><summary>角色与世界状态</summary><div className="mobile-panels"><Roster agents={agents} onSelect={(agent) => setSelectedCharacterId(agent.id || agent.name)} /><WorldPanel entries={visibleWorldState} scenario={scenario} /></div></details>
       </section>
 
+      {snapshot.provenance && <p className="branch-origin">{snapshot.provenance.kind === "branch" ? "独立剧情分支" : "导入的独立推演"} · 来源版本 {snapshot.provenance.revision}，保留 {snapshot.provenance.inherited_event_count} 个历史事件。继续推进不会修改原推演。</p>}
+
       <div className="simulation-grid">
         <aside className="sim-sidebar left-panel"><Roster agents={agents} onSelect={(agent) => setSelectedCharacterId(agent.id || agent.name)} /></aside>
 
         <section className="timeline-panel">
           <div className="timeline-context"><span>第 {currentPage.page || 1} 幕</span><p>{scene || scenario.brief?.premise || prompt}</p></div>
           <div className="timeline-content" ref={contentRef} aria-live="polite">
-            {currentPage.messages?.length ? currentPage.messages.map((message, index) => <MessageCard key={`${message.event_id || message.id}-${index}`} message={message} skipToken={skipToken} focused={message.event_id === focusedEventId} />) : <div className="timeline-empty"><span className="scene-loader" /><strong>角色正在进入场景</strong><p>第一轮行动会从公开场景和各自掌握的信息开始。</p></div>}
+            {currentPage.messages?.length ? currentPage.messages.map((message, index) => <MessageCard key={`${message.event_id || message.id}-${index}`} sessionId={sessionId} message={message} skipToken={skipToken} focused={message.event_id === focusedEventId} />) : <div className="timeline-empty"><span className="scene-loader" /><strong>角色正在进入场景</strong><p>第一轮行动会从公开场景和各自掌握的信息开始。</p></div>}
             {currentPage.isEnd ? <div className="ending-card"><strong>本次模拟已收束</strong><p>{currentPage.endReason || snapshot.end_reason || "场景达到自然结束条件。"}</p>{snapshot.winner ? <span>结果：{snapshot.winner}</span> : null}</div> : null}
           </div>
 
           {errorMessage ? <div className="stream-error" role="alert"><span>{errorMessage}</span><button type="button" onClick={() => setErrorMessage("")}>关闭</button></div> : null}
 
           <section className="director-console" aria-label="剧情导演台">
-            <div className="director-console-heading"><div><span>DIRECTOR</span><h2>干预下一步剧情</h2></div><div className="arc-progress"><span>剧情进度 {progressPercent}%</span><div><i style={{ width: `${progressPercent}%` }} /></div></div></div>
+            <CheckpointBranches sessionId={sessionId} disabled={isGenerating || isDirecting} onCreated={async (id) => {
+              const restored = await fetchStorySession(id);
+              saveStorySetup(localStorage, restored.prompt, restored);
+              window.location.assign("/story");
+            }} />
+            <BeatProgress arc={snapshot.arc_state} phase={snapshot.current_phase} onJumpToEvent={jumpToEvent} />
             <DirectorObservability data={snapshot.director_observability} onJumpToEvent={jumpToEvent} />
             <div className="pace-control"><label htmlFor="story-pace">推进速度 <strong>{paceDraft <= 20 ? "沉浸" : paceDraft <= 40 ? "舒缓" : paceDraft <= 60 ? "均衡" : paceDraft <= 80 ? "紧凑" : "冲刺"}</strong></label><input id="story-pace" type="range" min="0" max="100" step="10" value={paceDraft} onChange={(event) => setPaceDraft(Number(event.target.value))} onMouseUp={savePace} onTouchEnd={savePace} onKeyUp={savePace} disabled={isGenerating || isDirecting} /><div><span>慢 · 多细节</span><span>快 · 早收束</span></div></div>
             <textarea value={interventionDraft} onChange={(event) => { setInterventionDraft(event.target.value); setInterventionPreview(null); }} onFocus={() => setAutoCountdown(null)} maxLength={3000} placeholder="例如：让暴雨在下一轮切断交通，但不要替任何角色决定是否离开。" disabled={isGenerating || isDirecting} />

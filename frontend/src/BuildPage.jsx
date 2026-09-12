@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { getApiErrorMessage } from "./apiErrors";
 import { saveStorySetup } from "./scenarioStorage";
-import { startStoryBuild } from "./storyApi";
+import { startStoryBuild, cancelStoryBuild } from "./storyApi";
 import "./BuildReview.css";
 
 const BUILD_STAGES = [
@@ -16,6 +16,15 @@ const BUILD_STAGES = [
   ["storage", "保存档案", "归档完整结构化实验"],
 ];
 
+const PENDING_BUILD_KEY = "story_pending_build";
+
+function pendingBuild(prompt, scene) {
+  try {
+    const saved = JSON.parse(localStorage.getItem(PENDING_BUILD_KEY) || "null");
+    return saved?.prompt === prompt && saved?.scene === scene ? saved.buildId : null;
+  } catch { return null; }
+}
+
 function BuildPage() {
   const location = useLocation();
   const navigate = useNavigate();
@@ -26,8 +35,11 @@ function BuildPage() {
   const [runId, setRunId] = useState(1);
   const [stageState, setStageState] = useState({});
   const [errorMessage, setErrorMessage] = useState("");
+  const [activity, setActivity] = useState(null);
+  const [cancelling, setCancelling] = useState(false);
+  const buildIdRef = useRef(pendingBuild(prompt, scene));
+  const [canResume, setCanResume] = useState(Boolean(buildIdRef.current));
   const controllerRef = useRef(null);
-  const startedRunRef = useRef(0);
   const cancellingRef = useRef(false);
 
   const completedCount = useMemo(
@@ -43,17 +55,31 @@ function BuildPage() {
       navigate("/", { replace: true });
       return;
     }
-    if (startedRunRef.current === runId) return;
-    startedRunRef.current = runId;
     const controller = new AbortController();
     controllerRef.current = controller;
     cancellingRef.current = false;
+    let settled = false;
+    let dispatched = false;
+    let activeBuildId = buildIdRef.current;
 
+    // Deferring dispatch lets StrictMode clean up its probe effect without
+    // creating a second paid build request.
+    const dispatch = setTimeout(() => {
+    dispatched = true;
     startStoryBuild({
       prompt,
       scene,
+      buildId: buildIdRef.current,
       signal: controller.signal,
       onEvent: async (event) => {
+        if (cancellingRef.current || controller.signal.aborted) return;
+        if (event.type === "build_started") {
+          activeBuildId = event.build_id;
+          buildIdRef.current = event.build_id;
+          setCanResume(true);
+          localStorage.setItem(PENDING_BUILD_KEY, JSON.stringify({ buildId: event.build_id, prompt, scene }));
+        }
+        if (event.type === "build_activity") setActivity(event);
         if (event.type === "build_progress") {
           setStageState((previous) => ({
             ...previous,
@@ -61,32 +87,55 @@ function BuildPage() {
           }));
         }
         if (event.type === "story_ready") {
+          settled = true;
+          localStorage.removeItem(PENDING_BUILD_KEY);
+          buildIdRef.current = null;
+          setCanResume(false);
           saveStorySetup(localStorage, prompt, event.data);
           await new Promise((resolve) => setTimeout(resolve, 350));
-          navigate("/review", { replace: true });
+          if (!controller.signal.aborted) navigate("/review", { replace: true });
         }
       },
     }).catch((error) => {
+      if (controller.signal.aborted) return;
       if (error.name === "AbortError") {
         if (!cancellingRef.current) setErrorMessage("生成已暂停，可以返回修改后重新开始。");
         return;
       }
       setErrorMessage(getApiErrorMessage(error, error.message || "场景生成失败。"));
-    });
+    }).finally(() => { settled = true; });
+    }, 0);
+    return () => {
+      clearTimeout(dispatch);
+      controller.abort();
+      if (dispatched && !settled && activeBuildId) cancelStoryBuild(activeBuildId).catch(() => {});
+    };
   }, [navigate, prompt, runId, scene]);
 
-  const cancelBuild = () => {
+  const cancelBuild = async () => {
+    setCancelling(true);
     cancellingRef.current = true;
-    controllerRef.current?.abort();
-    navigate("/", {
-      replace: true,
-      state: { prompt, scene },
-    });
+    try {
+      if (buildIdRef.current) await cancelStoryBuild(buildIdRef.current);
+      controllerRef.current?.abort();
+      navigate("/", { replace: true, state: { prompt, scene } });
+    } catch (error) {
+      cancellingRef.current = false;
+      setErrorMessage(error.message);
+    } finally { setCancelling(false); }
   };
 
-  const retryBuild = () => {
+  const retryBuild = async (restart = false) => {
+    if (restart && buildIdRef.current) {
+      try { await cancelStoryBuild(buildIdRef.current); }
+      catch (error) { setErrorMessage(error.message); return; }
+      buildIdRef.current = null;
+      localStorage.removeItem(PENDING_BUILD_KEY);
+      setCanResume(false);
+    }
     controllerRef.current?.abort();
     setStageState({});
+    setActivity(null);
     setErrorMessage("");
     setRunId((value) => value + 1);
   };
@@ -108,6 +157,18 @@ function BuildPage() {
 
         <div className="build-prompt-preview">{prompt}</div>
 
+        {activity && <div className="build-activity" aria-live="polite">
+          <strong>{BUILD_STAGES.find(([id]) => id === activity.stage)?.[1] || "构建中"}</strong>
+          <span>已用 {Math.floor(activity.elapsed_seconds)} 秒 · 当前预算剩余 {Math.ceil(activity.remaining_seconds)} 秒</span>
+          {activity.request_attempt && <span>本步骤请求 {activity.request_attempt}/{activity.request_limit} · JSON 修复 {activity.json_repair_attempt} 次 · 传输重试 {activity.transport_retry} 次</span>}
+          {activity.reason && <small>{activity.reason}</small>}
+          {activity.issues?.length > 0 && <details>
+            <summary>查看本次修复问题（可能涉及隐藏设定） · 第 {activity.repair_attempt} 次修复</summary>
+            <ul>{activity.issues.map((issue, index) => <li key={index}>{issue}</li>)}</ul>
+          </details>}
+          <small>已完成的世界、角色会保存在本地检查点；超时后无需全部重建。</small>
+        </div>}
+
         <ol className="build-stage-list">
           {BUILD_STAGES.map(([id, title, description], index) => {
             const event = stageState[id];
@@ -123,7 +184,7 @@ function BuildPage() {
                 </span>
                 <span className="stage-status">
                   {status === "started"
-                    ? "进行中"
+                    ? errorMessage ? "已停止" : "进行中"
                     : status === "completed"
                     ? "完成"
                     : status === "skipped"
@@ -139,12 +200,13 @@ function BuildPage() {
           <div className="flow-error" role="alert">
             <strong>生成未完成</strong>
             <span>{errorMessage}</span>
-            <button type="button" onClick={retryBuild}>从头重试</button>
+            {canResume && <button type="button" onClick={() => retryBuild()}>从检查点继续</button>}
+            <button type="button" onClick={() => retryBuild(true)}>重新生成全部</button>
           </div>
         ) : null}
 
-        <button className="flow-text-button" type="button" onClick={cancelBuild}>
-          取消并返回修改
+        <button className="flow-text-button" type="button" onClick={cancelBuild} disabled={cancelling}>
+          {cancelling ? "正在通知后端停止…" : "取消并返回修改（保留检查点）"}
         </button>
       </section>
     </main>

@@ -105,6 +105,10 @@ class ArcState:
     active_beat_ids: List[str] = field(default_factory=list)
     resolved_beat_ids: List[str] = field(default_factory=list)
     skipped_beat_ids: List[str] = field(default_factory=list)
+    beat_records: Dict[str, Any] = field(default_factory=dict)
+    beat_statuses: Dict[str, Any] = field(default_factory=dict)
+    beat_checks: Dict[str, Any] = field(default_factory=dict)
+    plan_adjusted_at_turn: int | None = None
 
     @classmethod
     def from_mapping(cls, data: Dict[str, Any] | None) -> "ArcState":
@@ -140,6 +144,10 @@ class ArcState:
             active_beat_ids=[str(item) for item in source.get("active_beat_ids") or []],
             resolved_beat_ids=[str(item) for item in source.get("resolved_beat_ids") or []],
             skipped_beat_ids=[str(item) for item in source.get("skipped_beat_ids") or []],
+            beat_records=dict(source.get("beat_records") or {}),
+            beat_statuses=dict(source.get("beat_statuses") or {}),
+            beat_checks=dict(source.get("beat_checks") or {}),
+            plan_adjusted_at_turn=source.get("plan_adjusted_at_turn"),
         )
 
 
@@ -164,6 +172,8 @@ class Message:
     authoritative: bool = False
     state_patch: List[Dict[str, Any]] = field(default_factory=list)
     intent: Dict[str, Any] = field(default_factory=dict)
+    public_changes: List[Dict[str, Any]] = field(default_factory=list)
+    director_changes: List[Dict[str, Any]] = field(default_factory=list)
 
     def as_observation(self) -> str:
         return f"[{self.turn}] {self.speaker}：{self.action} {self.speech}".strip()
@@ -301,6 +311,7 @@ class AgentState:
     conversation_opportunities: List[Dict[str, Any]] = field(default_factory=list)
     memories: List[MemoryRecord] = field(default_factory=list)
     memory_summaries: List[Dict[str, Any]] = field(default_factory=list)
+    memory_archive: List[Dict[str, Any]] = field(default_factory=list)
     initiative: int = 0
 
     def set_disclosure_pressure(self, thread_id: str, value: float) -> float:
@@ -395,7 +406,7 @@ class AgentState:
             supersedes=str(supersedes)[:120],
         )
         self.belief_records.append(record)
-        self.belief_records = self.belief_records[-60:]
+        # Retain correction chains; age alone does not invalidate a belief.
         return record
 
     def observe(self, message: Message, phase: str = "") -> None:
@@ -434,12 +445,8 @@ class AgentState:
         self._trim_memories()
 
     def _trim_memories(self) -> None:
-        recent_events = [item for item in self.memories if item.memory_type == "event"][-30:]
-        structured = [item for item in self.memories if item.memory_type != "event"][-50:]
-        self.memories = sorted(
-            recent_events + structured,
-            key=lambda item: item.created_at_turn,
-        )[-MAX_AGENT_MEMORY:]
+        from .memory import archive_and_trim
+        archive_and_trim(self)
 
     def remember_structured(
         self,
@@ -656,6 +663,10 @@ class AgentState:
         self.memory_summaries.append({
             "phase": phase,
             "through_turn": turn,
+            "method": "extractive_v1",
+            "source_event_ids": list(dict.fromkeys(item.event_id for item in (important or window))),
+            "epistemic_status": "observed_or_claimed_not_verified",
+            "unresolved": list(self.pending_commitments),
             "content": f"- 阶段摘要（{phase}，截至第 {turn} 回合）：{body}",
         })
         self.memory_summaries = self.memory_summaries[-6:]
@@ -698,6 +709,13 @@ class SimulationState:
         self.revision = 0
         self._scheduler_index = 0
         self.world_spec = world_spec
+        self.entity_states = {
+            key: dict(value.get("state") or {})
+            for key, value in (getattr(world_spec, "entities", {}) or {}).items()
+            if isinstance(value, dict)
+        }
+        from .build_control import CURRENT_BUILD
+        self.model_requests = list(getattr(CURRENT_BUILD.get(), "model_requests", []))
         self.phase_sequence = list(getattr(world_spec, "phases", []) or [])
         self.current_phase = self.phase_sequence[0] if self.phase_sequence else "自由推进"
         self.public_rules = list(getattr(world_spec, "public_rules", []) or [])
@@ -788,7 +806,12 @@ class SimulationState:
         raise RuntimeError("当前没有可行动角色")
 
     def add_message(self, msg: Message) -> None:
+        from .change_log import snapshot, differences
+        before_changes = snapshot(self)
         phase_before = self.current_phase
+        if msg.authoritative:
+            from .mechanics import patch_changes_state
+            msg.intent["meaningful_state_change"] = patch_changes_state(self, msg.state_patch)
         self.history.append(msg)
         self.turn_count += 1
         if msg.kind in {"narration", "intervention"}:
@@ -858,7 +881,7 @@ class SimulationState:
         # Importing lazily avoids coupling the persistence models to orchestration.
         from .pacing import update_arc_after_message
 
-        update_arc_after_message(self, msg)
+        update_arc_after_message(self, msg, previous_phase=phase_before)
         phase_changed = self.current_phase != phase_before
         expired_question_ids: set[str] = set()
         for agent in self.agents.values():
@@ -911,6 +934,10 @@ class SimulationState:
             if thread.status == "active" and msg.turn - thread.last_active_turn > 8:
                 thread.status = "dormant"
         self.bump_revision()
+
+        after_changes = snapshot(self)
+        msg.public_changes = differences(before_changes["public"], after_changes["public"], msg.event_id)
+        msg.director_changes = differences(before_changes["director"], after_changes["director"], msg.event_id)
 
     def thread_for_event(self, event_id: str) -> ConversationThread | None:
         value = str(event_id or "")
@@ -1116,7 +1143,7 @@ class SimulationState:
                         turn=msg.turn,
                         phase=self.current_phase,
                     )
-            actor.pending_commitments = actor.pending_commitments[-12:]
+            # Outstanding promises survive until explicitly resolved.
 
         for candidate in intent.get("memory_candidates") or []:
             if not isinstance(candidate, dict):
@@ -1301,7 +1328,9 @@ class SimulationState:
             target_name = str(operation.get("target") or "").strip()
             value = operation.get("value")
             agent = self.agents.get(target_name)
-            if op == "set_world" and self._valid_world_value(key, value):
+            if op == "set_entity" and target_name in self.entity_states and key in self.entity_states[target_name]:
+                self.entity_states[target_name][key] = value
+            elif op == "set_world" and self._valid_world_value(key, value):
                 self.world_state[key] = value
             elif op == "increment_world" and key:
                 try:
@@ -1343,12 +1372,17 @@ class SimulationState:
                 agent.goal_status[key] = str(value)
             elif op == "set_relationship" and agent is not None and key in self.agents:
                 agent.relationships[key] = str(value)
-            elif op == "record_vote" and target_name in self.agents:
+            elif op == "record_vote" and (target_name in self.agents or target_name in self.entity_states):
                 voter = str(operation.get("actor") or "").strip()
                 if voter in self.agents and self.agents[voter].eligible:
                     self.votes[voter] = target_name
             elif op == "clear_votes":
                 self.votes.clear()
+            elif op == "settle_votes" and target_name in self.entity_states:
+                eligible = {a.name for a in self.agents.values() if a.eligible}
+                if eligible and eligible.issubset(self.votes):
+                    count = sum(self.votes[name] == target_name for name in eligible)
+                    self.entity_states[target_name][key] = count >= int(operation.get("amount", 1))
             elif op == "set_phase":
                 self.advance_phase(str(value or "").strip())
             elif op == "add_known_fact" and agent is not None and key:
@@ -1420,6 +1454,9 @@ class SimulationState:
             return faction_count > 0 and faction_count >= len(alive) - faction_count
         if kind == "world_equals":
             return self.world_state.get(getattr(rule, "key", "")) == getattr(rule, "value", None)
+        if kind == "entity_equals":
+            entity = self.entity_states.get(getattr(rule, "target", ""), {})
+            return rule.key in entity and entity[rule.key] == rule.value
         if kind == "all_goals_completed":
             return bool(alive) and all(
                 agent.goal_status

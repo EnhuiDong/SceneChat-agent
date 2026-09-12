@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from .models import AgentState, SimulationState
 from .visibility import ViewerContext, can_access
+from .memory import recall
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,14 @@ class AgentView:
     retrieved_background: str
 
     def render(self) -> str:
+        from dataclasses import replace
+        from .config import config_int
+        from .context_budget import optional
+        budget = config_int("simulation", "context_section_bytes", 6000, minimum=1000, maximum=100000)
+        self = replace(self, **{key: optional(getattr(self, key), budget) for key in (
+            "retrieved_background", "observations", "private_memory", "story_memory",
+            "relationships", "colocated_public_profiles",
+        )})
         return f"""【可检索的长背景】
 {self.retrieved_background or '无额外长背景。'}
 
@@ -232,7 +241,7 @@ def build_agent_view(
         active_threads=active_threads,
         observations=agent.recent_observations(),
         private_memory=agent.recent_private_memory(6),
-        story_memory=agent.layered_memory(focus_agents),
+        story_memory=recall(agent, focus_agents),
         voice_profile=_voice_summary(agent),
         short_term_state=_short_term_summary(state, agent),
         response_obligations=_response_obligations(agent),

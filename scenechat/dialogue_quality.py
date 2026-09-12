@@ -287,7 +287,10 @@ def inspect_narration_event(
             hard=True,
         ))
 
-    if visibility == "audience_only" and not state.ended:
+    if visibility == "audience_only" and not state.ended and not (
+        getattr(state.world_spec, "audience_policy", "limited") == "omniscient"
+        and getattr(state.world_spec, "reveal_policy", "preserve_suspense") == "allow_reveal"
+    ):
         explicit_reveals = []
         compact = _normalized(text)
         for agent in state.agents.values():

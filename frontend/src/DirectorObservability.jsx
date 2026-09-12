@@ -118,8 +118,8 @@ function QualityView({ data }) {
   const signals = data.quality_signals || [];
   if (!signals.length) return <p className="observer-empty">完成一轮推演后，这里会显示可重复计算的运行信号。</p>;
   return <div className="quality-signal-grid">{signals.map((signal) => <article key={signal.id}>
-    <header><strong>{signal.label}</strong><b>{percent(signal.value)}%</b></header>
-    <div><span style={{ width: `${percent(signal.value)}%` }} /></div>
+    <header><strong>{signal.label}</strong><b>{signal.value == null ? "N/A" : `${percent(signal.value)}%`}</b></header>
+    {signal.value != null && <div><span style={{ width: `${percent(signal.value)}%` }} /></div>}
     <p>{signal.description}</p>
   </article>)}</div>;
 }

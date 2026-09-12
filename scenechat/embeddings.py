@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from typing import Any
+import asyncio
+
+from .build_control import CURRENT_BUILD, await_controlled
+from .config import config_int
 
 from llama_index.core.base.embeddings.base import BaseEmbedding, Embedding
 from llama_index.core.bridge.pydantic import PrivateAttr
@@ -39,11 +43,13 @@ class OpenAICompatibleEmbedding(BaseEmbedding):
     def _embed(self, texts: list[str]) -> list[Embedding]:
         if not texts:
             return []
-        response = self._client.embeddings.create(
-            model=self.model_name,
-            input=texts,
-            encoding_format="float",
-        )
+        control = CURRENT_BUILD.get()
+        if control is None:
+            response = self._client.embeddings.create(
+                model=self.model_name, input=texts, encoding_format="float",
+            )
+        else:
+            response = asyncio.run(self._controlled_embed(texts, control))
         data = list(getattr(response, "data", None) or [])
         ordered = sorted(
             enumerate(data),
@@ -56,6 +62,15 @@ class OpenAICompatibleEmbedding(BaseEmbedding):
         if len(embeddings) != len(texts) or any(not vector for vector in embeddings):
             raise ValueError("向量模型返回的 embedding 数量或内容无效")
         return embeddings
+
+    async def _controlled_embed(self, texts, control):
+        from openai import AsyncOpenAI
+        timeout = config_int("embedding", "request_timeout_seconds", 180, minimum=1, maximum=600)
+        async with AsyncOpenAI(api_key=self._client.api_key, base_url=str(self._client.base_url),
+                               timeout=timeout, max_retries=0) as client:
+            return await await_controlled(client.embeddings.create(
+                model=self.model_name, input=texts, encoding_format="float",
+            ), control, timeout)
 
     def _get_query_embedding(self, query: str) -> Embedding:
         return self._embed([query])[0]

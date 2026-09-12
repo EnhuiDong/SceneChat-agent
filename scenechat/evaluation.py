@@ -20,8 +20,8 @@ from .scenario import ScenarioPackage, validate_scenario_package
 
 @dataclass(frozen=True)
 class QualityScore:
-    value: float
-    passed: bool
+    value: float | None
+    passed: bool | None
     detail: str
 
     def to_dict(self) -> dict:
@@ -67,7 +67,7 @@ def evaluate_scenario(package: ScenarioPackage) -> dict[str, QualityScore]:
     if runtime_issues:
         runtime_value *= 0.5
 
-    return {
+    metrics = {
         "constraint_recall": _score(
             covered_count / max(len(constraints), 1),
             f"{covered_count}/{len(constraints)} locked constraints declared covered",
@@ -78,22 +78,26 @@ def evaluate_scenario(package: ScenarioPackage) -> dict[str, QualityScore]:
         "runtime_completeness": _score(runtime_value, "; ".join(runtime_issues) or "required runtime structures present"),
         "deterministic_validation": _score(1.0 if not validation_issues else 0.0, "; ".join(validation_issues) or "package valid", 1.0),
     }
+    if not constraints:
+        metrics["constraint_recall"] = QualityScore(None, None, "N/A：没有锁定约束")
+    if requested is None:
+        metrics["character_count"] = QualityScore(None, None, "N/A：用户没有指定人数")
+    return metrics
 
 
 def _near_duplicate_rate(speeches: list[str]) -> float:
     if len(speeches) < 2:
         return 0.0
     duplicates = 0
-    comparisons = 0
     for index, speech in enumerate(speeches):
         normalized = "".join(speech.split()).lower()
         for previous in speeches[max(0, index - 5):index]:
-            comparisons += 1
             other = "".join(previous.split()).lower()
             if normalized and other and SequenceMatcher(None, normalized, other).ratio() >= 0.88:
                 duplicates += 1
                 break
-    return duplicates / max(comparisons, 1)
+    # Count repeated events, not a variable number of pairwise comparisons.
+    return duplicates / (len(speeches) - 1)
 
 
 def evaluate_trace(
@@ -105,7 +109,7 @@ def evaluate_trace(
 ) -> dict[str, QualityScore]:
     """Score only public, user-observable properties of a simulation trace."""
     trace = list(messages)
-    dialogue = [message for message in trace if message.kind != "narration" and message.speech.strip()]
+    dialogue = [message for message in trace if message.kind not in {"narration", "intervention"} and message.speech.strip()]
     agent_events = [
         message for message in trace
         if message.kind not in {"narration", "intervention"}
@@ -326,6 +330,24 @@ def evaluate_trace(
         )
     if expect_end or ended:
         metrics["natural_ending"] = _score(1.0 if natural_end else 0.0, f"ended={ended}, kind={getattr(state, 'end_kind', '')}", 1.0)
+    applicable = {
+        "duplicate_avoidance": len(speeches) >= 2,
+        "narration_freshness": len(narrations) >= 2,
+        "turn_balance": len(dialogue) >= 2,
+        "role_differentiation": len(role_samples) >= 2,
+        "conversation_responsiveness": bool(obligations) or bool(state and any(t.obligations for t in state.conversation_threads.values())),
+        "relationship_evidence": bool(relationship_updates),
+        "belief_provenance": bool(state and active_beliefs),
+        "relationship_evidence_reuse": bool(state and evidence_keys),
+        "memory_signal": bool(state and (structured_memories or reflection_noise)),
+        "monologue_avoidance": bool(dialogue),
+        "quality_gate_stability": bool(dialogue),
+        "generation_stability": state is not None,
+        "agent_event_share": bool(trace),
+    }
+    for key, applies in applicable.items():
+        if key in metrics and not applies:
+            metrics[key] = QualityScore(None, None, "N/A：没有适用样本")
     return metrics
 
 

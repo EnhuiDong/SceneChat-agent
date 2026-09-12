@@ -50,6 +50,7 @@ class SimulationLLMAdapter:
         finish_reason = getattr(choices[0], "finish_reason", "") if choices else ""
         return SimpleNamespace(
             text=str(getattr(response, "content", "") or ""),
+            raw=raw,
             finish_reason=str(finish_reason or ""),
         )
 
@@ -148,6 +149,8 @@ def _token_limit_parameter() -> str:
 def get_generation_chat_model(
     temperature: float = 0.8,
     max_tokens: int | None = None,
+    *,
+    transport_retries: int | None = None,
 ):
     provider = _chat_provider()
     api_key = _required_env("LLM_API_KEY", "生成模型 API Key")
@@ -165,6 +168,8 @@ def get_generation_chat_model(
 
     timeout = _setting_float("llm", "request_timeout_seconds", 180, minimum=1)
     max_retries = _setting_int("llm", "max_retries", 1, minimum=0)
+    if transport_retries is not None:
+        max_retries = transport_retries
     extra_body = None
     if provider == "dashscope":
         extra_body = {

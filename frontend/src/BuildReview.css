@@ -4,6 +4,11 @@
   font-family: Inter, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
 }
 
+.build-activity { display: grid; gap: 8px; margin: 16px 0; padding: 16px; border-radius: 14px; background: #edf2e9; color: #415d4a; font-size: 13px; line-height: 1.6; }
+.build-activity summary { cursor: pointer; }
+.build-activity li { overflow-wrap: anywhere; }
+.flow-text-button:disabled { opacity: .6; cursor: wait; }
+
 .flow-page { min-height: 100vh; padding: 48px 24px; background: radial-gradient(circle at 15% 5%, #fffdf5 0, transparent 32%), linear-gradient(145deg, #e4ece4, #f4efe3 55%, #dee8df); }
 .flow-card { width: min(1100px, 100%); margin: 0 auto; background: rgba(255, 253, 247, .94); border: 1px solid rgba(51, 74, 60, .13); border-radius: 28px; box-shadow: 0 24px 70px rgba(47, 64, 51, .13); }
 .build-card { width: min(820px, 100%); padding: 42px; }

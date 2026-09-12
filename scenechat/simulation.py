@@ -29,6 +29,8 @@ from .providers import get_simulation_llm
 from .runtime import Intent, IntentResolver
 from .scenario import extract_json_object
 from .scheduler import SimulationScheduler
+from .telemetry import complete
+from .mechanics import visible_entities, action_context
 
 
 MAX_VISIBLE_OBSERVATIONS = 15
@@ -80,6 +82,12 @@ def build_agent_prompt(
 你不是全知叙述者。你只能依据下面明确提供的信息判断，绝不能假定自己知道其他角色的私密动机、秘密经历或未被观察到的事件。
 
 {view.render()}
+
+【可用的非人物目标】
+地点：{json.dumps(state.locations, ensure_ascii=False)}
+物品/提案（使用声明的 ID）：{json.dumps(visible_entities(state, agent), ensure_ascii=False)}
+当前允许的场景行动（不含尚未获取的结果）：
+{action_context(state, agent)}
 
 请严格站在“{agent.name}”的有限视角中推进一轮行动。行动和发言必须符合其身份、目标、已知信息与社会处境，不要解释创作过程，不要替其他角色行动。
 
@@ -252,6 +260,11 @@ def build_narrator_prompt(
         )
         recent_history = state.get_recent_history(12)
 
+    reveal_instruction = (
+        "用户允许全知读者镜头揭示秘密；只在 audience_only 镜头中使用，不得写入角色知识。"
+        if getattr(state.world_spec, "audience_policy", "limited") == "omniscient" and getattr(state.world_spec, "reveal_policy", "preserve_suspense") == "allow_reveal"
+        else "在身份公开揭晓或结算前，只能给出有多种解释的线索，不得直接确认隐藏身份。"
+    )
     return f"""你是互动故事的场景导演与旁白，不扮演任何一个角色。
 
 【实验设定与可用背景】
@@ -277,7 +290,7 @@ def build_narrator_prompt(
 
 {mode_instruction}
 
-读者镜头也必须保护推理体验：在身份公开揭晓或结算前，只能给出存在多种解释的线索，不得直接确认隐藏身份，也不得反复用代码流、后台进程、异常同步等单一答案式暗示。只能把当前角色名单中的人物写成下一位行动者。先检查近期历史：如果某个当前节点已经由最近的角色行动实际完成，本轮应在 resolved_beat_ids 中结算它，不必要求完成必须发生在本句旁白里。
+{reveal_instruction} 不得反复用代码流、后台进程、异常同步等单一答案式暗示。只能把当前角色名单中的人物写成下一位行动者。先检查近期历史：如果某个当前节点已经由最近的角色行动实际完成，在 resolved_beat_ids 中提议核验；不要把本句旁白自己宣布的结果当证据。
 
 tension 必须使用 0.0—1.0 的小数比例，不能填写百分制的 25 或 100。
 
@@ -388,8 +401,9 @@ def simulate_next_turn(
                 "\n\n【上一次 Intent 被拒绝】\n"
                 f"{rejection}\n请保持角色目标不变，改为提交一项当前阶段合法的 Intent。"
             )
-        response = active_llm.complete(
+        response = complete(state, active_llm,
             attempt_prompt,
+            purpose="actor_intent",
             max_tokens=_token_budget("intent_max_tokens", 900, 520, 1800),
         )
         parsed = parse_agent_intent(response.text)
@@ -515,6 +529,10 @@ def simulate_narration(
         len(factions) > 1
         and not reveal_phase
         and state.arc_state.progress < 0.65
+        and not (
+            getattr(state.world_spec, "audience_policy", "limited") == "omniscient"
+            and getattr(state.world_spec, "reveal_policy", "preserve_suspense") == "allow_reveal"
+        )
     )
     visibility = forced_visibility or (
         "public"
@@ -547,8 +565,9 @@ def simulate_narration(
             prompt + "\n\n【上一次旁白被拒绝】\n" + rejection
             + "\n只输出修正后的完整 JSON 对象。"
         )
-        response = active_llm.complete(
+        response = complete(state, active_llm,
             attempt_prompt,
+            purpose="narration",
             max_tokens=_token_budget("narration_max_tokens", 480, 360, 900),
         )
         parsed = parse_narrator_event(response.text)
@@ -583,7 +602,11 @@ def simulate_narration(
     if parsed is None:
         state.record_generation_failure()
         return None
-    resolved_beat_ids = validate_resolved_beats(state, parsed["resolved_beat_ids"])
+    verified = {}
+    if getattr(state.world_spec, "execution_version", 1) == 2:
+        from .beat_evidence import verify_narrative_candidates
+        verified = verify_narrative_candidates(state, active_llm, parsed["resolved_beat_ids"])
+    resolved_beat_ids = validate_resolved_beats(state, parsed["resolved_beat_ids"], verified)
     resolution = (resolver or IntentResolver()).resolve_director_event(
         state,
         narration=parsed["narration"],
@@ -599,6 +622,7 @@ def simulate_narration(
     intent_payload["narration_phase"] = state.current_phase
     intent_payload["arc_updates"] = {
         "resolved_beat_ids": resolved_beat_ids,
+        "verified_beats": verified,
         "tension": parsed["tension"],
     }
     if applied_guidance_ids:

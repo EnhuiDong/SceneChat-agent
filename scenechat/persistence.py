@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
 from .knowledge import ExperimentKnowledgeBase, build_knowledge_documents
+from .save_validation import validate_import
 from .models import (
     AbilityState,
     AgentState,
@@ -32,7 +33,7 @@ from .scenario import (
 )
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def utc_now() -> str:
@@ -61,6 +62,9 @@ class SessionStore:
 
     def _initialize(self) -> None:
         with self._connect() as connection:
+            if connection.execute("PRAGMA user_version").fetchone()[0] > SCHEMA_VERSION:
+                raise ValueError("数据库版本高于当前程序，不能降级打开。")
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS story_sessions (
@@ -81,9 +85,62 @@ class SessionStore:
                 "CREATE INDEX IF NOT EXISTS idx_story_sessions_updated_at "
                 "ON story_sessions(updated_at DESC)"
             )
+            connection.execute("""CREATE TABLE IF NOT EXISTS story_builds (
+                id TEXT PRIMARY KEY, owner TEXT NOT NULL, lease_until REAL NOT NULL,
+                status TEXT NOT NULL, payload TEXT NOT NULL, updated_at TEXT NOT NULL
+            )""")
+            connection.execute("""CREATE TABLE IF NOT EXISTS story_checkpoints (
+                session_id TEXT NOT NULL, revision INTEGER NOT NULL, turn_count INTEGER NOT NULL,
+                created_at TEXT NOT NULL, payload TEXT NOT NULL,
+                PRIMARY KEY(session_id, revision))""")
+            connection.execute("""CREATE TABLE IF NOT EXISTS story_copies (
+                request_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, session_id TEXT NOT NULL)""")
             connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
-    def save(self, payload: dict[str, Any]) -> None:
+    def claim_build(self, build_id, owner, lease_until, prompt, scene):
+        """Atomic lease prevents two requests/processes rebuilding one checkpoint."""
+        import time
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM story_builds WHERE id=?", (build_id,)).fetchone()
+            if row:
+                payload = json.loads(row["payload"])
+                if payload["prompt"] != prompt or payload["scene"] != scene:
+                    raise ValueError("build_input_mismatch")
+                if row["status"] in {"running", "cancelling"} and row["lease_until"] > time.time():
+                    raise ValueError("build_in_progress")
+            else:
+                payload = {"prompt": prompt, "scene": scene, "checkpoint": {}}
+            connection.execute("""INSERT INTO story_builds VALUES (?, ?, ?, 'running', ?, ?)
+                ON CONFLICT(id) DO UPDATE SET owner=excluded.owner, lease_until=excluded.lease_until,
+                    status='running', updated_at=excluded.updated_at""",
+                (build_id, owner, lease_until, json.dumps(payload, ensure_ascii=False), utc_now()))
+        return payload
+
+    def load_build(self, build_id):
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM story_builds WHERE id=?", (build_id,)).fetchone()
+        if not row:
+            return None
+        return {**dict(row), "payload": json.loads(row["payload"])}
+
+    def update_build(self, build_id, owner, payload, status="running"):
+        with self._connect() as connection:
+            cursor = connection.execute("""UPDATE story_builds SET payload=?, status=?, updated_at=?
+                WHERE id=? AND owner=? AND (status='running' OR ? IN ('cancelled','failed'))""",
+                (json.dumps(payload, ensure_ascii=False), status, utc_now(), build_id, owner, status))
+        return cursor.rowcount > 0
+
+    def cancel_build(self, build_id):
+        with self._connect() as connection:
+            connection.execute("UPDATE story_builds SET status='cancelling' WHERE id=? AND status='running'", (build_id,))
+
+    def renew_build(self, build_id, owner, lease_until):
+        with self._connect() as connection:
+            connection.execute("UPDATE story_builds SET lease_until=? WHERE id=? AND owner=? AND status='running'",
+                               (lease_until, build_id, owner))
+
+    def save(self, payload: dict[str, Any], *, build_owner=None, _connection=None) -> bool:
         session = payload["session"]
         scenario = payload["scenario"]
         simulation = payload["simulation"]
@@ -91,7 +148,12 @@ class SessionStore:
         created_at = session.get("created_at") or now
         status = "ended" if session.get("ended") else simulation.get("run_status", "running")
         serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        with self._connect() as connection:
+        with (nullcontext(_connection) if _connection else self._connect()) as connection:
+            if build_owner:
+                connection.execute("BEGIN IMMEDIATE")
+                lease = connection.execute("SELECT owner, status FROM story_builds WHERE id=?", (session["id"],)).fetchone()
+                if lease is None or lease["owner"] != build_owner or lease["status"] != "running":
+                    return False
             connection.execute(
                 """
                 INSERT INTO story_sessions (
@@ -110,7 +172,8 @@ class SessionStore:
                 """,
                 (
                     session["id"],
-                    scenario.get("world", {}).get("title") or "未命名推演",
+                    (scenario.get("world", {}).get("title") or "未命名推演") +
+                    ({"branch": " · 分支", "import": " · 导入"}.get((session.get("provenance") or {}).get("kind"), "")),
                     session.get("prompt", ""),
                     session.get("scene", ""),
                     created_at,
@@ -121,6 +184,59 @@ class SessionStore:
                     SCHEMA_VERSION,
                 ),
             )
+            # Latest snapshot and immutable full-state checkpoint commit together.
+            connection.execute("""INSERT OR IGNORE INTO story_checkpoints VALUES (?, ?, ?, ?, ?)""",
+                (session["id"], int(simulation.get("revision", simulation.get("turn_count", 0))), int(simulation.get("turn_count", 0)), now, serialized))
+            from .config import config_int
+            retention = config_int("storage", "checkpoint_retention", 40, minimum=1, maximum=1000)
+            connection.execute("""DELETE FROM story_checkpoints WHERE session_id=? AND revision NOT IN
+                (SELECT revision FROM story_checkpoints WHERE session_id=? ORDER BY revision DESC LIMIT ?)""",
+                (session["id"], session["id"], retention))
+        return True
+
+    def checkpoints(self, session_id):
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT payload FROM story_sessions WHERE id=?", (session_id,)).fetchone()
+            if row and not connection.execute("SELECT 1 FROM story_checkpoints WHERE session_id=? LIMIT 1", (session_id,)).fetchone():
+                old = json.loads(row["payload"])
+                connection.execute("INSERT OR IGNORE INTO story_checkpoints VALUES (?, ?, ?, ?, ?)",
+                    (session_id, old["simulation"].get("revision", old["simulation"].get("turn_count", 0)), old["simulation"].get("turn_count", 0), utc_now(), row["payload"]))
+            rows = connection.execute("SELECT revision, turn_count, created_at FROM story_checkpoints WHERE session_id=? ORDER BY revision DESC", (session_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def copy_session(self, *, request_id, payload=None, source_id=None, revision=None):
+        import hashlib
+        import uuid
+        from copy import deepcopy
+        fingerprint = hashlib.sha256(json.dumps([source_id, revision, payload], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            previous = connection.execute("SELECT * FROM story_copies WHERE request_id=?", (request_id,)).fetchone()
+            if previous:
+                if previous["fingerprint"] != fingerprint:
+                    raise ValueError("同一请求标识不能用于不同的分支或导入。")
+                if not connection.execute("SELECT 1 FROM story_sessions WHERE id=?", (previous["session_id"],)).fetchone():
+                    raise ValueError("此请求创建的推演已删除，请重新发起操作。")
+                return previous["session_id"]
+            if source_id:
+                row = connection.execute("SELECT payload FROM story_checkpoints WHERE session_id=? AND revision=?", (source_id, revision)).fetchone()
+                if row is None:
+                    raise ValueError("该检查点不存在或已超出保留范围，不能从对话记录重建。")
+                payload = json.loads(row["payload"])
+            payload = deepcopy(payload)
+            validate_import(payload)
+            payload["simulation"].setdefault("revision", payload["simulation"].get("turn_count", 0))
+            payload["schema_version"] = SCHEMA_VERSION
+            payload["session"]["ended"] = bool(payload["session"].get("ended") or payload["simulation"].get("ended") or payload["simulation"].get("run_status") == "blocked")
+            new_id = str(uuid.uuid4())
+            payload["session"].update(id=new_id, created_at=utc_now(), page=1 if payload["simulation"]["history"] else 0,
+                provenance={"kind": "branch" if source_id else "import", "source_session_id": source_id or payload["session"]["id"], "revision": payload["simulation"].get("revision", 0), "inherited_event_count": len(payload["simulation"]["history"])})
+            payload["page_requests"] = []
+            # New transport identity; history and all runtime state remain untouched.
+            self.save(payload, _connection=connection)
+            connection.execute("INSERT INTO story_copies VALUES (?, ?, ?)", (request_id, fingerprint, new_id))
+            return new_id
 
     def load(self, session_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
@@ -148,12 +264,17 @@ class SessionStore:
                 "DELETE FROM story_sessions WHERE id = ?",
                 (session_id,),
             )
+            connection.execute("DELETE FROM story_builds WHERE id=?", (session_id,))
+            connection.execute("DELETE FROM story_checkpoints WHERE session_id=?", (session_id,))
         return cursor.rowcount > 0
 
     def clear(self) -> int:
         with self._connect() as connection:
             count = connection.execute("SELECT COUNT(*) FROM story_sessions").fetchone()[0]
             connection.execute("DELETE FROM story_sessions")
+            connection.execute("DELETE FROM story_builds")
+            connection.execute("DELETE FROM story_checkpoints")
+            connection.execute("DELETE FROM story_copies")
         return int(count)
 
 
@@ -187,7 +308,7 @@ def _nonnegative_int(value: Any, default: int = 0) -> int:
 def _memory_from_dict(data: dict[str, Any]) -> MemoryRecord:
     values = _known_fields(MemoryRecord, data)
     values["event_id"] = str(data.get("event_id") or "")[:120]
-    values["content"] = str(data.get("content") or "")[:2000]
+    values["content"] = str(data.get("content") or "")
     values["source"] = str(data.get("source") or "observation")[:80]
     values["visibility"] = [
         str(item)[:120] for item in data.get("visibility") or []
@@ -343,6 +464,7 @@ def _relationship_dynamics_from_dict(data: Any) -> dict[str, dict[str, Any]]:
 
 def agent_from_dict(data: dict[str, Any]) -> AgentState:
     values = _known_fields(AgentState, data)
+    values["memory_archive"] = [asdict(_memory_from_dict(item)) for item in data.get("memory_archive", []) if isinstance(item, dict)]
     raw_voice_profile = data.get("voice_profile")
     values["voice_profile"] = (
         asdict(VoiceProfile.from_mapping(raw_voice_profile))
@@ -368,9 +490,10 @@ def agent_from_dict(data: dict[str, Any]) -> AgentState:
     ]
     values["memory_summaries"] = [
         {
+            **item,
             "phase": str(item.get("phase") or "")[:120],
             "through_turn": _nonnegative_int(item.get("through_turn", 0)),
-            "content": str(item.get("content") or "")[:2000],
+            "content": str(item.get("content") or ""),
         }
         for item in data.get("memory_summaries") or []
         if isinstance(item, dict)
@@ -398,7 +521,7 @@ def agent_from_dict(data: dict[str, Any]) -> AgentState:
     values["belief_records"] = [
         _belief_from_dict(item) for item in data.get("belief_records") or []
         if isinstance(item, dict) and str(item.get("content") or "").strip()
-    ][-60:]
+    ]
     try:
         values["emotion_intensity"] = max(
             0.0, min(float(data.get("emotion_intensity", 0.2)), 1.0)
@@ -414,7 +537,7 @@ def agent_from_dict(data: dict[str, Any]) -> AgentState:
         _memory_from_dict(value)
         for value in data.get("memories") or []
         if isinstance(value, dict)
-    ][-80:]
+    ]
     return AgentState(**values)
 
 
@@ -442,6 +565,8 @@ def state_from_dict(
     state.current_phase = str(data.get("current_phase") or state.current_phase)
     state.phase_action_log = set(data.get("phase_action_log") or [])
     state.world_state = dict(data.get("world_state") or {})
+    state.entity_states = dict(data.get("entity_states") or state.entity_states)
+    state.model_requests = list(data.get("model_requests") or [])
     state.public_rules = list(data.get("public_rules") or state.public_rules)
     state.termination_conditions = list(
         data.get("termination_conditions") or state.termination_conditions
@@ -570,6 +695,8 @@ def runtime_session_from_export(payload: dict[str, Any]) -> dict[str, Any]:
     }
     return {
         "created_at": session_data.get("created_at", ""),
+        "provenance": session_data.get("provenance"),
+        "run_metadata": payload.get("run_metadata", {}),
         "prompt": str(session_data.get("prompt") or ""),
         "scene": scene,
         "worldview": package.public_worldview_markdown,

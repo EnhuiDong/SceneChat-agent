@@ -1,4 +1,4 @@
-import { getApiErrorMessage, readApiError } from "./apiErrors";
+import { getApiErrorMessage, readApiError } from "./apiErrors.js";
 
 async function readNdjson(response, onEvent) {
   if (!response.body) {
@@ -7,43 +7,57 @@ async function readNdjson(response, onEvent) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
+  let ready = false;
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      const event = JSON.parse(line);
-      if (event.type === "error") {
-        throw new Error(getApiErrorMessage(event, "生成场景失败，请稍后重试。"));
-      }
-      await onEvent(event);
-    }
-  }
-
-  if (buffer.trim()) {
-    const event = JSON.parse(buffer);
+  const deliver = async (event) => {
+    await onEvent(event);
     if (event.type === "error") {
       throw new Error(getApiErrorMessage(event, "生成场景失败，请稍后重试。"));
     }
-    await onEvent(event);
+    if (event.type === "story_ready") ready = true;
+  };
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const event = JSON.parse(line);
+        await deliver(event);
+      }
+    }
+
+    if (buffer.trim()) {
+      const event = JSON.parse(buffer);
+      await deliver(event);
+    }
+    if (!ready) throw new Error("构建连接中断，可从已保存的检查点继续。");
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
   }
 }
 
-export async function startStoryBuild({ prompt, scene, signal, onEvent }) {
+export async function startStoryBuild({ prompt, scene, buildId, signal, onEvent }) {
   const response = await fetch("/api/story/start-stream", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt, scene }),
+    body: JSON.stringify({ prompt, scene, ...(buildId ? { build_id: buildId } : {}) }),
     signal,
   });
   if (!response.ok) {
     throw new Error(await readApiError(response, "启动实验失败，请稍后重试。"));
   }
   await readNdjson(response, onEvent);
+}
+
+export async function cancelStoryBuild(buildId) {
+  const response = await fetch(`/api/story/build/${encodeURIComponent(buildId)}/cancel`, { method: "POST" });
+  if (!response.ok && response.status !== 404) throw new Error(await readApiError(response, "取消构建失败，请重试。"));
 }
 
 export async function fetchStorySession(sessionId) {

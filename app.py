@@ -10,6 +10,8 @@ from flask import Flask, jsonify, request, Response, stream_with_context
 from flask_cors import CORS
 
 from scenechat.config import config_int, config_value
+from scenechat.build_control import BuildControl, CURRENT_BUILD
+from scenechat.build_jobs import BuildJobs
 from scenechat.errors import SceneChatError, stage_error
 from scenechat.generation import (
     generate_character_specs,
@@ -28,15 +30,18 @@ from scenechat.interventions import (
     public_intervention,
     validate_intervention,
 )
-from scenechat.pacing import PacingPolicy, initialize_arc
+from scenechat.pacing import PacingPolicy, initialize_arc, arc_view
 from scenechat.preflight import (
     validate_embedding_model_availability,
     validate_generation_model_availability,
 )
-from scenechat.persistence import SCHEMA_VERSION, SessionStore, runtime_session_from_export
+from scenechat.persistence import SCHEMA_VERSION, SessionStore, runtime_session_from_export, scenario_from_dict
 from scenechat.providers import get_simulation_llm
 from scenechat.scenario import (
     ScenarioPackage,
+    ScenarioBrief,
+    WorldSpec,
+    CharacterSpec,
     ScenarioValidationError,
     agents_from_character_specs,
     normalize_scenario_phase_references,
@@ -87,11 +92,19 @@ def load_story_session(session_id: str) -> dict | None:
 
 def persist_story_session(session_id: str, session: dict) -> None:
     if session.get("deleted"):
-        return
+        raise SceneChatError("session_deleted", "推演已被删除，已停止生成。", stage="simulation", status_code=409)
     try:
-        session_store.save(full_session_export(session_id, session))
+        control = CURRENT_BUILD.get()
+        owner = getattr(control, "owner", None)
+        if control:
+            control.check()
+        if not session_store.save(full_session_export(session_id, session), build_owner=owner):
+            control.cancelled.set()
+            control.check()
     except Exception:
         app.logger.exception("story.persist status=failed session=%s", session_id)
+        story_sessions.pop(session_id, None)
+        raise
 
 
 def error_response(error: SceneChatError):
@@ -143,6 +156,9 @@ def acquire_session_operation(session: dict, expected_revision):
 
 
 def run_stage(session_id: str, stage: str, label: str, operation):
+    control = CURRENT_BUILD.get()
+    if control:
+        control.check()
     started_at = time.perf_counter()
     app.logger.info(
         "story.start stage=%s label=%s status=started session=%s",
@@ -152,6 +168,8 @@ def run_stage(session_id: str, stage: str, label: str, operation):
     )
     try:
         result = operation()
+        if control:
+            control.check()
     except Exception as exc:
         error = stage_error(stage, exc)
         app.logger.exception(
@@ -186,6 +204,9 @@ BUILD_STAGE_LABELS = {
 
 
 def build_progress_event(stage: str, status: str, **details):
+    control = CURRENT_BUILD.get()
+    if control and status == "started" and control.stage != stage:
+        control.begin_step(stage)
     return {
         "type": "build_progress",
         "stage": stage,
@@ -273,6 +294,28 @@ def story_ready_payload(
 
 
 def build_story_events(user_prompt: str, scene_override: str, session_id: str):
+    control = CURRENT_BUILD.get()
+    existing = load_story_session(session_id)
+    if existing is not None:
+        yield {"type": "story_ready", "data": story_ready_payload(
+            session_id, existing["scenario"], existing["state"], existing["scene"]
+        )}
+        return
+
+    def saved(key, operation, encode, decode):
+        checkpoint = getattr(control, "checkpoint", {})
+        if key in checkpoint:
+            control.progress(reason="已恢复完成的检查点，无需重新生成")
+            return decode(checkpoint[key])
+        result = operation()
+        if control and hasattr(control, "save_checkpoint"):
+            control.save_checkpoint(key, encode(result))
+        return result
+
+    def save_package(package):
+        if control and hasattr(control, "save_checkpoint"):
+            control.save_checkpoint("package", package.to_dict())
+
     yield build_progress_event("embedding_preflight", "started")
     run_stage(
         session_id, "preflight", BUILD_STAGE_LABELS["embedding_preflight"],
@@ -293,7 +336,8 @@ def build_story_events(user_prompt: str, scene_override: str, session_id: str):
         session_id,
         "scenario_generation",
         BUILD_STAGE_LABELS["brief"],
-        lambda: generate_scenario_brief(user_prompt, scene_override),
+        lambda: saved("brief", lambda: generate_scenario_brief(user_prompt, scene_override),
+                      lambda item: item.to_dict(), ScenarioBrief.from_mapping),
     )
     yield build_progress_event(
         "brief",
@@ -307,7 +351,7 @@ def build_story_events(user_prompt: str, scene_override: str, session_id: str):
         session_id,
         "scenario_generation",
         BUILD_STAGE_LABELS["world"],
-        lambda: generate_world_spec(user_prompt, brief),
+        lambda: saved("world", lambda: generate_world_spec(user_prompt, brief), asdict, WorldSpec.from_mapping),
     )
     yield build_progress_event("world", "completed", title=world.title)
 
@@ -316,21 +360,28 @@ def build_story_events(user_prompt: str, scene_override: str, session_id: str):
         session_id,
         "scenario_generation",
         BUILD_STAGE_LABELS["characters"],
-        lambda: generate_character_specs(user_prompt, brief, world),
+        lambda: saved("characters", lambda: generate_character_specs(user_prompt, brief, world),
+                      lambda items: [asdict(item) for item in items],
+                      lambda items: [CharacterSpec.from_mapping(item, i) for i, item in enumerate(items, 1)]),
     )
     yield build_progress_event(
         "characters", "completed", character_count=len(characters)
     )
 
     yield build_progress_event("validation", "started")
-    package = ScenarioPackage(brief=brief, world=world, characters=characters)
+    checkpoint = getattr(control, "checkpoint", {})
+    package = scenario_from_dict(checkpoint["package"]) if "package" in checkpoint else ScenarioPackage(brief=brief, world=world, characters=characters)
     normalize_scenario_phase_references(package)
+    save_package(package)
     issues = validate_scenario_package(package, user_prompt=user_prompt)
     repair_attempts = 0
     for attempt in range(scenario_semantic_repair_attempts()):
         if not issues:
             break
         repair_attempts += 1
+        if control:
+            control.progress(repair_attempt=repair_attempts, issue_count=len(issues), issues=issues[:30])
+        app.logger.info("story.repair session=%s attempt=%d issues=%s", session_id, repair_attempts, issues)
         yield build_progress_event(
             "validation",
             "started",
@@ -348,6 +399,7 @@ def build_story_events(user_prompt: str, scene_override: str, session_id: str):
             lambda: repair_scenario_package(user_prompt, package, issues),
         )
         normalize_scenario_phase_references(package)
+        save_package(package)
         issues = validate_scenario_package(package, user_prompt=user_prompt)
     if issues:
         raise stage_error("scenario_generation", ScenarioValidationError(issues))
@@ -372,6 +424,8 @@ def build_story_events(user_prompt: str, scene_override: str, session_id: str):
         lambda: agents_from_character_specs(package.characters),
     )
     state = SimulationState(initial_scene, agents, world_spec=package.world)
+    if control is not None:
+        state.model_requests = list(getattr(control, "model_requests", []))
     initialize_arc(state)
     knowledge_base = run_stage(
         session_id,
@@ -405,6 +459,8 @@ def build_story_events(user_prompt: str, scene_override: str, session_id: str):
             scenario_payload=package.to_dict(),
         ),
     )
+    if control:
+        control.check()
     story_sessions[session_id] = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "prompt": user_prompt,
@@ -446,6 +502,7 @@ def message_to_frontend(msg: Message):
         "end_signal": msg.end_signal,
         "end_reason": msg.end_reason,
         "event_id": msg.event_id,
+        "public_changes": msg.public_changes,
         "visibility_scopes": msg.scopes,
         "location": msg.location,
         "intent": {
@@ -459,6 +516,7 @@ def message_to_frontend(msg: Message):
                 "memory_candidates",
                 "used_memory_ids",
                 "claim_updates",
+                "arc_updates",
             }
         },
     }
@@ -467,6 +525,7 @@ def message_to_frontend(msg: Message):
 def director_state_event(state: SimulationState, *, include_quality: bool = False):
     return {
         "type": "director_state",
+        "arc_state": arc_view(state),
         "revision": state.revision,
         "turn_count": state.turn_count,
         "current_phase": state.current_phase,
@@ -510,6 +569,13 @@ def replay_page_response(
 
 @app.route("/api/story/start", methods=["POST"])
 def start_story():
+    # Legacy synchronous API shares wall-clock limits; web clients use the
+    # resumable stream below, which also provides cancellation and checkpoints.
+    with BuildControl().activate():
+        return _start_story_sync()
+
+
+def _start_story_sync():
     data = request.get_json(silent=True)
     if not data:
         return request_error(
@@ -630,40 +696,43 @@ def start_story_stream():
     if not user_prompt:
         return request_error("prompt_missing", "请输入实验设定后再开始生成。")
 
-    session_id = str(uuid.uuid4())
-    app.logger.info("story.start status=received session=%s", session_id)
+    try:
+        events = build_jobs.start(user_prompt, scene_override, data.get("build_id"))
+    except SceneChatError as exc:
+        return error_response(exc)
 
     def generate():
         try:
-            for event in build_story_events(user_prompt, scene_override, session_id):
+            for event in events:
                 yield json.dumps(event, ensure_ascii=False) + "\n"
-        except SceneChatError as error:
-            yield json.dumps(
-                {
-                    "type": "error",
-                    "error": error.to_payload()["error"],
-                },
-                ensure_ascii=False,
-            ) + "\n"
-        except Exception as exc:
-            error = stage_error("internal", exc)
-            app.logger.exception(
-                "story.start status=failed session=%s code=%s",
-                session_id,
-                error.code,
-            )
-            yield json.dumps(
-                {
-                    "type": "error",
-                    "error": error.to_payload()["error"],
-                },
-                ensure_ascii=False,
-            ) + "\n"
+        finally:
+            events.close()
 
     return Response(
         stream_with_context(generate()),
         mimetype="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+build_jobs = BuildJobs(lambda: session_store, build_story_events)
+
+
+@app.route("/api/story/build/<build_id>/cancel", methods=["POST"])
+def cancel_story_build(build_id):
+    if session_store.load_build(build_id) is None:
+        return request_error("build_not_found", "构建检查点不存在。", status_code=404)
+    build_jobs.cancel(build_id)
+    return jsonify({"build_id": build_id, "status": "cancelling"})
+
+
+@app.route("/api/story/build/<build_id>", methods=["GET"])
+def story_build_status(build_id):
+    row = session_store.load_build(build_id)
+    if row is None:
+        return request_error("build_not_found", "构建检查点不存在。", status_code=404)
+    return jsonify({"build_id": build_id, "status": row["status"],
+                    "completed_stages": list(row["payload"]["checkpoint"])})
 
 
 @app.route("/api/story/next-stream", methods=["POST"])
@@ -809,6 +878,8 @@ def next_story_page_stream():
 
         try:
             while len(page_request["messages"]) < target_count:
+                if session.get("deleted"):
+                    raise SceneChatError("session_deleted", "推演已被删除，已停止生成。", stage="simulation", status_code=409)
                 if not getattr(state, "can_continue", not state.ended):
                     break
                 msg = simulate_next_event(state, knowledge_base, llm=simulation_llm)
@@ -821,6 +892,15 @@ def next_story_page_stream():
                 sent_count += 1
                 serialized = message_to_frontend(msg)
                 page_request["messages"].append(serialized)
+
+                # Save before publishing. Failed persistence evicts the mutated cache;
+                # a retry reloads the last durable state instead of duplicating effects.
+                try:
+                    persist_story_session(session_id, session)
+                except Exception:
+                    page_request["messages"].pop()
+                    sent_count -= 1
+                    raise
 
                 yield json.dumps({
                     "type": "message",
@@ -1060,9 +1140,8 @@ def get_story_session(session_id):
 
     pages = []
     completed_requests = [
-        item
-        for item in session.get("page_requests", {}).values()
-        if item.get("status") == "completed"
+        {**item, "request_id": request_id}
+        for request_id, item in session.get("page_requests", {}).items()
     ]
     for page_request in sorted(completed_requests, key=lambda item: item.get("page") or 0):
         done = page_request.get("done") or {}
@@ -1073,13 +1152,23 @@ def get_story_session(session_id):
             "endReason": done.get("end_reason", ""),
             "endKind": done.get("end_kind", ""),
             "runStatus": done.get("run_status", "running"),
-            "requestId": done.get("request_id"),
+            "requestId": done.get("request_id") or page_request["request_id"],
+            "requestStatus": page_request.get("status"),
         })
+
+    inherited = (session.get("provenance") or {}).get("inherited_event_count", 0)
+    if inherited:
+        pages.insert(0, {"page": 1, "messages": [message_to_frontend(m) for m in state.history[:inherited]],
+                      "isEnd": session["ended"], "endReason": state.end_reason})
+    elif not pages and state.history:
+        pages.append({"page": session["page"], "messages": [message_to_frontend(m) for m in state.history],
+                      "isEnd": session["ended"], "endReason": state.end_reason})
 
     return jsonify({
         "session_id": session_id,
         "page": session["page"],
         "isEnd": session["ended"],
+        "provenance": session.get("provenance"),
         "prompt": session["prompt"],
         "scene": session["scene"],
         "worldview": session["scenario"].public_worldview_markdown,
@@ -1087,15 +1176,7 @@ def get_story_session(session_id):
         "scenario": public_scenario_payload(session["scenario"], state),
         "max_turns": MAX_TURNS,
         "revision": state.revision,
-        "arc_state": {
-            "pace": state.arc_state.pace,
-            "progress": state.arc_state.progress,
-            "tension": state.arc_state.tension,
-            "target_end_turn": state.arc_state.target_end_turn,
-            "turns_since_progress": state.arc_state.turns_since_progress,
-            "active_beat_ids": state.arc_state.active_beat_ids,
-            "resolved_beat_ids": state.arc_state.resolved_beat_ids,
-        },
+        "arc_state": arc_view(state),
         "interventions": [public_intervention(item) for item in state.interventions],
         "turn_count": state.turn_count,
         "current_phase": state.current_phase,
@@ -1122,8 +1203,74 @@ def get_story_session(session_id):
     })
 
 
+@app.route("/api/story/import/preview", methods=["POST"])
+def preview_story_import():
+    from scenechat.save_validation import validate_import
+    if request.content_length and request.content_length > 20 * 1024 * 1024:
+        return request_error("import_too_large", "存档超过 20 MB 导入上限。", 413)
+    try:
+        return jsonify(validate_import(request.get_json(silent=True)))
+    except ValueError as exc:
+        return request_error("import_invalid", str(exc))
+
+
+@app.route("/api/story/import", methods=["POST"])
+def import_story():
+    from scenechat.save_validation import validate_import
+    if request.content_length and request.content_length > 20 * 1024 * 1024:
+        return request_error("import_too_large", "存档超过 20 MB 导入上限。", 413)
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return request_error("import_invalid", "导入请求必须是 JSON 对象。")
+    try:
+        validate_import(data.get("payload"))
+        request_id = str(data.get("request_id") or "")
+        if not 1 <= len(request_id) <= 160:
+            raise ValueError("导入需要有效的请求标识。")
+        new_id = session_store.copy_session(request_id=request_id, payload=data["payload"])
+        return jsonify({"session_id": new_id})
+    except ValueError as exc:
+        return request_error("import_invalid", str(exc))
+
+
+@app.route("/api/story/session/<session_id>/checkpoints", methods=["GET"])
+def list_story_checkpoints(session_id):
+    if not session_store.load(session_id):
+        return request_error("session_not_found", "会话不存在。", 404)
+    return jsonify({"checkpoints": session_store.checkpoints(session_id)})
+
+
+@app.route("/api/story/session/<session_id>/branch", methods=["POST"])
+def branch_story(session_id):
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return request_error("checkpoint_invalid", "分支请求必须是 JSON 对象。")
+    try:
+        if type(data.get("revision")) is not int or data["revision"] < 0:
+            raise ValueError("请选择实际存在的检查点。")
+        request_id = str(data.get("request_id") or "")
+        if not 1 <= len(request_id) <= 160:
+            raise ValueError("分支需要有效的请求标识。")
+        new_id = session_store.copy_session(request_id=request_id, source_id=session_id, revision=data["revision"])
+        return jsonify({"session_id": new_id})
+    except ValueError as exc:
+        return request_error("checkpoint_invalid", str(exc), 409)
+
+
+@app.route("/api/story/session/<session_id>/changes/<event_id>", methods=["GET"])
+def get_story_changes(session_id, event_id):
+    session = load_story_session(session_id)
+    message = next((m for m in session["state"].history if m.event_id == event_id), None) if session else None
+    if message is None:
+        return request_error("event_not_found", "事件不存在。", 404)
+    return jsonify({"changes": message.director_changes, "visibility": "director_only"})
+
+
 def full_session_export(session_id: str, session: dict) -> dict:
     """Build an explicit owner export, including private scenario and agent state."""
+    from scenechat.benchmark import public_run_metadata
+    if not session.get("run_metadata"):
+        session["run_metadata"] = public_run_metadata()
     state: SimulationState = session["state"]
     initialize_arc(state)
     package: ScenarioPackage = session["scenario"]
@@ -1140,6 +1287,7 @@ def full_session_export(session_id: str, session: dict) -> dict:
 
     return {
         "schema_version": SCHEMA_VERSION,
+        "run_metadata": session["run_metadata"],
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "session": {
             "id": session_id,
@@ -1149,6 +1297,7 @@ def full_session_export(session_id: str, session: dict) -> dict:
             "page": session["page"],
             "ended": session["ended"],
             "max_turns": MAX_TURNS,
+            "provenance": session.get("provenance"),
         },
         "scenario": package.to_dict(),
         "documents": {
@@ -1166,6 +1315,8 @@ def full_session_export(session_id: str, session: dict) -> dict:
             "current_phase": state.current_phase,
             "phase_action_log": sorted(state.phase_action_log),
             "world_state": state.world_state,
+            "entity_states": state.entity_states,
+            "model_requests": state.model_requests,
             "public_rules": state.public_rules,
             "termination_conditions": state.termination_conditions,
             "ended": state.ended,
@@ -1208,11 +1359,16 @@ def export_story_session(session_id):
             status_code=404,
         )
 
-    content = json.dumps(
-        full_session_export(session_id, session),
-        ensure_ascii=False,
-        indent=2,
-    )
+    lock = session.setdefault("operation_lock", threading.Lock())
+    acquired = lock.acquire(blocking=False)
+    try:
+        payload = full_session_export(session_id, session) if acquired else session_store.load(session_id)
+        if payload is None:
+            return request_error("snapshot_unavailable", "尚无已提交的完整状态，请稍后导出。", 409)
+        content = json.dumps(payload, ensure_ascii=False, indent=2)
+    finally:
+        if acquired:
+            lock.release()
     return Response(
         content,
         mimetype="application/json",
@@ -1241,6 +1397,7 @@ def list_story_sessions():
 
 @app.route("/api/story/sessions", methods=["DELETE"])
 def clear_story_sessions():
+    build_jobs.cancel_all()
     for session in story_sessions.values():
         session["deleted"] = True
     story_sessions.clear()

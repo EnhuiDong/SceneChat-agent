@@ -4,6 +4,8 @@ from .errors import SceneChatError, classify_provider_error
 from .openai_compat import response_content
 from .providers import get_embedding_model, get_generation_chat_model
 from .scenario import extract_json_object
+from .build_control import CURRENT_BUILD
+from .telemetry import measured_call
 
 
 @dataclass(frozen=True)
@@ -13,10 +15,16 @@ class ModelPreflightResult:
 
 
 def _probe_generation_model(generation_model) -> None:
-    response = generation_model.invoke(
-        [("user", '只输出这个 JSON 对象：{"ok":true}')],
-        max_tokens=12,
-        response_format={"type": "json_object"},
+    control = CURRENT_BUILD.get()
+    response = measured_call(
+        control.model_requests if control is not None else [],
+        stage="preflight", purpose="chat_availability",
+        model=getattr(generation_model, "model_name", "configured"),
+        operation=lambda: generation_model.invoke(
+            [("user", '只输出这个 JSON 对象：{"ok":true}')],
+            max_tokens=12,
+            response_format={"type": "json_object"},
+        ),
     )
     payload = extract_json_object(response_content(response))
     if payload.get("ok") is not True:
@@ -65,6 +73,10 @@ def validate_generation_model_availability() -> str:
         raise
     except Exception as exc:
         raise classify_provider_error(exc, service="生成模型") from exc
+    finally:
+        close = getattr(generation_model, "close", None)
+        if close:
+            close()
     return str(generation_model.model_name)
 
 

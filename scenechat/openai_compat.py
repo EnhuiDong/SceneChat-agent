@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any, Iterable
+import asyncio
+
+from .build_control import CURRENT_BUILD, await_controlled
+from .config import config_int
 
 
 def create_openai_client(
@@ -90,7 +94,11 @@ class OpenAICompatibleChatModel:
         if self.extra_body:
             request["extra_body"] = dict(self.extra_body)
 
-        response = self.client.chat.completions.create(**request)
+        control = CURRENT_BUILD.get()
+        if control is None:
+            response = self.client.chat.completions.create(**request)
+        else:
+            response = asyncio.run(self._controlled_request(request, control))
         choices = getattr(response, "choices", None) or []
         if not choices:
             raise ValueError("生成模型没有返回任何候选结果")
@@ -100,4 +108,23 @@ class OpenAICompatibleChatModel:
         return SimpleNamespace(
             content=response_content(getattr(message, "content", "")),
             raw=response,
+            finish_reason=getattr(choices[0], "finish_reason", ""),
         )
+
+    async def _controlled_request(self, request, control):
+        from openai import AsyncOpenAI
+
+        control.check()
+        timeout = config_int("scenario", "request_timeout_seconds", 120, minimum=1, maximum=600)
+        configured_read_timeout = getattr(self.client.timeout, "read", None)
+        if configured_read_timeout is not None:
+            timeout = min(timeout, configured_read_timeout)
+        # No SDK retries here: structured generation owns the sole retry loop.
+        async with AsyncOpenAI(
+            api_key=self.client.api_key, base_url=str(self.client.base_url),
+            timeout=timeout, max_retries=0,
+        ) as client:
+            return await await_controlled(client.chat.completions.create(**request), control, timeout)
+
+    def close(self):
+        self.client.close()

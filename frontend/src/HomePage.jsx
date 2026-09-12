@@ -3,6 +3,8 @@ import { useLocation, useNavigate } from "react-router-dom";
 import { clearStoryStorage, saveStorySetup } from "./scenarioStorage";
 import { clearStorySessions, deleteStorySession, fetchStorySession, listStorySessions } from "./storyApi";
 import "./HomePage.css";
+import "./SessionTools.css";
+import { ImportSession } from "./SessionTools";
 
 const EXAMPLES = [
   "七人狼人杀，角色自行发言、投票并推进昼夜阶段",
@@ -90,6 +92,7 @@ function HomePage() {
       if (action.type === "clear") {
         await clearStorySessions();
         clearStoryStorage(localStorage);
+        localStorage.removeItem("story_pending_build");
         setHistory([]);
       } else {
         await deleteStorySession(action.session.id);
@@ -173,7 +176,8 @@ function HomePage() {
         </form>
 
         <section className="story-library" aria-labelledby="story-library-title">
-          <header><div><span>LOCAL ARCHIVE</span><h2 id="story-library-title">历史推演</h2></div>{history.length ? <button type="button" className="clear-history" onClick={() => setConfirmAction({ type: "clear" })}>清除全部</button> : null}</header>
+          <ImportSession onImported={continueStory} />
+          <header><div><span>LOCAL ARCHIVE</span><h2 id="story-library-title">历史推演</h2></div><button type="button" className="clear-history" disabled={historyLoading || Boolean(historyBusy)} onClick={() => setConfirmAction({ type: "clear" })}>清除全部</button></header>
           {historyLoading ? <p className="library-empty">正在读取本机记录…</p> : history.length ? (
             <div className="story-history-list">{history.map((item) => (
               <article key={item.id}>
@@ -203,7 +207,7 @@ function HomePage() {
         <div className="home-modal-overlay" onClick={() => setConfirmAction(null)}>
           <div className="home-modal" role="alertdialog" aria-modal="true" aria-labelledby="confirm-modal-title" onClick={(event) => event.stopPropagation()}>
             <div className="home-modal-title" id="confirm-modal-title">{confirmAction.type === "clear" ? "清除全部推演？" : "删除这次推演？"}</div>
-            <div className="home-modal-text">{confirmAction.type === "clear" ? "所有历史推演、人物状态和事件记录都会从本机删除，且无法撤销。" : `“${confirmAction.session.title}”及其全部人物和历史记录会被永久删除。`}</div>
+            <div className="home-modal-text">{confirmAction.type === "clear" ? "所有历史推演、人物状态、事件记录及未完成的构建检查点都会从本机删除，且无法撤销。" : `“${confirmAction.session.title}”及其全部人物和历史记录会被永久删除。`}</div>
             <div className="home-modal-actions confirm-actions"><button type="button" className="cancel-confirm" onClick={() => setConfirmAction(null)}>取消</button><button type="button" className="danger-confirm" onClick={runConfirmedAction}>确认删除</button></div>
           </div>
         </div>

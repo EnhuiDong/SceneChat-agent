@@ -10,6 +10,10 @@ from .visibility import normalize_scopes
 
 
 VALID_VISIBILITIES = {"public", "director_only", "audience_only"}
+VALID_TERMINATION_KINDS = {
+    "faction_eliminated", "faction_parity", "world_equals", "entity_equals",
+    "all_goals_completed", "all_active_at_location", "all_of", "any_of", "manual",
+}
 VALID_SCHEDULERS = {
     "round_robin",
     "phase_order",
@@ -18,6 +22,8 @@ VALID_SCHEDULERS = {
     "event_first",
 }
 VALID_PATCH_OPERATIONS = {
+    "set_entity",
+    "settle_votes",
     "set_world",
     "increment_world",
     "move_agent",
@@ -330,11 +336,17 @@ class RuleSpec:
     target_scope: str = "same_location"
     effects: list[PatchTemplate] = field(default_factory=list)
     visibility: list[str] = field(default_factory=lambda: ["public"])
+    priority: int = 0
+    effect_mode: str = "rule"
+    behavior_template: str = ""
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any], index: int) -> "RuleSpec":
         return cls(
             id=_text(data.get("id"), f"rule-{index}"),
+            priority=int(data.get("priority", 0)),
+            effect_mode=_text(data.get("effect_mode"), "rule"),
+            behavior_template=_text(data.get("behavior_template")),
             description=_text(data.get("description")),
             action_type=_text(data.get("action_type"), "act"),
             phases=_string_list(data.get("phases")),
@@ -362,6 +374,7 @@ class TerminationRule:
     conditions: list["TerminationRule"] = field(default_factory=list)
     phases: list[str] = field(default_factory=list)
     location: str = ""
+    target: str = ""
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any], index: int) -> "TerminationRule":
@@ -381,6 +394,7 @@ class TerminationRule:
             ],
             phases=_string_list(data.get("phases")),
             location=_text(data.get("location")),
+            target=_text(data.get("target")),
         )
 
 
@@ -395,6 +409,8 @@ class BeatSpec:
     prerequisites: list[str] = field(default_factory=list)
     phase_hint: str = ""
     resolution_signals: list[str] = field(default_factory=list)
+    completion_conditions: list[dict[str, Any]] = field(default_factory=list)
+    completion_mode: str = "narrative"
 
     @classmethod
     def from_value(cls, value: Any, index: int) -> "BeatSpec":
@@ -413,6 +429,8 @@ class BeatSpec:
             prerequisites=_string_list(data.get("prerequisites")),
             phase_hint=_text(data.get("phase_hint")),
             resolution_signals=_string_list(data.get("resolution_signals")),
+            completion_mode=_text(data.get("completion_mode"), "narrative"),
+            completion_conditions=list(data.get("completion_conditions") or []),
         )
 
 
@@ -461,6 +479,10 @@ class WorldSpec:
     rules: list[RuleSpec] = field(default_factory=list)
     termination_rules: list[TerminationRule] = field(default_factory=list)
     relationship_dimensions: list[RelationshipDimensionSpec] = field(default_factory=list)
+    execution_version: int = 1
+    entities: dict[str, dict[str, Any]] = field(default_factory=dict)
+    audience_policy: str = "limited"
+    reveal_policy: str = "preserve_suspense"
 
     def __post_init__(self) -> None:
         if not self.beat_specs and self.target_beats:
@@ -473,6 +495,17 @@ class WorldSpec:
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> "WorldSpec":
+        if data.get("execution_version", 1) == 2:
+            for rule in data.get("rules") or []:
+                if not isinstance(rule, dict):
+                    raise ValueError("规则必须是对象")
+                for part in [rule, *(rule.get("effects") or [])]:
+                    if not isinstance(part, dict):
+                        raise ValueError("effect 必须是对象")
+                    if any(part.get(key) for key in ("condition", "conditions", "preconditions", "when", "script", "code")):
+                        raise ValueError("规则不支持条件表达式或脚本；请使用已声明的阶段、目标和白名单操作")
+                    if "op" in part and (part["op"] not in VALID_PATCH_OPERATIONS or any(key in part for key in ("params", "arguments", "path"))):
+                        raise ValueError("effect 必须使用白名单 op，key/target/value/amount 应位于同一层；不支持 params/path 或自造操作")
         scheduler = _text(data.get("scheduler"), "round_robin")
         if scheduler not in VALID_SCHEDULERS:
             scheduler = "round_robin"
@@ -507,6 +540,10 @@ class WorldSpec:
         ]
         return cls(
             title=_text(data.get("title"), "未命名互动场景"),
+            execution_version=int(data.get("execution_version", 1)),
+            entities=dict(data.get("entities") or {}),
+            audience_policy=_text(data.get("audience_policy"), "limited"),
+            reveal_policy=_text(data.get("reveal_policy"), "preserve_suspense"),
             opening_scene=_text(data.get("opening_scene")),
             public_world_markdown=_text(data.get("public_world_markdown")),
             director_notes_markdown=_text(data.get("director_notes_markdown")),
@@ -946,11 +983,7 @@ def normalize_scenario_phase_references(package: ScenarioPackage) -> None:
         "or": "any_of",
         "manual_trigger": "manual",
     }
-    valid_termination_kinds = {
-        "faction_eliminated", "faction_parity", "world_equals",
-        "all_goals_completed", "all_active_at_location", "all_of",
-        "any_of", "manual",
-    }
+    valid_termination_kinds = VALID_TERMINATION_KINDS
 
     def winner_faction(winner: str) -> str:
         normalized_winner = re.sub(r"(?:阵营|faction|team)", "", winner.lower()).strip()
@@ -1087,7 +1120,7 @@ def validate_scenario_package(package: ScenarioPackage, *, user_prompt: str | No
                 ability.action_type,
                 set(),
             )
-            if any(effect.op not in allowed_effects for effect in ability.effects):
+            if package.world.execution_version == 1 and any(effect.op not in allowed_effects for effect in ability.effects):
                 issues.append(
                     f"角色“{character.name}”的能力“{ability.name}”包含与行动类型不匹配的 effect"
                 )
@@ -1107,7 +1140,7 @@ def validate_scenario_package(package: ScenarioPackage, *, user_prompt: str | No
             rule.action_type,
             set(),
         ) | {"set_phase"}
-        if any(effect.op not in allowed_effects for effect in rule.effects):
+        if package.world.execution_version == 1 and any(effect.op not in allowed_effects for effect in rule.effects):
             issues.append(f"规则“{rule.id}”包含与行动类型不匹配的 effect")
 
     fact_ids = [fact.id for fact in package.world.facts]
@@ -1147,16 +1180,7 @@ def validate_scenario_package(package: ScenarioPackage, *, user_prompt: str | No
     if any(has_beat_cycle(beat_id) for beat_id in beat_dependencies):
         issues.append("剧情节拍的前置关系存在循环依赖")
 
-    valid_termination_kinds = {
-        "faction_eliminated",
-        "faction_parity",
-        "world_equals",
-        "all_goals_completed",
-        "all_active_at_location",
-        "all_of",
-        "any_of",
-        "manual",
-    }
+    valid_termination_kinds = VALID_TERMINATION_KINDS
 
     def check_termination(rule: TerminationRule) -> None:
         if rule.kind not in valid_termination_kinds:

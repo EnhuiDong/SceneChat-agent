@@ -222,22 +222,46 @@ class IntentResolver:
             return Resolution(False, "该行动没有对应的角色能力或场景规则", intent)
 
         target_error = self._validate_target(state, actor, intent, ability, rule)
+        if not target_error and ability is not None and rule is not None and getattr(state.world_spec, "execution_version", 1) == 2:
+            target_error = self._validate_target(state, actor, intent, ability, None)
         if target_error:
             return Resolution(False, target_error, intent)
         self._sanitize_conversation_metadata(state, actor, intent)
 
         patch = StatePatch()
         observations: dict[str, str] = {}
+        version = getattr(state.world_spec, "execution_version", 1)
+        mode = getattr(rule, "effect_mode", "rule") if version == 2 else "stack"
+        if version == 2 and mode == "ability" and ability is None:
+            return Resolution(False, "该规则要求明确选择一个角色能力", intent)
         if ability is not None:
             patch.add("consume_ability", target=actor.name, key=ability.id, amount=1)
             for effect in ability.effects:
-                self._expand_effect(patch, effect, intent)
-        if rule is not None:
+                if rule is None or mode in {"ability", "stack"} or effect.get("op") == "consume_resource":
+                    self._expand_effect(patch, effect, intent)
+        if rule is not None and mode in {"rule", "stack"}:
             for effect in rule.effects:
                 self._expand_effect(patch, asdict(effect), intent)
 
-        self._apply_builtin_effects(state, actor, intent, patch, observations)
+        if version == 1:
+            self._apply_builtin_effects(state, actor, intent, patch, observations)
+        elif getattr(rule, "behavior_template", "") == "legacy_tabletop":
+            template_patch = StatePatch()
+            self._apply_builtin_effects(state, actor, intent, template_patch, observations)
+            if rule.effects and mode != "stack":
+                return Resolution(False, "模板与显式效果叠加必须声明 effect_mode=stack", intent)
+            # A template already includes record_vote/heal etc.; identical ops run once.
+            def effect_key(operation):
+                return tuple((key, operation.get(key)) for key in ("op", "target", "key", "value", "actor") if operation.get(key) not in (None, ""))
+            for operation in template_patch.operations:
+                if not any(effect_key(operation) == effect_key(existing) for existing in patch.operations):
+                    patch.operations.append(operation)
         self._append_phase_transition(state, actor, intent, patch)
+        if version == 2:
+            from .mechanics import validate_patch
+            error = validate_patch(state, patch.operations)
+            if error:
+                return Resolution(False, error, intent)
         scopes = list(
             getattr(ability, "visibility", [])
             or getattr(rule, "visibility", [])
@@ -609,6 +633,10 @@ class IntentResolver:
                 field = state.state_schema.get(str(key))
                 if (
                     state._valid_world_value(str(key), value)
+                    and (
+                        getattr(state.world_spec, "execution_version", 1) == 1
+                        or (field is not None and "director" in field.mutable_by)
+                    )
                     and (field is None or "public" in field.visibility)
                     and state.world_state.get(str(key)) != value
                 ):
@@ -645,7 +673,7 @@ class IntentResolver:
 
     @staticmethod
     def _matching_rule(state: SimulationState, actor: AgentState, intent: Intent):
-        for rule in state.rules:
+        for rule in sorted(state.rules, key=lambda rule: -getattr(rule, "priority", 0)) if getattr(state.world_spec, "execution_version", 1) == 2 else state.rules:
             if rule.action_type != intent.action_type:
                 continue
             if rule.phases and state.current_phase not in rule.phases:
@@ -664,6 +692,19 @@ class IntentResolver:
                 return "目标地点不在场景允许地点中"
             return ""
         scope = getattr(ability, "target_scope", "") or getattr(rule, "target_scope", "") or "none"
+        if getattr(state.world_spec, "execution_version", 1) == 2:
+            if getattr(rule, "behavior_template", "") == "legacy_tabletop" and intent.action_type in TARGETED_ACTIONS and intent.target not in state.agents:
+                return "传统桌游模板必须指定存在的目标角色"
+            if rule is not None:
+                scope = rule.target_scope
+            if scope == "location":
+                return "" if intent.target in state.locations else "目标地点不存在"
+            if scope in {"object", "proposal"}:
+                from .mechanics import visible_entities
+                if intent.target not in visible_entities(state, actor):
+                    return "目标实体不存在或角色无权访问"
+                entity = getattr(state.world_spec, "entities", {}).get(intent.target, {})
+                return "" if entity.get("kind") == scope else "目标实体不存在或类型不匹配"
         if intent.action_type in TARGETED_ACTIONS and not intent.target:
             return "该行动需要指定目标"
         if scope == "none":
@@ -686,7 +727,7 @@ class IntentResolver:
             return
         values = {}
         for key in ("key", "value", "target", "amount"):
-            value = effect.get(key)
+            value = effect.get(key, 1 if key == "amount" else None)
             if value == "$actor":
                 value = intent.actor
             elif value == "$target":
@@ -695,6 +736,8 @@ class IntentResolver:
                 value = intent.expected_effect
             values[key] = value
         patch.add(op, **values)
+        if op == "record_vote":
+            patch.operations[-1]["actor"] = intent.actor
 
     @staticmethod
     def _apply_builtin_effects(

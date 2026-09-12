@@ -34,6 +34,33 @@ def _beats(state: SimulationState) -> list[Any]:
     return list(getattr(state.world_spec, "beat_specs", []) or [])
 
 
+def arc_view(state):
+    from dataclasses import asdict
+    refresh_active_beats(state)
+    beats = _beats(state)
+    events = {m.event_id: m for m in state.history}
+    def evidence(beat):
+        items = []
+        for event_id in state.arc_state.beat_records.get(beat.id, {}).get("evidence_event_ids", []):
+            event = events.get(event_id)
+            if event is None:
+                continue
+            visible = event.visibility in {"public", "audience_only"}
+            items.append({"id": event_id, "turn": event.turn, "visible": visible,
+                          "speaker": event.speaker if visible else "",
+                          "excerpt": (event.speech or event.action)[:90] if visible else ""})
+        return items
+    return {
+        **asdict(state.arc_state),
+        "progress_mode": "milestones" if beats else "open_ended",
+        "completed_count": sum(b.id in state.arc_state.resolved_beat_ids for b in beats),
+        "total_count": len(beats),
+        "beats": [{"id": b.id, "description": b.description,
+                   **state.arc_state.beat_statuses.get(b.id, {}),
+                   "completion": state.arc_state.beat_records.get(b.id), "last_check": state.arc_state.beat_checks.get(b.id), "evidence": evidence(b)} for b in beats],
+    }
+
+
 def initialize_arc(state: SimulationState, *, reset_horizon: bool = False) -> None:
     """Initialize the target horizon and currently eligible beats."""
 
@@ -44,9 +71,8 @@ def initialize_arc(state: SimulationState, *, reset_horizon: bool = False) -> No
         remaining = max(6, round(base * policy.horizon_multiplier))
         state.arc_state.target_end_turn = state.turn_count + remaining
     refresh_active_beats(state)
-    if not beats and not state.ended:
-        horizon = max(state.turn_count + 1, state.arc_state.target_end_turn or 1)
-        state.arc_state.progress = min(0.92, state.turn_count / horizon)
+    if not beats:
+        state.arc_state.progress = 0.0
 
 
 def refresh_active_beats(state: SimulationState) -> None:
@@ -63,6 +89,14 @@ def refresh_active_beats(state: SimulationState) -> None:
     ]
     limit = PacingPolicy.from_value(state.arc_state.pace).active_beat_limit
     state.arc_state.active_beat_ids = eligible[:limit]
+    for beat in beats:
+        blocked = ""
+        if not set(beat.prerequisites).issubset(resolved): blocked = "前置节点尚未完成"
+        elif beat.phase_hint and beat.phase_hint != state.current_phase: blocked = "等待适用阶段"
+        status = "completed" if beat.id in resolved else "skipped" if beat.id in skipped else "in_progress" if beat.id in state.arc_state.active_beat_ids else "available"
+        if status in {"completed", "skipped"}:
+            blocked = ""
+        state.arc_state.beat_statuses[beat.id] = {"status": status, "blocked_reason": blocked}
 
 
 def active_beat_context(state: SimulationState) -> str:
@@ -75,7 +109,7 @@ def active_beat_context(state: SimulationState) -> str:
             continue
         marker = "必须保留" if beat.required else "目标节点"
         signals = f"；可判定信号：{'、'.join(beat.resolution_signals)}" if beat.resolution_signals else ""
-        lines.append(f"- {beat.id}（{marker}）：{beat.description}{signals}")
+        lines.append(f"- {beat.id}（{marker}，{beat.completion_mode}）：{beat.description}{signals}；条件={beat.completion_conditions}")
     return "\n".join(lines) or "- 暂无明确节点；依据当前冲突自然推进"
 
 
@@ -94,10 +128,10 @@ def pacing_context(state: SimulationState) -> str:
         )
     return (
         f"节奏档位：{policy.label}（{policy.pace}/100）。{policy.direction}。\n"
-        f"剧情进度：{round(state.arc_state.progress * 100)}%；张力：{round(state.arc_state.tension * 100)}%。\n"
+        f"已完成节点：{len(state.arc_state.resolved_beat_ids)}/{len(_beats(state))}（无节点表示开放推进）；张力：{round(state.arc_state.tension * 100)}%。\n"
         f"预计收束轮次：约第 {state.arc_state.target_end_turn} 轮。该数字是软目标，不得牺牲人物逻辑或硬规则。\n"
         f"当前可推进节点：\n{active_beat_context(state)}"
-        f"{resolution_instruction}"
+        f"{resolution_instruction}\n任何节奏均不得跳过必要选择、信息获取和规则结算；慢速仍须产生新的反应或关系变化，不得重复问答。"
     )
 
 
@@ -116,23 +150,51 @@ def required_beats_resolved(state: SimulationState, additional: list[str] | None
     return all(not beat.required or beat.id in resolved for beat in _beats(state))
 
 
-def validate_resolved_beats(state: SimulationState, values: Any) -> list[str]:
+def validate_resolved_beats(state: SimulationState, values: Any, verified=None) -> list[str]:
     requested = [str(item) for item in values or []]
     active = set(state.arc_state.active_beat_ids)
-    return [beat_id for beat_id in requested if beat_id in active]
+    if getattr(state.world_spec, "execution_version", 1) == 1:
+        return list(dict.fromkeys(beat_id for beat_id in requested if beat_id in active))
+    return list(dict.fromkeys(beat_id for beat_id in requested if beat_id in active and beat_id in (verified or {})))
 
 
-def update_arc_after_message(state: SimulationState, message: Message) -> None:
+def update_arc_after_message(state: SimulationState, message: Message, *, previous_phase=None) -> None:
     initialize_arc(state)
     arc_updates = message.intent.get("arc_updates", {}) if isinstance(message.intent, dict) else {}
-    resolved_now = validate_resolved_beats(state, arc_updates.get("resolved_beat_ids", []))
+    verified = arc_updates.get("verified_beats", {})
+    resolved_now = validate_resolved_beats(state, arc_updates.get("resolved_beat_ids", []), verified)
+    if getattr(state.world_spec, "execution_version", 1) == 2:
+        from .beat_evidence import state_evidence
+        for beat in _beats(state):
+            eligible = (
+                beat.id not in state.arc_state.resolved_beat_ids
+                and beat.id not in state.arc_state.skipped_beat_ids
+                and set(beat.prerequisites).issubset(state.arc_state.resolved_beat_ids)
+                and (not beat.phase_hint or beat.phase_hint in {state.current_phase, previous_phase})
+            )
+            if eligible and beat.completion_mode == "state":
+                evidence = state_evidence(state, beat)
+                if evidence:
+                    resolved_now.append(beat.id)
+                    verified[beat.id] = {"method": "state", "evidence_event_ids": evidence, "reason": "声明条件已由提交的行动满足"}
     previous = set(state.arc_state.resolved_beat_ids)
     for beat_id in resolved_now:
         if beat_id not in previous:
             state.arc_state.resolved_beat_ids.append(beat_id)
+            state.arc_state.beat_records.setdefault(beat_id, {
+                **verified.get(beat_id, {"method": "legacy", "evidence_event_ids": []}),
+                "completed_at_turn": message.turn,
+            })
             previous.add(beat_id)
 
-    if resolved_now:
+    meaningful = bool(message.authoritative and message.kind != "narration" and (
+        message.intent.get("meaningful_state_change", False)
+        or message.intent.get("obligation_resolution") in {"satisfied", "withdrawn"}
+        or message.relationship_updates
+    ))
+    if message.kind == "intervention" or any(item.applied_at_turn == message.turn for item in state.interventions):
+        state.arc_state.plan_adjusted_at_turn = message.turn
+    if resolved_now or meaningful:
         state.arc_state.turns_since_progress = 0
     else:
         state.arc_state.turns_since_progress += 1
@@ -154,11 +216,6 @@ def update_arc_after_message(state: SimulationState, message: Message) -> None:
             max(1, beat.weight) for beat in beats if beat.id in previous
         )
         state.arc_state.progress = min(1.0, resolved_weight / total_weight)
-    elif state.ended:
-        state.arc_state.progress = 1.0
     else:
-        horizon = max(state.turn_count + 1, state.arc_state.target_end_turn or 1)
-        state.arc_state.progress = min(0.92, state.turn_count / horizon)
-    if state.ended:
-        state.arc_state.progress = 1.0
+        state.arc_state.progress = 0.0
     refresh_active_beats(state)
