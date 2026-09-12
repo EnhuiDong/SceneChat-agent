@@ -1,0 +1,12 @@
+.session-tools, .event-changes { margin: 12px 0; padding: 12px; border: 1px solid #ccd6cf; border-radius: 10px; background: #f6f8f5; color: #31443a; font-size: 13px; overflow-wrap: anywhere; }
+.session-tools summary, .event-changes summary { cursor: pointer; font-weight: 600; }
+.session-tools button, .event-changes button, .session-tools select { margin: 6px 8px 6px 0; padding: 8px 12px; border: 1px solid #a7b8ac; border-radius: 6px; background: white; color: #244832; cursor: pointer; max-width: 100%; }
+.session-tools button:disabled { opacity: .5; cursor: wait; }
+.session-tools label, .event-changes small, .event-changes span { display: block; }
+.session-tools input { display: block; margin-top: 8px; max-width: 100%; }
+.event-changes ul { padding-left: 18px; }
+.event-changes li { margin-bottom: 10px; }
+.event-changes small { color: #65766c; margin-top: 3px; }
+.session-tools [role=alert], .event-changes [role=alert] { color: #9d3030; }
+.session-tools :focus-visible, .event-changes :focus-visible { outline: 2px solid #397454; outline-offset: 3px; }
+.branch-origin { margin: 0; padding: 8px 24px; background: #edf3ee; color: #46644e; font-size: 12px; }
