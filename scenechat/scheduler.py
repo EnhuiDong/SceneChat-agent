@@ -15,6 +15,7 @@ class SchedulerDecision:
     thread_id: str = ""
     obligation_id: str = ""
     source_event_id: str = ""
+    phase_exit_rule_id: str = ""
 
 
 class SimulationScheduler:
@@ -40,10 +41,37 @@ class SimulationScheduler:
                 "blocked", reason=f"阶段“{state.current_phase}”没有符合规则的可行动角色，或阶段行动已耗尽但未完成切换"
             ))
 
+        exit_rule = self._due_phase_exit(state, phase, eligible)
+        if exit_rule is not None:
+            actor = self._round_robin_actor(
+                state, [agent for agent in eligible
+                        if matches_role(agent.role, exit_rule.allowed_roles)]
+            )
+            return self._record(state, SchedulerDecision(
+                "agent", actor.name,
+                f"本阶段已充分讨论；由角色按规则 {exit_rule.id} 执行阶段切换，避免重复争论",
+                phase_exit_rule_id=exit_rule.id,
+            ))
+
+        # Model-supplied urgency cannot starve the rest of an open phase.
+        recent_actors = [m.speaker for m in state.history if m.speaker in {a.name for a in eligible}]
+        window = max(4, len(eligible) * 2)
+        if len(recent_actors) >= window:
+            overdue = [a for a in eligible if a.name not in recent_actors[-window:]]
+            if overdue:
+                actor = max(overdue, key=lambda a: self._waiting_turns(state, a))
+                return self._record(state, SchedulerDecision("agent", actor.name, "避免连续插话使其他可行动角色长期无回合"))
+
         response_candidates = [agent for agent in eligible if agent.pending_intents]
         if response_candidates:
-            actor = max(response_candidates, key=self._response_priority)
-            pending = max(actor.pending_intents, key=self._pending_priority)
+            def response_score(agent, pending):
+                urgency, created = self._pending_priority(pending)
+                age = max(0, state.turn_count - created)
+                return ((1 if pending.get("address_scope", "specific") == "specific" else 0)
+                        + min(urgency, 1.0) * 0.4 + age / max(4, len(eligible))
+                        + self._waiting_turns(state, agent) / max(4, len(eligible)))
+            actor = max(response_candidates, key=lambda a: max(response_score(a, p) for p in a.pending_intents))
+            pending = max(actor.pending_intents, key=lambda p: response_score(actor, p))
             return self._record(state, SchedulerDecision(
                 "agent",
                 actor.name,
@@ -52,6 +80,23 @@ class SimulationScheduler:
                 str(pending.get("thread_id") or ""),
                 str(pending.get("obligation_id") or ""),
                 str(pending.get("event_id") or ""),
+            ))
+        # Once all addressees have replied but the request is still blocked,
+        # return control to its owner once. This is a choice point, not an
+        # invitation to make every participant agree again.
+        from .agenda import relevant_tasks
+        followups = [
+            (agent, task) for agent in eligible
+            for task in relevant_tasks(state, agent, limit=8)
+            if task.owner == agent.name and task.status == "blocked"
+            and task.owner_reviewed_at_turn < task.updated_at_turn
+        ]
+        if followups:
+            actor, task = max(followups, key=lambda pair: pair[1].updated_at_turn)
+            return self._record(state, SchedulerDecision(
+                "agent", actor.name,
+                "已有回应但事项尚未解决；请求者选择核验、改变条件、执行替代方案或搁置",
+                task.thread_id, "", task.source_event_id,
             ))
         opportunities_by_agent = {
             agent.name: [
@@ -107,7 +152,21 @@ class SimulationScheduler:
         )
 
     @staticmethod
+    def _waiting_turns(state: SimulationState, agent: AgentState) -> int:
+        count = 0
+        for message in reversed(state.history):
+            if message.speaker == agent.name:
+                break
+            if message.speaker in state.agents:
+                count += 1
+        return count
+
+    @staticmethod
     def _record(state: SimulationState, decision: SchedulerDecision) -> SchedulerDecision:
+        if decision.kind == "agent" and decision.actor_name in state.agent_order:
+            # Direct replies consume a real actor turn too. Otherwise, after a
+            # broadcast response round the fallback cursor replays that round.
+            state._scheduler_index = state.agent_order.index(decision.actor_name) + 1
         state.last_scheduler_decision = {
             "kind": decision.kind,
             "actor_name": decision.actor_name,
@@ -115,9 +174,41 @@ class SimulationScheduler:
             "thread_id": decision.thread_id,
             "obligation_id": decision.obligation_id,
             "source_event_id": decision.source_event_id,
+            "phase_exit_rule_id": decision.phase_exit_rule_id,
             "at_turn": state.turn_count,
         }
         return decision
+
+    @staticmethod
+    def _due_phase_exit(state: SimulationState, phase, eligible: list[AgentState]):
+        if (phase is None or phase.event_only or phase.advance_when != "manual"
+                or not phase.next_phase or not eligible):
+            return None
+        exits = [
+            rule for rule in state.rules
+            if (not rule.phases or phase.name in rule.phases)
+            and rule.action_type in phase.allowed_action_types
+            and rule.target_scope in {"none", "self"}
+            and any(effect.op == "set_phase" and effect.value == phase.next_phase
+                    for effect in rule.effects)
+            and any(matches_role(agent.role, rule.allowed_roles) for agent in eligible)
+        ]
+        if not exits:
+            return None
+        names = {agent.name for agent in eligible}
+        phase_start = 0
+        for index, message in enumerate(state.history):
+            if any(operation.get("op") == "set_phase" and operation.get("value") == phase.name
+                   for operation in message.state_patch):
+                phase_start = index + 1
+            elif message.state_updates.get("current_phase") == phase.name:
+                phase_start = index + 1
+        actor_turns = sum(message.speaker in names for message in state.history[phase_start:])
+        pace = getattr(getattr(state, "arc_state", None), "pace", 50)
+        cycles = 3 if pace <= 30 else 1 if pace > 70 else 2
+        if actor_turns < len(eligible) * cycles or not names.issubset(state.phase_action_log):
+            return None
+        return max(exits, key=lambda rule: rule.priority)
 
     @staticmethod
     def _eligible_for_phase(state: SimulationState, phase) -> list[AgentState]:
@@ -138,6 +229,11 @@ class SimulationScheduler:
         ]
         if unacted:
             return unacted
+        if getattr(phase, "advance_when", "") == "all_eligible_acted":
+            previous_turns, revisited = state.phase_actor_turn_count()
+            required = state.phase_required_actor_turns(phase, len(eligible), revisited=revisited)
+            if previous_turns < required:
+                return eligible
         # Structured phases wait for their resolver transition instead of
         # selecting an actor twice inside the same cycle.
         return []

@@ -114,6 +114,7 @@ def _voice_summary(agent: AgentState) -> str:
     if not profile:
         return "- 结构化语言画像未提供；以完整角色档案中的表达设定为准"
     lines = [
+        "- 以下只是倾向，不是每轮必用的台词或差异配额；首先以当前处境和具体回应为准。",
         f"- 语域：{profile.get('register') or '自然口语'}",
         f"- 句式长度：{profile.get('sentence_length') or '中等'}",
         f"- 直接程度：{profile.get('directness', 0.5)}",
@@ -122,7 +123,7 @@ def _voice_summary(agent: AgentState) -> str:
     ]
     optional = (
         ("幽默方式", profile.get("humor_style")),
-        ("表达策略", "；".join(profile.get("rhetorical_habits") or [])),
+        ("可选择的表达策略", "；".join(profile.get("rhetorical_habits") or [])),
         ("避免表达", "；".join(profile.get("avoidances") or [])),
         ("可自然使用的词汇", "、".join(profile.get("vocabulary_hints") or [])),
     )

@@ -33,7 +33,7 @@ from .scenario import (
 )
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def utc_now() -> str:
@@ -552,6 +552,16 @@ def state_from_dict(
         if isinstance(item, dict)
     ]
     state = SimulationState(scene, agents, world_spec=package.world)
+    # Older exports stored the complete CharacterSpec but not these separate
+    # runtime lenses. Populate them without altering historical events.
+    character_index = {character.name: character for character in package.characters}
+    for agent in state.agents.values():
+        character = character_index.get(agent.name)
+        if character is not None:
+            if not agent.personality:
+                agent.personality = character.personality
+            if not agent.decision_logic:
+                agent.decision_logic = character.decision_logic
     state.history = [
         Message(**_known_fields(Message, item))
         for item in data.get("history") or []
@@ -611,6 +621,47 @@ def state_from_dict(
         for thread in [_thread_from_dict(item)]
         if thread.id
     }
+    from .agenda import agenda_from_dict
+    state.agenda = {
+        task.id: task
+        for item in (data.get("agenda") or [])[:80]
+        if isinstance(item, dict)
+        for task in [agenda_from_dict(item)]
+        if task.id and task.source_event_id
+        and task.owner in state.agents
+        and all(target in state.agents for target in task.targets)
+    }
+    # The export is user-editable. Never put imported task prose into another
+    # character's prompt unless the linked committed source is visible there.
+    # Reconstruct the title/scope/targets from authoritative event + obligations.
+    event_index = {message.event_id: message for message in state.history}
+    for task_id, task in list(state.agenda.items()):
+        source = event_index.get(task.source_event_id)
+        thread = state.conversation_threads.get(task.thread_id)
+        obligations = [o for o in thread.obligations if o.source_event_id == task.source_event_id] if thread else []
+        if source is None or source.speaker != task.owner or not obligations:
+            state.agenda.pop(task_id, None)
+            continue
+        task.title = (source.speech or source.action).strip()[:240]
+        task.visibility = list(source.scopes)
+        task.location = source.location
+        task.targets = list(dict.fromkeys(o.target for o in obligations if o.target in state.agents))
+        task.evidence_event_ids = [
+            event_id for event_id in task.evidence_event_ids
+            if event_id == task.source_event_id or event_id in event_index
+        ][-20:]
+        open_targets = [o.target for o in obligations if o.status == "open"]
+        if task.status == "abandoned":
+            task.next_action = "事项已被取代或阶段已改变"
+        elif open_targets:
+            task.status = "active"
+            task.next_action = "等待 " + "、".join(open_targets[:8]) + " 回应；可回答、拒绝或说明不知道"
+        elif any(o.status in {"responded", "expired"} for o in obligations):
+            task.status = "blocked"
+            task.next_action = "请求者根据已有回应选择核验、改变条件、执行替代行动或明确搁置；不要原样追问"
+        else:
+            task.status = "completed"
+            task.next_action = "已收到本次请求的回应；回答内容仍只是角色主张"
     state.last_scheduler_decision = (
         dict(data.get("last_scheduler_decision"))
         if isinstance(data.get("last_scheduler_decision"), dict)

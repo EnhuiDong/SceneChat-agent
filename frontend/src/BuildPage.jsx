@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { getApiErrorMessage } from "./apiErrors";
 import { saveStorySetup } from "./scenarioStorage";
-import { startStoryBuild, cancelStoryBuild } from "./storyApi";
+import { startStoryBuild, cancelStoryBuild, fetchStoryBuildStatus } from "./storyApi";
 import "./BuildReview.css";
 
 const BUILD_STAGES = [
@@ -59,7 +59,14 @@ function BuildPage() {
     if (runId === 1 && pending?.resumable === false) {
       setCanResume(false);
       setErrorMessage(pending.message || "上次修复未取得进展，请修改设定或模型后重新生成。");
-      return;
+      let active = true;
+      if (pending.buildId) fetchStoryBuildStatus(pending.buildId).then((status) => {
+        if (active && status.recovery_available) {
+          setCanResume(true);
+          setErrorMessage("修复器已更新，可以从保留的世界与角色检查点继续；点击后才会调用模型。");
+        }
+      }).catch(() => {});
+      return () => { active = false; };
     }
     const controller = new AbortController();
     controllerRef.current = controller;

@@ -273,6 +273,7 @@ class PhaseSpec:
     advance_when: str = "all_eligible_acted"
     next_phase: str = ""
     event_only: bool = False
+    opening_min_cycles: int = 1
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any], index: int) -> "PhaseSpec":
@@ -300,6 +301,8 @@ class PhaseSpec:
             ),
             next_phase=_text(data.get("next_phase")),
             event_only=event_only,
+            opening_min_cycles=max(1, min(3, int(data.get("opening_min_cycles") or 1)))
+            if str(data.get("opening_min_cycles") or "1").isdigit() else 1,
         )
 
 
@@ -1228,16 +1231,6 @@ def validate_scenario_package(package: ScenarioPackage, *, user_prompt: str | No
         for phase in package.world.phase_specs:
             if not phase.allowed_action_types and not phase.event_only:
                 issues.append(f"规则型阶段“{phase.name}”缺少 allowed_action_types")
-            if (
-                not phase.event_only
-                and phase.allowed_action_types
-                and not set(phase.allowed_action_types).intersection(
-                    {"pass", "observe", "speak", "act"}
-                )
-            ):
-                issues.append(
-                    f"规则型阶段“{phase.name}”缺少安全兜底行动 pass/observe/speak/act"
-                )
             if phase.next_phase and phase.next_phase not in package.world.phases:
                 issues.append(f"阶段“{phase.name}”引用未知 next_phase")
             if phase.advance_when == "all_active_voted":
@@ -1335,6 +1328,8 @@ def agents_from_character_specs(characters: list[CharacterSpec]):
                 name=character.name,
                 profile=character.to_markdown(index, include_voice=False),
                 public_profile=character.public_profile,
+                personality=character.personality,
+                decision_logic=character.decision_logic,
                 goals=list(character.goals),
                 private_memory=[f"我的初始知识边界：{knowledge}"] if knowledge else [],
                 relationships=dict(character.relationships),

@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
+import re
 import uuid
 
 from .visibility import ViewerContext, can_access, normalize_scopes
@@ -313,6 +314,8 @@ class AgentState:
     memory_summaries: List[Dict[str, Any]] = field(default_factory=list)
     memory_archive: List[Dict[str, Any]] = field(default_factory=list)
     initiative: int = 0
+    personality: str = ""
+    decision_logic: str = ""
 
     def set_disclosure_pressure(self, thread_id: str, value: float) -> float:
         key = str(thread_id or "general")[:120]
@@ -755,6 +758,7 @@ class SimulationState:
             }
         )
         self.conversation_threads: Dict[str, ConversationThread] = {}
+        self.agenda: Dict[str, Any] = {}
         self.last_scheduler_decision: Dict[str, Any] = {}
         self.phase_action_log: set[str] = set()
         self.votes: Dict[str, str] = {}
@@ -804,6 +808,31 @@ class SimulationState:
             if agent.eligible:
                 return agent
         raise RuntimeError("当前没有可行动角色")
+
+    def phase_actor_turn_count(self) -> tuple[int, bool]:
+        """Actor turns since entering this phase, and whether it is a revisit."""
+        started_at = 0
+        revisited = False
+        for index, message in enumerate(self.history):
+            entered = any(
+                operation.get("op") == "set_phase"
+                and operation.get("value") == self.current_phase
+                for operation in message.state_patch
+            ) or message.state_updates.get("current_phase") == self.current_phase
+            if entered:
+                started_at = index + 1
+                revisited = True
+        observed = sum(message.speaker in self.agents for message in self.history[started_at:])
+        return max(observed, len(self.phase_action_log)), revisited
+
+    def phase_required_actor_turns(self, phase: Any, eligible_count: int, *, revisited: bool) -> int:
+        cycles = 1 if revisited else max(1, int(getattr(phase, "opening_min_cycles", 1)))
+        pace = getattr(self.arc_state, "pace", 50)
+        if pace >= 80:
+            cycles = 1
+        elif pace <= 30 and cycles > 1:
+            cycles = min(3, cycles + 1)
+        return eligible_count * cycles
 
     def add_message(self, msg: Message) -> None:
         from .change_log import snapshot, differences
@@ -933,6 +962,8 @@ class SimulationState:
         for thread in self.conversation_threads.values():
             if thread.status == "active" and msg.turn - thread.last_active_turn > 8:
                 thread.status = "dormant"
+        from .agenda import update_agenda
+        update_agenda(self, msg)
         self.bump_revision()
 
         after_changes = snapshot(self)
@@ -998,6 +1029,18 @@ class SimulationState:
                 requested = (
                     "satisfied" if move in {"answer", "reveal"} else "responded"
                 )
+            # The target cannot withdraw somebody else's request. A counter-
+            # question, challenge, silence or refusal is an answer attempt,
+            # not proof that the original issue was settled.
+            uncertain_reply = any(marker in msg.speech.lower() for marker in (
+                "不知道", "不清楚", "不能回答", "无法回答", "不能答应",
+                "i don't know", "i cannot answer", "can't answer",
+            )) and len(msg.speech) <= 50
+            if requested == "withdrawn" or (
+                requested == "satisfied"
+                and (move not in {"answer", "reveal"} or not msg.speech.strip() or uncertain_reply)
+            ):
+                requested = "responded"
             obligation.status = requested
             obligation.resolution_event_id = msg.event_id
             obligation.updated_at_turn = msg.turn
@@ -1228,7 +1271,13 @@ class SimulationState:
         elif move in {"answer", "acknowledge"}:
             actor.adjust_disclosure_pressure(thread_id, -0.08)
 
-        if not summary or move not in {"question", "request", "challenge"}:
+        # A counter-question in direct reply is part of the same decision
+        # point. It may be spoken, but must not create another mandatory round
+        # of answers to the very person who asked first.
+        opens_obligation = move in {"question", "request", "challenge"} and not (
+            reply_to and move in {"question", "challenge"}
+        )
+        if not summary or not opens_obligation:
             if thread is not None and thread.obligations and all(
                 item.status in {"satisfied", "withdrawn"}
                 for item in thread.obligations
@@ -1237,6 +1286,7 @@ class SimulationState:
             return
         obligation = {
             "event_id": msg.event_id,
+            "address_scope": str(intent.get("address_scope") or "specific"),
             "speaker": actor.name,
             "move": move,
             "summary": summary,
@@ -1244,8 +1294,16 @@ class SimulationState:
             "created_at_turn": msg.turn,
             "thread_id": thread.id if thread is not None else "",
         }
+        obligation_targets = addressed_to
+        if (intent.get("address_scope") == "all_present" and move == "question"
+                and len(addressed_to) > 2
+                and not re.search(r"每(?:个人|位|名)|各自|分别|逐个|人人|一人一句", summary)):
+            # A factual question heard by the whole room does not require
+            # every listener to repeat the same answer. Explicit requests for
+            # each person's own account still reach everyone.
+            obligation_targets = addressed_to[:2]
         delivered_to = []
-        for name in addressed_to:
+        for name in obligation_targets:
             target = self.agents[name]
             if not self._agent_can_observe(target, msg):
                 continue
@@ -1331,7 +1389,12 @@ class SimulationState:
             if op == "set_entity" and target_name in self.entity_states and key in self.entity_states[target_name]:
                 self.entity_states[target_name][key] = value
             elif op == "set_world" and self._valid_world_value(key, value):
-                self.world_state[key] = value
+                if key == "current_phase":
+                    # Reserved runtime field: no independent shadow phase.
+                    if value in self.phase_sequence and value != self.current_phase:
+                        self.advance_phase(value)
+                else:
+                    self.world_state[key] = value
             elif op == "increment_world" and key:
                 try:
                     self.world_state[key] = int(self.world_state.get(key, 0)) + int(
@@ -1347,6 +1410,8 @@ class SimulationState:
                 setattr(agent, key, bool(value))
                 if key == "alive" and not bool(value):
                     agent.active = False
+                if key == "alive" and type(self.world_state.get("alive_count")) is int:
+                    self.world_state["alive_count"] = sum(item.alive for item in self.agents.values())
             elif op in {"set_resource", "consume_resource"} and agent is not None and key:
                 if op == "set_resource":
                     agent.resources[key] = value
@@ -1408,12 +1473,30 @@ class SimulationState:
     def advance_phase(self, requested_phase: str = "") -> None:
         if not self.phase_sequence:
             return
+        previous_phase = self.current_phase
         if requested_phase and requested_phase in self.phase_sequence:
             next_phase = requested_phase
         else:
             current_index = self.phase_sequence.index(self.current_phase)
             next_phase = self.phase_sequence[(current_index + 1) % len(self.phase_sequence)]
         self.current_phase = next_phase
+        if "current_phase" in self.world_state:
+            self.world_state["current_phase"] = next_phase
+        if self.world_state.get("phase") in self.phase_sequence:
+            self.world_state["phase"] = next_phase
+        previous_spec = self.phase_specs.get(previous_phase)
+        completed_round = (
+            next_phase == self.phase_sequence[0]
+            and previous_phase != next_phase
+            and previous_spec is not None
+            and previous_spec.event_only
+            and any(marker in previous_phase.lower()
+                    for marker in ("resolution", "announcement", "结算", "公布", "揭晓"))
+        )
+        if completed_round:
+            for key in ("round", "round_number"):
+                if type(self.world_state.get(key)) is int:
+                    self.world_state[key] += 1
         self.phase_action_log.clear()
         self.votes.clear()
         self.protected_agents.clear()

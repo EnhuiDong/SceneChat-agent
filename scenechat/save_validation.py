@@ -19,6 +19,8 @@ def validate_import(payload):
         if not isinstance(payload.get(key), dict):
             raise ValueError(f"存档缺少 {key} 完整状态。")
     sim = payload["simulation"]
+    if "agenda" in sim and (not isinstance(sim["agenda"], list) or len(sim["agenda"]) > 80):
+        raise ValueError("事项状态格式无效或超出上限。")
     agents, history = sim.get("agents"), sim.get("history")
     if not isinstance(agents, list) or not agents or not isinstance(history, list):
         raise ValueError("存档缺少角色或事件状态。")
@@ -54,11 +56,24 @@ def validate_import(payload):
             raise ValueError("事件轮次无效。")
     try:
         restored = runtime_session_from_export(payload)
-        from .mechanics import validate_mechanics
-        if validate_mechanics(restored["scenario"]):
+        from .mechanics import records_vote, validate_mechanics
+        mechanics_issues = validate_mechanics(restored["scenario"])
+        world = restored["scenario"].world
+        valid_ballots = [rule for rule in world.rules if rule.action_type == "vote" and records_vote(rule)]
+        legacy_vote_issues = [
+            issue for issue in mechanics_issues
+            if "声明 vote 却不记录选票" in issue
+            and any(not invalid.phases or not valid.phases or set(invalid.phases) & set(valid.phases)
+                    for invalid in world.rules for valid in valid_ballots
+                    if issue.startswith(f"规则 {invalid.id} 声明 vote"))
+        ]
+        if any(issue not in legacy_vote_issues for issue in mechanics_issues):
             raise ValueError("存档包含当前程序不支持的执行规则。")
     except (TypeError, ValueError, KeyError, AttributeError) as exc:
         raise ValueError("存档字段格式无效，无法安全恢复。") from exc
+    warning = "完整存档含人物秘密。将创建独立推演，不覆盖已有数据；只恢复文件中的完整状态。"
+    if legacy_vote_issues:
+        warning += "检测到旧版无效投票规则；运行时会忽略它们，原导出文件不会被改写。"
     return {"title": restored["scenario"].world.title, "characters": len(names),
             "turns": len(history), "schema_version": version, "migrated_to": SCHEMA_VERSION,
-            "warning": "完整存档含人物秘密。将创建独立推演，不覆盖已有数据；只恢复文件中的完整状态。"}
+            "warning": warning}

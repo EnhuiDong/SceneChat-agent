@@ -60,6 +60,12 @@ export async function cancelStoryBuild(buildId) {
   if (!response.ok && response.status !== 404) throw new Error(await readApiError(response, "取消构建失败，请重试。"));
 }
 
+export async function fetchStoryBuildStatus(buildId) {
+  const response = await fetch(`/api/story/build/${encodeURIComponent(buildId)}`);
+  if (!response.ok) throw new Error(await readApiError(response, "读取构建检查点失败。"));
+  return response.json();
+}
+
 export async function fetchStorySession(sessionId) {
   const response = await fetch(`/api/story/session/${encodeURIComponent(sessionId)}`);
   if (!response.ok) {

@@ -31,6 +31,8 @@
     "max_requests_per_operation": 5,
     "operation_timeout_seconds": 180,
     "consecutive_fallback_limit": 3,
+    "fallback_window_size": 12,
+    "fallback_window_limit": 6,
     "intent_max_tokens": 900,
     "narration_max_tokens": 480,
     "beat_verification_max_tokens": 700,

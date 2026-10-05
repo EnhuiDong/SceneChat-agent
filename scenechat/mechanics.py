@@ -8,6 +8,78 @@ from .visibility import ViewerContext, can_access
 
 TARGET_SCOPES = {"none", "self", "same_location", "any_active", "character", "location", "object", "proposal"}
 TEMPLATES = {"", "legacy_tabletop"}
+EFFECT_PLACEHOLDERS = {"$actor", "$target", "$value"}
+BEAT_STATE_CONDITIONS = {"world_equals", "entity_equals", "agent_location", "goal_equals"}
+
+
+def records_vote(rule):
+    """A vote rule must record ballots rather than impersonate a win condition."""
+    if rule.action_type != "vote":
+        return True
+    return (getattr(rule, "behavior_template", "") == "legacy_tabletop"
+            or getattr(rule, "effect_mode", "rule") == "ability"
+            or any(effect.op == "record_vote" for effect in rule.effects))
+
+
+def validate_world_structure(world):
+    """Catch cast-independent V2 mistakes before the expensive character call.
+
+    Character-role reachability remains a package check after the cast exists.
+    This does not silently rewrite a requested game mechanic.
+    """
+    if world.execution_version != 2:
+        return []
+    issues = []
+    phases = {phase.name: phase for phase in world.phase_specs}
+    for phase in phases.values():
+        if phase.advance_when == "all_active_voted" and any(
+            action in phase.allowed_action_types for action in ("pass", "observe")
+        ):
+            issues.append(
+                f"投票阶段“{phase.name}”允许不记录选票的 pass/observe，"
+                "却要求 all_active_voted；必须实现真正的弃权票契约或移除这些行动"
+            )
+        if phase.advance_when == "manual" and phase.next_phase:
+            exit_rules = [
+                rule for rule in world.rules
+                if (not rule.phases or phase.name in rule.phases)
+                and (not phase.allowed_action_types or rule.action_type in phase.allowed_action_types)
+                and any(effect.op == "set_phase" and effect.value == phase.next_phase for effect in rule.effects)
+            ]
+            if not exit_rules:
+                issues.append(f"手动阶段“{phase.name}”没有可执行的 set_phase 出口")
+    for rule in world.rules:
+        if rule.action_type != "vote" and any(effect.op == "record_vote" for effect in rule.effects):
+            issues.append(f"规则 {rule.id} 不是 vote 行动却记录选票；提问、质疑等不能暗中投票")
+        if not records_vote(rule):
+            issues.append(f"规则 {rule.id} 声明 vote 却不记录选票；胜负请放在 termination_rules，不能用投票行动无条件设置胜负")
+        selected = [phases[name] for name in rule.phases if name in phases] if rule.phases else list(phases.values())
+        if selected and not any(
+            not phase.event_only
+            and (not phase.allowed_action_types or rule.action_type in phase.allowed_action_types)
+            for phase in selected
+        ):
+            issues.append(f"规则 {rule.id} 没有允许其执行的角色行动阶段；event_only 只能由环境事件结算")
+        for effect in rule.effects:
+            for value in (effect.key, effect.target, effect.value):
+                if isinstance(value, str) and value.startswith("$") and value not in EFFECT_PLACEHOLDERS:
+                    issues.append(f"规则/能力 {rule.id} 使用不支持的效果占位符 {value}")
+            if effect.op not in VALID_PATCH_OPERATIONS:
+                issues.append(f"规则/能力 {rule.id} 包含不支持的操作 {effect.op}")
+            if effect.op == "set_entity" and effect.target in world.entities:
+                entity = world.entities[effect.target]
+                state = entity.get("state") if isinstance(entity, dict) else None
+                if (isinstance(state, dict) and effect.key in state
+                        and not (isinstance(effect.value, str) and effect.value in EFFECT_PLACEHOLDERS)
+                        and type(effect.value) is not type(state[effect.key])):
+                    issues.append(f"规则/能力 {rule.id} 的实体状态值类型不匹配")
+    for beat in world.beat_specs:
+        if beat.completion_mode == "state" and not beat.completion_conditions:
+            issues.append(f"节点 {beat.id} 必须声明 completion_conditions")
+        for condition in beat.completion_conditions:
+            if not isinstance(condition, dict) or condition.get("kind") not in BEAT_STATE_CONDITIONS:
+                issues.append(f"节点 {beat.id} 使用不支持的完成条件；若无可声明的状态结果，请使用 narrative 与已提交事件证据")
+    return list(dict.fromkeys(issues))
 
 
 def visible_entities(state, actor):
@@ -19,11 +91,34 @@ def visible_entities(state, actor):
 
 def action_context(state, actor):
     viewer = ViewerContext(name=actor.name, role=actor.role, location=actor.current_location)
-    return "\n".join(
-        f"- action_type={rule.action_type}；目标类型={rule.target_scope}；{rule.description}"
-        for rule in state.rules if (not rule.phases or state.current_phase in rule.phases)
-        and matches_role(actor.role, rule.allowed_roles) and can_access(rule.visibility, viewer)
-    ) or "- 无额外场景行动"
+    phase = state.phase_specs.get(state.current_phase)
+    allowed = set(phase.allowed_action_types) if phase and phase.allowed_action_types else None
+    visible = visible_entities(state, actor)
+    lines = []
+    for rule in state.rules:
+        if ((rule.phases and state.current_phase not in rule.phases)
+                or (allowed is not None and rule.action_type not in allowed)
+                or (getattr(state.world_spec, "execution_version", 1) == 2 and not records_vote(rule))
+                or not matches_role(actor.role, rule.allowed_roles)
+                or not can_access(rule.visibility, viewer)):
+            continue
+        scope = rule.target_scope
+        if scope in {"character", "any_active"}:
+            targets = [item.name for item in state.agents.values() if item.eligible]
+        elif scope == "same_location":
+            targets = [item.name for item in state.agents.values()
+                       if item.eligible and item.current_location == actor.current_location]
+        elif scope in {"object", "proposal"}:
+            targets = [key for key, item in visible.items() if item.get("kind") == scope]
+        elif scope == "location":
+            targets = list(state.locations)
+        elif scope == "self":
+            targets = [actor.name]
+        else:
+            targets = []
+        target_hint = f"；可填 target={','.join(targets[:12]) or '无有效目标'}" if scope != "none" else "；target 留空"
+        lines.append(f"- rule_id={rule.id}；action_type={rule.action_type}；目标类型={scope}{target_hint}；{rule.description}")
+    return "\n".join(lines) or "- 无额外场景行动"
 
 
 def validate_mechanics(package):
@@ -42,6 +137,8 @@ def validate_mechanics(package):
             issues.append(f"实体 ID {entity_id} 与角色或地点重名")
     specs = list(world.rules) + [a for c in package.characters for a in c.abilities]
     for spec in specs:
+        if spec in world.rules and not records_vote(spec):
+            issues.append(f"规则 {spec.id} 声明 vote 却不记录选票；胜负请放在 termination_rules")
         if spec.target_scope not in TARGET_SCOPES:
             issues.append(f"规则/能力 {spec.id} 使用不支持的 target_scope")
         if getattr(spec, "effect_mode", "rule") not in {"rule", "ability", "stack"}:
@@ -55,6 +152,12 @@ def validate_mechanics(package):
         if spec.action_type not in {"speak", "act", "observe", "pass"} and not spec.effects and not getattr(spec, "behavior_template", "") and spec in world.rules and spec.effect_mode != "ability":
             issues.append(f"规则 {spec.id} 没有可执行效果，请声明 effects、能力效果来源或显式模板")
         for effect in spec.effects:
+            unsupported = list(dict.fromkeys(
+                value for value in (effect.key, effect.target, effect.value)
+                if isinstance(value, str) and value.startswith("$") and value not in EFFECT_PLACEHOLDERS
+            ))
+            for value in unsupported:
+                issues.append(f"规则/能力 {spec.id} 使用不支持的效果占位符 {value}")
             if effect.op not in VALID_PATCH_OPERATIONS:
                 issues.append(f"规则/能力 {spec.id} 包含不支持的操作 {effect.op}")
             if effect.op in {"set_world", "increment_world"} and effect.key not in world.state_schema:
@@ -71,8 +174,64 @@ def validate_mechanics(package):
                 candidates = [world.entities.get(effect.target)] if effect.target != "$target" else [e for e in world.entities.values() if isinstance(e, dict) and e.get("kind") == spec.target_scope]
                 if not candidates or any(not isinstance(e, dict) or effect.key not in e.get("state", {}) for e in candidates):
                     issues.append(f"规则/能力 {spec.id} 的实体状态键 {effect.key} 未在目标中声明")
-                elif any((not isinstance(e["state"][effect.key], bool)) if effect.op == "settle_votes" else (type(effect.value) is not type(e["state"][effect.key])) for e in candidates):
+                elif any((not isinstance(e["state"][effect.key], bool)) if effect.op == "settle_votes" else (
+                    not (isinstance(effect.value, str) and effect.value in EFFECT_PLACEHOLDERS)
+                    and not unsupported and type(effect.value) is not type(e["state"][effect.key])
+                ) for e in candidates):
                     issues.append(f"规则/能力 {spec.id} 的实体状态值类型不匹配")
+    def needs_elimination(rule):
+        return rule.kind == "faction_eliminated" or any(needs_elimination(child) for child in rule.conditions)
+
+    if any(needs_elimination(rule) for rule in world.termination_rules):
+        can_eliminate = any(
+            any(effect.op == "set_agent_status" and effect.key in {"alive", "active"}
+                and effect.value is False for effect in spec.effects)
+            or (getattr(spec, "behavior_template", "") == "legacy_tabletop"
+                and spec.action_type in {"vote", "eliminate", "poison"})
+            for spec in specs
+        )
+        if not can_eliminate:
+            issues.append("结束规则 faction_eliminated 要求角色淘汰，但规则和能力均无可执行的淘汰效果；"
+                          "settle_votes 只更新提案状态，不会淘汰角色")
+    effects = [effect for spec in specs for effect in spec.effects]
+
+    def has_live_dependency(rule):
+        """A phase gate alone cannot turn an immutable initial value into a result."""
+        kind = rule.kind
+        if kind in {"all_of", "any_of"}:
+            return any(has_live_dependency(child) for child in rule.conditions)
+        if kind == "entity_equals":
+            return any(
+                effect.op in {"set_entity", "settle_votes"}
+                and effect.key == rule.key
+                and (effect.target == rule.target or effect.target == "$target")
+                for effect in effects
+            )
+        if kind == "world_equals":
+            if rule.key in {"phase", "current_phase", "round", "round_number"}:
+                return True
+            field = world.state_schema.get(rule.key)
+            return any(effect.op in {"set_world", "increment_world"} and effect.key == rule.key
+                       for effect in effects) or bool(field and "director" in field.mutable_by)
+        if kind in {"faction_eliminated", "faction_parity"}:
+            return any(effect.op == "set_agent_status" and effect.key in {"alive", "active"}
+                       for effect in effects) or any(
+                spec.behavior_template == "legacy_tabletop"
+                and spec.action_type in {"vote", "eliminate", "poison"} for spec in specs
+            )
+        if kind == "all_goals_completed":
+            return any(effect.op == "set_goal_status" for effect in effects)
+        if kind == "all_active_at_location":
+            return any(effect.op == "move_agent" for effect in effects)
+        return False
+
+    for terminal in world.termination_rules:
+        if not has_live_dependency(terminal) and terminal.kind != "manual":
+            issues.append(
+                f"结束规则 {terminal.id} 只依赖不会被行动或导演更新的初始状态；"
+                "进入结算阶段不会使胜负条件变真。请连接可执行的状态效果，"
+                "或改用实际存活角色的 faction_eliminated/faction_parity 等条件"
+            )
     for index, left in enumerate(world.rules):
         for right in world.rules[index + 1:]:
             phases_overlap = not left.phases or not right.phases or bool(set(left.phases) & set(right.phases))
@@ -105,7 +264,7 @@ def validate_mechanics(package):
             check_end(child)
     for rule in world.termination_rules:
         check_end(rule)
-    return issues
+    return list(dict.fromkeys(issues))
 
 
 def validate_patch(state, operations):
@@ -177,6 +336,8 @@ def patch_changes_state(state, operations):
         if kind == "move_agent" and agent and agent.current_location != value: return True
         if kind == "set_agent_status" and agent and getattr(agent, key, None) != value: return True
         if kind == "set_resource" and agent and agent.resources.get(key) != value: return True
+        if kind == "consume_resource" and agent and op.get("amount", 1) and agent.resources.get(key, 0): return True
+        if kind == "consume_ability" and agent and key in agent.ability_states and agent.ability_states[key].uses_remaining is not None: return True
         if kind == "set_goal_status" and agent and agent.goal_status.get(key) != value: return True
         if kind == "record_vote" and state.votes.get(op.get("actor")) != target: return True
         if kind == "add_known_fact" and agent and agent.known_facts.get(key) != value: return True

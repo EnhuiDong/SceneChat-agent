@@ -6,6 +6,13 @@ const THREAD_STATUS = {
   resolved: "已解决",
 };
 
+const TASK_STATUS = {
+  active: "等待回应",
+  blocked: "需要新决策",
+  completed: "回应已闭环",
+  abandoned: "已被取代/阶段变更",
+};
+
 const OBLIGATION_STATUS = {
   open: "待回应",
   responded: "已回应·未解决",
@@ -84,6 +91,17 @@ function ThreadsView({ data, onJumpToEvent }) {
   })}</div>;
 }
 
+export function AgendaView({ data, onJumpToEvent }) {
+  const tasks = data.agenda || [];
+  if (!tasks.length) return <p className="observer-empty">出现明确的提问、请求或挑战后，这里会记录事项及实际回应。没有待办时，角色仍按阶段目标与自身性格行动。</p>;
+  return <div className="thread-card-list">{tasks.map((task) => <article className={`thread-card agenda-card ${task.status}`} key={task.id}>
+    <header><div><span>{TASK_STATUS[task.status] || task.status}</span><strong>{task.title}</strong></div><b>第 {task.updated_at_turn} 回合</b></header>
+    <p className="thread-participants">发起人 {task.owner} · 对象 {task.targets?.join("、") || "未指定"}</p>
+    <p className="agenda-next">{task.next_action}</p>
+    <div className="agenda-evidence"><EventButton eventId={task.source_event_id} onJumpToEvent={onJumpToEvent}>查看发起</EventButton>{task.evidence_event_ids?.filter((id) => id !== task.source_event_id).map((id) => <EventButton key={id} eventId={id} onJumpToEvent={onJumpToEvent}>查看回应</EventButton>)}</div>
+  </article>)}</div>;
+}
+
 function RelationshipsView({ data, onJumpToEvent }) {
   const relationships = data.relationships || [];
   if (!relationships.length) return <p className="observer-empty">角色基于新事件调整关系后，这里会展示当前维度与证据。</p>;
@@ -127,20 +145,23 @@ function QualityView({ data }) {
 export default function DirectorObservability({ data = {}, onJumpToEvent }) {
   const [tab, setTab] = useState("scheduler");
   const summary = data.thread_summary || {};
+  const agendaSummary = data.agenda_summary || {};
   const tabs = [
     ["scheduler", "调度"],
+    ["agenda", "事项"],
     ["threads", "议题"],
     ["relationships", "关系"],
     ["beliefs", "认知"],
     ["quality", "质量"],
   ];
   return <details className="director-observer">
-    <summary><div><span>RUNTIME OBSERVER</span><strong>导演运行观察</strong></div><p>{summary.active || 0} 个活跃议题 · {summary.open_obligations || 0} 项待回应</p></summary>
+    <summary><div><span>RUNTIME OBSERVER</span><strong>导演运行观察</strong></div><p>{agendaSummary.active || 0} 项等待回应 · {agendaSummary.blocked || 0} 项待决策 · {summary.open_obligations || 0} 个对话义务</p></summary>
     <div className="observer-body">
       <p className="observer-privacy-note">这里展示已提交的结构化状态和证据，不展示模型思维链。认知与关系是人物主观状态，不自动代表世界事实。</p>
       <div className="observer-tabs" role="tablist" aria-label="导演观察分类">{tabs.map(([id, label]) => <button type="button" role="tab" aria-selected={tab === id} className={tab === id ? "active" : ""} onClick={() => setTab(id)} key={id}>{label}</button>)}</div>
       <div className="observer-tab-content" role="tabpanel">
         {tab === "scheduler" ? <SchedulerView data={data} onJumpToEvent={onJumpToEvent} /> : null}
+        {tab === "agenda" ? <AgendaView data={data} onJumpToEvent={onJumpToEvent} /> : null}
         {tab === "threads" ? <ThreadsView data={data} onJumpToEvent={onJumpToEvent} /> : null}
         {tab === "relationships" ? <RelationshipsView data={data} onJumpToEvent={onJumpToEvent} /> : null}
         {tab === "beliefs" ? <BeliefsView data={data} onJumpToEvent={onJumpToEvent} /> : null}

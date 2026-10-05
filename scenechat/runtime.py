@@ -40,6 +40,7 @@ class Intent:
     memory_candidates: list[dict[str, Any]] = field(default_factory=list)
     used_memory_ids: list[str] = field(default_factory=list)
     claim_updates: list[dict[str, Any]] = field(default_factory=list)
+    rule_id: str = ""
 
     @classmethod
     def from_mapping(cls, actor: str, data: dict[str, Any]) -> "Intent":
@@ -62,6 +63,7 @@ class Intent:
             address_scope = "none"
         return cls(
             actor=actor,
+            rule_id=str(data.get("rule_id") or "").strip(),
             action_type=str(data.get("action_type") or "speak").strip(),
             action=str(data.get("action") or "观察局势").strip(),
             speech=str(data.get("speech") or "").strip(),
@@ -218,6 +220,8 @@ class IntentResolver:
                 return Resolution(False, f"能力“{ability.name}”与行动类型不匹配", intent)
 
         rule = self._matching_rule(state, actor, intent)
+        if intent.rule_id and rule is None:
+            return Resolution(False, "指定规则不存在或当前角色/阶段/动作无权执行", intent)
         if intent.action_type not in SAFE_FREE_ACTIONS and ability is None and rule is None:
             return Resolution(False, "该行动没有对应的角色能力或场景规则", intent)
 
@@ -295,9 +299,12 @@ class IntentResolver:
             "大家", "各位", "所有人", "每个人", "你们", "诸位",
             "everyone", "everybody", "all of you",
         )
-        combined_text = f"{intent.action}\n{intent.speech}".lower()
+        # Looking at a crowd is not a request for everyone to respond. Explicit
+        # addressees override this compatibility heuristic for older intents.
+        combined_text = intent.speech.lower()
         if (
-            intent.address_scope != "all_present"
+            intent.address_scope == "none"
+            and not intent.addressed_to
             and intent.conversation_move in {"question", "request", "challenge"}
             and any(marker in combined_text for marker in collective_markers)
         ):
@@ -634,11 +641,11 @@ class IntentResolver:
                 if (
                     state._valid_world_value(str(key), value)
                     and (
-                        getattr(state.world_spec, "execution_version", 1) == 1
-                        or (field is not None and "director" in field.mutable_by)
+                        field is not None and "director" in field.mutable_by
                     )
                     and (field is None or "public" in field.visibility)
                     and state.world_state.get(str(key)) != value
+                    and str(key) not in {"current_phase", "round_number"}
                 ):
                     patch.add("set_world", key=str(key), value=value)
             phase = state.phase_specs.get(state.current_phase)
@@ -673,15 +680,37 @@ class IntentResolver:
 
     @staticmethod
     def _matching_rule(state: SimulationState, actor: AgentState, intent: Intent):
-        for rule in sorted(state.rules, key=lambda rule: -getattr(rule, "priority", 0)) if getattr(state.world_spec, "execution_version", 1) == 2 else state.rules:
+        versioned = getattr(state.world_spec, "execution_version", 1) == 2
+        candidates = []
+        if versioned:
+            from .mechanics import records_vote
+        for rule in sorted(state.rules, key=lambda rule: -getattr(rule, "priority", 0)) if versioned else state.rules:
             if rule.action_type != intent.action_type:
                 continue
             if rule.phases and state.current_phase not in rule.phases:
                 continue
             if not matches_role(actor.role, rule.allowed_roles):
                 continue
-            return rule
-        return None
+            if versioned and not records_vote(rule):
+                continue
+            if not versioned and intent.rule_id and rule.id != intent.rule_id:
+                continue
+            candidates.append(rule)
+        if not versioned:
+            return candidates[0] if candidates else None
+        # Priority only orders rules that can actually take this target. A
+        # proposal-only vote must not shadow a character vote, even when the
+        # model explicitly names the lower-priority character rule.
+        compatible = [rule for rule in candidates
+                      if not IntentResolver._validate_target(state, actor, intent, None, rule)]
+        if compatible:
+            selected = compatible[0]
+            return selected if not intent.rule_id or selected.id == intent.rule_id else None
+        # Keep the most specific target error from resolve() when every rule
+        # is incompatible; do not silently accept an unknown explicit ID.
+        if intent.rule_id:
+            return next((rule for rule in candidates if rule.id == intent.rule_id), None)
+        return candidates[0] if candidates else None
 
     @staticmethod
     def _validate_target(state, actor, intent, ability, rule) -> str:
@@ -800,6 +829,10 @@ class IntentResolver:
         acted = set(state.phase_action_log)
         acted.add(actor.name)
         should_advance = phase.advance_when == "all_eligible_acted" and set(eligible).issubset(acted)
+        if should_advance:
+            previous_turns, revisited = state.phase_actor_turn_count()
+            required = state.phase_required_actor_turns(phase, len(eligible), revisited=revisited)
+            should_advance = previous_turns + 1 >= required
         if phase.advance_when == "all_active_voted":
             prospective = set(state.votes)
             if intent.action_type == "vote":

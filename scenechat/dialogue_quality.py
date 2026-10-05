@@ -155,6 +155,7 @@ def inspect_dialogue_intent(
         normalized_speech = _normalized(speech)
         if any(
             _similar(speech, previous, 0.88)
+            or _reordered_narration(speech, previous)
             or (
                 len(_normalized(previous)) >= 12
                 and _normalized(previous) in normalized_speech
@@ -163,19 +164,25 @@ def inspect_dialogue_intent(
         ):
             issues.append(DialogueQualityIssue(
                 "self_repetition",
-                "台词与该角色最近的表达过于相似；保留意图，但换一种具体回应方式。",
+                "该判断已表达过；换词仍然是重复。给出新依据、回应具体问题或改用合法行动，不要重演同一观点。",
+                hard=True,
             ))
 
-        previous_visible = next((
+        other_recent = [
             message for message in reversed(state.history)
             if message.speaker != agent.name
+            and message.speaker in state.agents
             and message.speech.strip()
             and state._agent_can_observe(agent, message)
-        ), None)
-        if previous_visible and _similar(speech, previous_visible.speech, 0.84):
+        ][:6]
+        previous_visible = next((message for message in other_recent
+                                 if _similar(speech, message.speech, 0.84)
+                                 or _reordered_narration(speech, message.speech)), None)
+        if previous_visible:
             issues.append(DialogueQualityIssue(
                 "parroting",
-                f"台词近似复述了{previous_visible.speaker}刚才的话；请给出新的反应、判断或行动。",
+                f"台词近似复述了{previous_visible.speaker}刚才的话；不要换姓名或场地复用同一段经历。直接回答当前问题、提出新依据或执行合法行动，简短同意即可，不再复述已有方案。",
+                hard=len(normalized_speech) >= 24,
             ))
 
         sentence_count = len([part for part in re.split(r"[。！？!?；;]+", speech) if part.strip()])
@@ -184,6 +191,27 @@ def inspect_dialogue_intent(
                 "monologue",
                 "台词像一次完整演讲；压缩到一至三句，只推进一个主要意图。",
             ))
+
+        if (getattr(intent, "action_type", "") == "vote"
+                and len(normalized_speech) >= 25 and getattr(intent, "target", "")):
+            same_target = [
+                message for message in state.history
+                if message.speaker != agent.name and message.speech.strip()
+                and any(operation.get("op") == "record_vote"
+                        and operation.get("target") == intent.target
+                        and operation.get("actor") in state.votes
+                        for operation in message.state_patch)
+            ][-5:]
+            if len(same_target) >= 2 and any(
+                _similar(speech, message.speech, 0.67)
+                or _reordered_narration(speech, message.speech)
+                for message in same_target
+            ):
+                issues.append(DialogueQualityIssue(
+                    "vote_rationale_echo",
+                    "仍可投同一人，但理由几乎沿用前面选票。给出此人真正不同的依据或顾虑；"
+                    "若只是跟票，可简短承认或只提交投票动作，不要伪装成独立推理。",
+                ))
 
     pending_ids = {
         str(item.get("event_id") or "") for item in agent.pending_intents
@@ -198,6 +226,29 @@ def inspect_dialogue_intent(
             f"请填写 event_id={most_recent.get('event_id')}，即使选择回避或沉默也要明确回应。",
             hard=True,
         ))
+
+    # A stalled task needs a new decision, not the same request restated with
+    # stronger wording. Only compare the owner's own task in the same thread;
+    # a distinct target or genuinely different request remains allowed.
+    move = str(getattr(intent, "conversation_move", "") or "")
+    thread_id = str(getattr(intent, "thread_id", "") or "")
+    addressed = set(getattr(intent, "addressed_to", []) or [])
+    if move in {"question", "request", "challenge"} and speech:
+        stalled = next((
+            task for task in reversed(list(getattr(state, "agenda", {}).values()))
+            if task.status == "blocked" and task.owner == agent.name
+            and task.thread_id == thread_id
+            and addressed.intersection(task.targets)
+            and ((_normalized(speech) == _normalized(task.title)
+                  and len(_normalized(speech)) >= 4)
+                 or _similar(speech, task.title, 0.83))
+        ), None)
+        if stalled is not None:
+            issues.append(DialogueQualityIssue(
+                "stalled_task_repeat",
+                "这项请求已有回应或拒绝；不要原样再问。请用新证据核验、改变具体条件、执行合法替代行动，或明确搁置。",
+                hard=True,
+            ))
 
     private_output = "\n".join([
         str(getattr(intent, "action", "") or ""),
@@ -272,10 +323,14 @@ def inspect_narration_event(
     # while ordinary place names and background NPC prose remain untouched.
     ignored = {"所有人", "每个人", "下一位", "参与者", "玩家", "众人"}
     selected_names = re.findall(
-        r"(?:点名(?:者)?|下一位(?:发言者|玩家|参与者)|轮到)\s*[:：]?\s*"
+        r"(?:点名(?:者)?|当前发言者|下一位(?:发言者|玩家|参与者)|轮到)\s*[:：]?\s*[“\"‘']?"
         r"([A-Za-z][A-Za-z0-9_.-]{1,39}|[\u4e00-\u9fff]{2,4})",
         text,
     )
+    selected_names += re.findall(r"[“\"‘']([A-Za-z][A-Za-z0-9_.-]{1,39}|[\u4e00-\u9fff]{2,4})[”\"’']的座位", text)
+    selected_names += re.findall(r"([\u4e00-\u9fff]{2,3})(?:喉结|深吸一口气|盯着屏幕)", text)
+    for roster in re.findall(r"(?:存活名单|存活人员名单|未发言者)[：:（(]([^。；\n）)]+)", text):
+        selected_names.extend(n.strip(" 、， “ ” \" ") for n in re.split(r"[、，,]", roster))
     unknown = [
         name for name in selected_names
         if name not in state.agents and name not in ignored

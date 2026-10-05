@@ -59,6 +59,10 @@ QUALITY_SIGNALS = {
         "剧情节点动量",
         "目标节点是否在合理轮数内得到实质推进或结算。",
     ),
+    "agenda_followthrough": (
+        "事项落地",
+        "请求是否留下回应证据；受阻时发起人是否重新决策。拒绝本身不算失败。",
+    ),
 }
 
 
@@ -259,6 +263,29 @@ def director_observability_payload(
     payload = {
         "turn": state.turn_count,
         "scheduler": scheduler,
+        "agenda_summary": {
+            "active": sum(item.status == "active" for item in state.agenda.values()),
+            "blocked": sum(item.status == "blocked" for item in state.agenda.values()),
+            "completed": sum(item.status == "completed" for item in state.agenda.values()),
+        },
+        "agenda": [
+            {
+                "id": item.id,
+                "title": item.title,
+                "owner": item.owner,
+                "targets": item.targets,
+                "status": item.status,
+                "next_action": item.next_action,
+                "source_event_id": item.source_event_id,
+                "evidence_event_ids": item.evidence_event_ids[-8:],
+                "created_at_turn": item.created_at_turn,
+                "updated_at_turn": item.updated_at_turn,
+            }
+            for item in sorted(
+                state.agenda.values(),
+                key=lambda task: (task.status not in {"active", "blocked"}, -task.updated_at_turn),
+            )[:16]
+        ],
         "thread_summary": {
             "active": sum(item.status == "active" for item in state.conversation_threads.values()),
             "dormant": sum(item.status == "dormant" for item in state.conversation_threads.values()),

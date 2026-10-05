@@ -5,6 +5,27 @@ import re
 from .role_selectors import ALL_ROLE_SELECTORS, has_phase_ending, matches_role
 
 
+def _stated_faction_count(text: str, faction: str) -> int | None:
+    numerals = "零一二两三四五六七八九十"
+    matches = list(re.finditer(
+        rf"([0-9{numerals}]+)\s*(?:名|个|位)?\s*(?:是|为|属于)?\s*{re.escape(faction)}",
+        text, flags=re.IGNORECASE,
+    ))
+    if not matches:
+        return None
+    value = matches[-1].group(1)
+    if value.isdigit():
+        return int(value)
+    digits = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+    if value == "十":
+        return 10
+    if "十" in value:
+        left, right = value.split("十", 1)
+        return (digits.get(left, 1) if left else 1) * 10 + digits.get(right, 0)
+    return digits.get(value)
+
+
 def rule_actors(package, rule, phase):
     if phase.event_only or (rule.phases and phase.name not in rule.phases):
         return []
@@ -20,10 +41,33 @@ def rule_actors(package, rule, phase):
 def additional_scenario_issues(package, user_prompt=None):
     from .mechanics import validate_mechanics
     issues = validate_mechanics(package)
+    factions = {actor.faction for actor in package.characters if actor.faction}
+    def check_winner(rule):
+        if rule.kind == "faction_parity" and rule.winner in factions and rule.winner != rule.faction:
+            issues.append(f"结束规则 {rule.id} 的 faction_parity 阵营方向与 winner 相反：faction 是达到人数优势的一方，应与获胜阵营一致")
+        for child in rule.conditions:
+            check_winner(child)
+    for rule in package.world.termination_rules:
+        check_winner(rule)
     # Only user text may authorize a title as the name, never generated assumptions.
     source = user_prompt if user_prompt is not None else "\n".join(
         item.source_excerpt or item.content for item in package.brief.constraints
     )
+    locked_cast_text = "\n".join(
+        item.content for item in package.brief.constraints
+        if item.locked and item.category in {"cast", "rule"}
+    )
+    for faction in factions:
+        expected = _stated_faction_count(source, faction)
+        if expected is None:
+            expected = _stated_faction_count(locked_cast_text, faction)
+        if expected is not None:
+            actual = sum(actor.faction == faction for actor in package.characters)
+            if actual != expected:
+                issues.append(
+                    f"用户硬约束指定阵营“{faction}”{expected}名，实际生成{actual}名；"
+                    "请同步修正角色 faction、私有身份和关联秘密，不得改变用户指定的人数"
+                )
     explicit_title_style = bool(re.search(
         r"(?:用|以|按|使用).{0,8}(?:职业|职务|称谓|称呼).{0,6}(?:称呼|命名|姓名|名字|代称)|不用姓名|不使用姓名",
         source,
@@ -37,6 +81,10 @@ def additional_scenario_issues(package, user_prompt=None):
                 f"角色姓名“{actor.name}”使用了未经用户指定的职业称呼；请生成独立姓名，"
                 "职业保留在 public_identity/role，并同步所有关系键、事实 scope 和导演笔记中的姓名引用"
             )
+        if any(token in package.world.public_world_markdown for token in ("隐藏身份", "身份隐藏", "秘密身份", "伪装")):
+            public_profile = " ".join((actor.public_identity, actor.public_traits, actor.public_background))
+            if re.search(r"(?:实际是|其实是|真实身份是|隐藏身份是|秘密身份是|实际上是)", public_profile):
+                issues.append(f"角色“{actor.name}”的公开档案包含隐藏身份说明；应只保留其他角色可知的背景")
 
     roles = {actor.role for actor in package.characters}
     for kind, specs, field in (
@@ -78,6 +126,12 @@ def additional_scenario_issues(package, user_prompt=None):
             issues.append(f"角色阶段“{phase.name}”不能依赖 after_event 退出，请使用角色行动完成条件")
 
     for rule in package.world.rules:
+        selected_phases = [phases[name] for name in rule.phases if name in phases]
+        if selected_phases and all(phase.event_only for phase in selected_phases):
+            issues.append(
+                f"规则“{rule.id}”只绑定环境事件阶段，角色永远无法执行；"
+                "请将结算放到可执行的角色规则或由环境事件呈现已提交结果"
+            )
         if phases and not any(rule_actors(package, rule, phase) for phase in phases.values()):
             issues.append(f"规则“{rule.id}”没有可执行的角色和阶段组合，请同时核对角色职能与 allowed_action_types")
         if package.world.execution_version == 1 and rule.action_type == "inspect" and re.search(r"提问|质疑|询问|拷问", rule.description) and not re.search(

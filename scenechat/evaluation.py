@@ -50,7 +50,7 @@ def evaluate_scenario(package: ScenarioPackage) -> dict[str, QualityScore]:
     identity_value = len(set(names)) / max(len(names), 1)
 
     validation_issues = validate_scenario_package(package)
-    privacy_issues = [issue for issue in validation_issues if "私密约束" in issue]
+    privacy_issues = [issue for issue in validation_issues if "私密约束" in issue or "公开档案包含隐藏身份" in issue]
     runtime_issues = [
         issue for issue in validation_issues
         if any(marker in issue for marker in ("规则", "阶段", "effect", "状态操作", "结束条件"))
@@ -86,6 +86,7 @@ def evaluate_scenario(package: ScenarioPackage) -> dict[str, QualityScore]:
 
 
 def _near_duplicate_rate(speeches: list[str]) -> float:
+    from .dialogue_quality import _reordered_narration
     if len(speeches) < 2:
         return 0.0
     duplicates = 0
@@ -93,7 +94,8 @@ def _near_duplicate_rate(speeches: list[str]) -> float:
         normalized = "".join(speech.split()).lower()
         for previous in speeches[max(0, index - 5):index]:
             other = "".join(previous.split()).lower()
-            if normalized and other and SequenceMatcher(None, normalized, other).ratio() >= 0.88:
+            if normalized and other and (SequenceMatcher(None, normalized, other).ratio() >= 0.88
+                                         or _reordered_narration(speech, previous)):
                 duplicates += 1
                 break
     # Count repeated events, not a variable number of pairwise comparisons.
@@ -232,6 +234,18 @@ def evaluate_trace(
         ),
     }
     if state is not None:
+        agenda_items = list(getattr(state, "agenda", {}).values())
+        if agenda_items:
+            completed = sum(item.status == "completed" and len(item.evidence_event_ids) > 1 for item in agenda_items)
+            blocked = sum(item.status == "blocked" for item in agenda_items)
+            reviewed = sum(item.status == "blocked" and item.owner_reviewed_at_turn >= item.updated_at_turn for item in agenda_items)
+            superseded = sum(item.status == "abandoned" and len(item.evidence_event_ids) > 1 for item in agenda_items)
+            decided = completed + blocked + superseded
+            metrics["agenda_followthrough"] = (
+                _score((completed + reviewed + superseded) / decided,
+                       f"answered={completed}, blocked={blocked}, owner-reviewed={reviewed}, superseded={superseded}", 0.6)
+                if decided else QualityScore(None, None, "N/A：事项仍在等待回应")
+            )
         phase = state.phase_specs.get(state.current_phase)
         eligible = [agent for agent in state.agents.values() if agent.eligible]
         exhausted_manual_phase = bool(
@@ -253,7 +267,9 @@ def evaluate_trace(
         )
         beats = list(getattr(state.world_spec, "beat_specs", []) or [])
         if beats:
-            momentum = 1 / (1 + state.arc_state.turns_since_progress / max(len(state.agents), 1))
+            last_completion = max((record.get("completed_at_turn", 0) for record in state.arc_state.beat_records.values()), default=0)
+            stalled_turns = max(state.arc_state.turns_since_progress, state.turn_count - last_completion)
+            momentum = 1 / (1 + stalled_turns / max(len(state.agents), 1))
             metrics["arc_momentum"] = _score(
                 momentum,
                 f"resolved={len(state.arc_state.resolved_beat_ids)}/{len(beats)}, turns since progress={state.arc_state.turns_since_progress}",

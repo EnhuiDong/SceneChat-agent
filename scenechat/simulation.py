@@ -33,6 +33,7 @@ from .scheduler import SimulationScheduler
 from .telemetry import complete
 from .mechanics import visible_entities, action_context
 from .recovery import bounded_operation
+from .prompt_library import prompt_contract, actor_worklist, narrator_facts
 
 
 MAX_VISIBLE_OBSERVATIONS = 15
@@ -44,6 +45,33 @@ def _single_retry_setting(key: str, default: int = 1) -> int:
 
 def _token_budget(key: str, default: int, minimum: int, maximum: int) -> int:
     return config_int("simulation", key, default, minimum=minimum, maximum=maximum)
+
+
+def _repair_vote_rule_reference(state: SimulationState, agent: AgentState, intent: Intent) -> bool:
+    """Repair only a mismatched rule ID when the ballot has one legal route."""
+    if (getattr(state.world_spec, "execution_version", 1) != 2
+            or intent.action_type != "vote" or not intent.rule_id
+            or not intent.target or intent.ability):
+        return False
+    if IntentResolver._matching_rule(state, agent, intent) is not None:
+        return False
+    from .mechanics import records_vote
+    from .role_selectors import matches_role
+    candidates = [
+        rule for rule in state.rules
+        if rule.action_type == "vote" and records_vote(rule)
+        and (not rule.phases or state.current_phase in rule.phases)
+        and matches_role(agent.role, rule.allowed_roles)
+        and not IntentResolver._validate_target(state, agent, intent, None, rule)
+    ]
+    if len(candidates) != 1:
+        return False
+    previous = intent.rule_id
+    intent.rule_id = candidates[0].id
+    state.record_structured_output_issue("vote_rule_reference_repaired", retried=False)
+    if state.model_requests:
+        state.model_requests[-1]["local_rule_repair"] = {"from": previous, "to": intent.rule_id}
+    return True
 
 
 class AgentKnowledge(Protocol):
@@ -78,42 +106,68 @@ def build_agent_prompt(
         ensure_ascii=False,
         separators=(",", ":"),
     )
+    phase = state.phase_specs.get(state.current_phase)
+    phase_actions = "、".join(phase.allowed_action_types) if phase and phase.allowed_action_types else "由可用规则决定"
+    exit_rule_id = str(state.last_scheduler_decision.get("phase_exit_rule_id") or "")
+    phase_exit_instruction = (
+        f"【本轮阶段推进】讨论已达到当前节奏允许的篇幅，继续换措辞争同一件事不会产生新信息。"
+        f"本轮请选择当前可执行的规则 {exit_rule_id}，用角色自己的话或动作发起阶段切换；"
+        "不要声称投票或结算已经完成。若还有待回应问题，可简短交代自己的立场，但不能用新反问拖延阶段。"
+        if exit_rule_id else ""
+    )
 
-    return f"""你正在扮演社会模拟实验中的角色“{agent.name}”。
+    return f"""{prompt_contract('actor')}
+你正在扮演社会模拟实验中的角色“{agent.name}”。
 
 你不是全知叙述者。你只能依据下面明确提供的信息判断，绝不能假定自己知道其他角色的私密动机、秘密经历或未被观察到的事件。
 
 {view.render()}
 
+【推进工作单】
+{actor_worklist(state, agent)}
+
 【可用的非人物目标】
 地点：{json.dumps(state.locations, ensure_ascii=False)}
 物品/提案（使用声明的 ID）：{json.dumps(visible_entities(state, agent), ensure_ascii=False)}
+本阶段允许的 action_type：{phase_actions}
 当前允许的场景行动（不含尚未获取的结果）：
 {action_context(state, agent)}
 
+{phase_exit_instruction}
+
 请严格站在“{agent.name}”的有限视角中推进一轮行动。行动和发言必须符合其身份、目标、已知信息与社会处境，不要解释创作过程，不要替其他角色行动。
+
+【人物决策镜头——先是具体的人，再是身份与表达画像】
+已设定的性格倾向：{agent.personality or '未单列；从完整人物档案中提取，不能凭职业套用。'}
+已设定的惯常决策方式：{agent.decision_logic or '未单列；从完整人物档案与当前目标判断。'}
+“当前事项”只说明外部问题，不规定此人必须合作。先判断眼前哪句话、行动或后果真正触动了自己；此刻能确定什么、怕失去什么、在谁面前不愿丢脸、愿意说到哪一步。再由性格、关系、经历影响选择。性别、文化、社会处境和职业按用户设定真实存在，但不是每句台词要表演的标签；职业主要影响可用知识与注意力，不强迫使用术语。没有明确风险时不虚构惊恐；有高风险时也不让所有人同样冷静或同样慌张。
+同一事项下，不同人物可以给出相反选择，也可以承认不知道、暂时强撑、说一半收住或事后补救。不要默认人人善辩、毒舌、理性、礼貌或寻求共识。private_reason 只写这个人此刻的具体顾虑或冲动及其选择，不必写漂亮的策略总结；它是不会说出口的材料，action/speech 不要复述它。
+如果当前是陌生人初遇，别凭空假设彼此有旧交、共同记忆或已有信任。即使主线涉及生死，也不意味着每人开口都在诊断敌人：规则真伪、眼前安全、身体反应、逃出去的念头、亲友牵挂或对某个人的第一印象，都可能改变其行动与说话。只挑眼下有关的东西，不能机械给每人塞一条无关家常；少数确有理由的人可立即尖锐，多数人可先摸底、试探或保持距离。
 
 【自然对话规则】
 1. 如果“需要优先处理的回应”非空，本轮应先回应其中最紧迫的一项；填写对应 thread_id、reply_to_obligation_id 和 reply_to_event_id。可以回答、质疑、回避或拒绝，但不能像没听见一样另起话题。回避表示已经回应但没有解决，不要伪装成完整回答。
+   若对方问的是“你现在怎么选择/愿意做什么”，先给出此人此刻的选择、明确拒绝或行动条件，再提出必要的反问；只有反问并未完成原请求。对已有请求的反问默认只是该事项的一部分，不会再强制生成一轮新的提问义务。没有回答或不知道时 obligation_resolution 填 responded，不得填 satisfied；不能替发起人撤回请求。
    标为“可选择插话”的内容不是强制回应；只有当它与当前目标、关系或秘密风险确实相关时才插话，避免所有人逢点名必抢话。
 2. 每轮只推进一个主要意图。优先对最近的具体言行作出反应，不要重新介绍人物、世界背景或复述双方已经知道的事实。
-3. 遵循语言画像，但不要机械重复口癖。让句长、礼貌、直接程度、情绪外显和信息披露方式体现人物差异。
-4. 角色通常不会把完整动机、秘密和推理过程直接说出口。允许潜台词、停顿、试探、反问、转移、沉默，以及动作与台词不完全一致。
-5. 除非题材或当前情境要求正式陈述，speech 通常控制在一至三句；没有必要说话时可以只行动或保持沉默。面向全场提问、请求或质疑时，address_scope 必须填 all_present；只对具体角色说话时填 specific。
+3. 先让性格影响选择、冒险程度和信息披露，再让语言画像影响措辞。说话应先接住眼前具体的人和事：能直接答就答，不能确定就说清自己不确定的部分。不要把每次回应写成概括人性、秩序、命运等主题的金句，也不要反复使用职业比喻、人物标志句或同一种挑衅动作；档案中的表达习惯不是每轮必演的台词。
+4. 角色通常不会把完整动机、秘密和推理过程直接说出口。情绪可以通过答得太快、删掉半句解释、转移对象、短暂失态或刻意平静影响表达，但只在此刻有原因时出现；不要机械加入结巴、语气词和身体小动作。纯发言时 action 可以简写“回应”“说话”，无需每次撑桌、盯视、拍桌或描写表情。允许潜台词、试探、反问、沉默，以及动作与台词不完全一致。高明的人也可能说一句很普通的话。
+5. 除非题材或当前情境要求正式陈述，speech 通常控制在一至三句；句长和完整程度应随情境变化，不必每轮都有反讽、收尾句或“漂亮的”比喻。没有必要说话时可以只行动或保持沉默。面向全场提问、请求或质疑时，address_scope 必须填 all_present；只对具体角色说话时填 specific。
 6. 本场景的关系维度为：{relationship_dimensions}。relationship_updates.facets 只能使用这些维度 ID；它们是题材相关的主观关系，不是固定的狼人杀式猜疑参数，也不能代替生命值、距离或胜负等客观战斗状态。每次变化必须引用新观察到的历史事件。
 7. 信息披露压力按议题隔离。某个议题压力较高时，角色更难完全无视该议题的追问，但仍可以有限回答、转移、撒谎或反问；不要因此公开其他议题的秘密。
-8. 他人的发言首先只是主张，不是客观事实。只有权威事件才能直接成为 verified；普通听闻、观察和推断用 claim_updates 保存来源。used_memory_ids 只填写本轮确实使用的已知事实、记忆或主张 ID。
+8. 他人的发言首先只是主张，不是客观事实。只有权威事件才能直接成为 verified；普通听闻、观察和推断用 claim_updates 保存来源。used_memory_ids 只填写本轮确实使用的已知事实、记忆或主张 ID。想引用别人“刚才说过”的话，必须能从可见历史或有来源的记忆找到；不要为了让推理显得聪明而编造旧发言。对别人瞳孔、呼吸、心率、手势等细节也是一样：没有亲眼可见的事件或设定中的测量能力，就不能报出具体测量结果；最多说出可见行为带给自己的不确定印象。
+9. 已经达成的具体做法不需要每人再复述确认。如果轮到你且能执行第一步，就用当前合法行动实际做；若只能提议而不能做，说明尚缺的条件。不要把“我去检查”写成“已查清结果”，也不要用未经设定的具体共同往事、年份、事故或关键证据补出戏剧效果；没有把握时用不确定的日常说法。
 
 你只提交 Intent，不直接修改世界状态。普通发言的 action_type 必须原样填写英文枚举 `speak`，普通行动/观察/跳过分别填写 `act`、`observe`、`pass`，不得翻译或自造“公开行动”“对话行动”等值。专用 action_type、ability 和 target 必须逐字来自上面的当前阶段、能力与在场角色；没有使用能力时省略 ability，不能把能力说明或期望效果填成能力名。不能凭空宣布自己获胜、获得能力、知道秘密或强迫他人完成重大决定。private_reason 只解释本轮决策，不会公开，也不会自动写入长期记忆。
 
-只输出一个紧凑 JSON 对象，不要使用 Markdown 代码块。前三个字段必填；其余字段没有实际变化时可以省略，不要为了字段齐全输出大段空数组：
+只输出一个紧凑 JSON 对象，不要使用 Markdown 代码块。private_reason 请先用一句短话写出此刻实际在意的东西，再生成公开行为；不要把这句私心照搬到台词。action、speech、action_type 必填；其他字段没有实际变化时可以省略，不要为了字段齐全输出大段空数组：
 {{
+  "private_reason": "此刻具体的顾虑、欲望或冲动；不是漂亮的策略总结",
   "action": "动作描述",
   "speech": "角色台词，没有时为空字符串",
   "action_type": "当前阶段允许的行动类型",
+  "rule_id": "需要特定规则效果时填可用规则 ID；普通发言可省略",
   "target": "目标角色或地点",
   "ability": "能力 ID 或名称",
-  "private_reason": "不会说出口的一句理由",
   "address_scope": "none|specific|all_present",
   "addressed_to": ["直接对话对象"],
   "mentioned_agents": ["被谈及但不是对话对象的角色"],
@@ -206,6 +260,7 @@ def parse_agent_intent(raw: str) -> Optional[dict]:
         "action": action,
         "speech": speech,
         "action_type": str(payload.get("action_type") or "speak").strip(),
+        "rule_id": str(payload.get("rule_id") or "").strip(),
         "target": str(payload.get("target") or "").strip(),
         "ability": str(payload.get("ability") or "").strip(),
         "private_reason": str(payload.get("private_reason") or payload.get("memory") or "").strip(),
@@ -267,7 +322,10 @@ def build_narrator_prompt(
         if getattr(state.world_spec, "audience_policy", "limited") == "omniscient" and getattr(state.world_spec, "reveal_policy", "preserve_suspense") == "allow_reveal"
         else "在身份公开揭晓或结算前，只能给出有多种解释的线索，不得直接确认隐藏身份。"
     )
-    return f"""你是互动故事的场景导演与旁白，不扮演任何一个角色。
+    return f"""{prompt_contract('narrator')}
+
+【引擎事实】
+{narrator_facts(state)}
 
 【实验设定与可用背景】
 {retrieved_context}
@@ -288,20 +346,25 @@ def build_narrator_prompt(
 {guidance_context(state)}
 
 请生成一个符合原题材的简短叙事事件，用于补充环境、节奏、动作结果、中立事件或面向读者的镜头信息。不要替角色说台词，不要强迫角色作出重大决定，不要突然转换题材，也不要无依据加入 AI、未来科技或宏大阴谋。
+优先回应最近已执行的行动，呈现有限、可观察的直接后果；不要为制造张力恰好安排新路人带来同类问题，或连续升级同一处天气、故障、危险。没有值得写的新变化且本阶段不强制旁白时，允许跳过。未设定的具体共同往事不能当成确定事实。
+若角色正在查找责任、病因或秘密来源，不要临时发明撕痕、监控、物证或测量结果指向某人；保留未知，只结算已经有依据的可见结果。
+涉及人数、票数和阶段时，以【引擎事实】为准；public_active_count 为 null 表示不能公开推断人数。投票未完成时不要宣布本轮结果、清空票数或虚构界面提示。未设定终端、灯光、按钮、座椅机构等具体装置时，不要把它们当成确定存在的系统反馈；可直接叙述已提交的结果。
+也不要替角色补做未提交的小动作，如包好杯子、打开抽屉或迈出一步；只呈现已提交行动的后果或独立环境变化。
 旁白不能用反复改写灯光、计时器、涟漪、沉默来占用回合；须回应刚发生的实际行动或提供可观察的新事件。规则宣读、结算等环境阶段应完成该阶段的职责，可以由中立广播说明规则或已发生的结果；不能只写气氛就声称已宣读规则或完成讨论。resolved_beat_ids 缺少实际证据时留空。
 
 {mode_instruction}
 
-{reveal_instruction} 不得反复用代码流、后台进程、异常同步等单一答案式暗示。只能把当前角色名单中的人物写成下一位行动者。先检查近期历史：如果某个当前节点已经由最近的角色行动实际完成，在 resolved_beat_ids 中提议核验；不要把本句旁白自己宣布的结果当证据。
+{reveal_instruction} 不得反复用代码流、后台进程、异常同步等单一答案式暗示。不要指定下一位行动者。先检查近期历史：如果某个当前节点已经由最近的角色行动实际完成，在 resolved_beat_ids 中提议核验；不要把本句旁白自己宣布的结果当证据。
 
 tension 必须使用 0.0—1.0 的小数比例，不能填写百分制的 25 或 100。
 
-只输出一个 JSON 对象，不要使用 Markdown：
+没有可呈现的新内容且不是必需环境阶段/待应用干预时，可只输出 {{"skip":true}}。否则只输出一个 JSON 对象，不要使用 Markdown：
 {{
   "narration": "一至三句自然的叙述",
   "visibility": "{visibility}",
   "location": "事件只发生在某个地点时填写；全局广播或读者镜头可为空",
-  "state_updates": {{"公共状态变量": "环境事件或规则裁决造成的新值"}},
+  "state_updates": {{"允许 director 修改的公共环境字段": "新值"}},
+  "evidence_event_ids": ["引用已提交结果时填写来源事件 ID"],
   "resolved_beat_ids": ["本轮或最近尚未结算的已完成节点 ID；只埋下线索时不要填写"],
   "tension": 0.0,
   "end_signal": false,
@@ -339,6 +402,8 @@ def parse_narrator_event(raw: str) -> Optional[dict]:
         return None
     if not isinstance(payload, dict):
         return None
+    if payload.get("skip") is True:
+        return {"skip": True}
     parsed = parse_narrator_response(text)
     if parsed is None:
         return None
@@ -354,6 +419,7 @@ def parse_narrator_event(raw: str) -> Optional[dict]:
             str(item) for item in payload.get("resolved_beat_ids") or []
         ] if isinstance(payload.get("resolved_beat_ids"), list) else [],
         "tension": payload.get("tension"),
+        "evidence_event_ids": payload.get("evidence_event_ids") if isinstance(payload.get("evidence_event_ids"), list) else [],
     }
 
 
@@ -402,6 +468,7 @@ def simulate_next_turn(
     prompt = build_agent_prompt(state, agent, retrieved_context)
     active_llm = llm or get_simulation_llm()
     active_resolver = resolver or IntentResolver()
+    phase_exit_rule_id = str(state.last_scheduler_decision.get("phase_exit_rule_id") or "")
     retries = max(
         _single_retry_setting("parse_retries"),
         _single_retry_setting("quality_retries"),
@@ -438,17 +505,48 @@ def simulate_next_turn(
                 break
             continue
         intent = Intent.from_mapping(agent.name, parsed)
+        _repair_vote_rule_reference(state, agent, intent)
         resolution = active_resolver.resolve(state, intent)
         if not resolution.accepted:
+            if state.model_requests:
+                state.model_requests[-1]["rule_rejection_reason"] = resolution.reason[:200]
             state.record_structured_output_issue(
                 "intent_rule_rejected", retried=attempt < _single_retry_setting("quality_retries")
             )
-            rejection = resolution.reason
+            rejection = (
+                f"{resolution.reason}\n"
+                f"当前阶段={state.current_phase}；允许的 action_type="
+                f"{','.join(state.phase_specs[state.current_phase].allowed_action_types) if state.current_phase in state.phase_specs else '见运行状态'}。\n"
+                f"可执行规则与合法目标：\n{action_context(state, agent)}"
+            )
             if attempt >= _single_retry_setting("quality_retries"):
                 break
             continue
+        if phase_exit_rule_id and not any(
+            operation.get("op") == "set_phase"
+            and operation.get("value") == state.phase_specs[state.current_phase].next_phase
+            for operation in resolution.patch.operations
+        ):
+            rejection = (
+                f"本轮必须使用 rule_id={phase_exit_rule_id} 执行当前阶段的真实退出行动；"
+                "普通发言、沉默或口头宣布进入下一阶段都不能完成阶段切换。"
+            )
+            state.record_structured_output_issue(
+                "phase_exit_not_selected", retried=attempt < retries
+            )
+            if attempt >= retries:
+                break
+            continue
         quality_issues = inspect_dialogue_intent(state, agent, intent)
+        if phase_exit_rule_id:
+            quality_issues = [issue for issue in quality_issues if issue.code != "missing_response"]
+        if intent.action_type not in {"speak", "pass", "observe"}:
+            from .mechanics import patch_changes_state
+            if patch_changes_state(state, resolution.patch.operations):
+                quality_issues = [issue for issue in quality_issues if issue.code not in {"self_repetition", "parroting"}]
         if quality_issues:
+            if state.model_requests:
+                state.model_requests[-1]["quality_issue_codes"] = [issue.code for issue in quality_issues]
             rejection = (
                 "Intent 通过规则校验，但未通过对话质量门：\n"
                 f"{quality_retry_instruction(quality_issues)}\n"
@@ -468,6 +566,21 @@ def simulate_next_turn(
 
     phase = state.phase_specs.get(state.current_phase)
     allowed_actions = list(getattr(phase, "allowed_action_types", []) or [])
+    if phase_exit_rule_id:
+        exit_rule = next((rule for rule in state.rules if rule.id == phase_exit_rule_id), None)
+        if exit_rule is not None:
+            fallback_intent = Intent(
+                actor=agent.name,
+                action_type=exit_rule.action_type,
+                rule_id=exit_rule.id,
+                target=agent.name if exit_rule.target_scope == "self" else "",
+                action="结束当前阶段，按规则推进到下一阶段。",
+                speech="这轮先到这里，按规则进入下一阶段。",
+            )
+            fallback_resolution = active_resolver.resolve(state, fallback_intent)
+            if fallback_resolution.accepted:
+                state.record_structured_output_fallback()
+                return _fallback_message(state, agent, fallback_intent, fallback_resolution)
     pending = agent.pending_intents[-1] if agent.pending_intents else None
     if pending and (not allowed_actions or "speak" in allowed_actions):
         fallback_intent = safe_obligation_fallback(agent, pending, rejection)
@@ -501,6 +614,8 @@ def simulate_next_turn(
                 fallback_resolution,
             )
     state.record_generation_failure()
+    if state.run_status == "blocked" and rejection:
+        state.end_reason += f" 最近一次校验原因：{rejection[:240]}"
     return None
 
 
@@ -517,10 +632,24 @@ def _fallback_message(state, agent, intent, resolution):
         count += 1
     limit = config_int("simulation", "consecutive_fallback_limit", 3, minimum=1, maximum=6)
     state.failed_generation_count = count
-    if count >= limit:
+    window_size = config_int("simulation", "fallback_window_size", 12, minimum=4, maximum=30)
+    window_limit = config_int("simulation", "fallback_window_limit", 6, minimum=2, maximum=20)
+    previous_actors = [m for m in state.history if m.speaker in state.agents][-(window_size - 1):]
+    recent_fallbacks = 1 + sum(bool(m.intent.get("generation_fallback")) for m in previous_actors)
+    if count >= limit or recent_fallbacks >= window_limit:
         state.run_status = "blocked"
         state.end_kind = "blocked"
-        state.end_reason = f"连续 {count} 次角色生成只能采用安全兜底，已暂停以避免无效推演。请检查模型配置后，从暂停前的检查点创建分支继续，或调整设定重新生成。"
+        recent_rule_rejection = next(
+            (entry.get("rule_rejection_reason") for entry in reversed(state.model_requests[-8:])
+             if entry.get("rule_rejection_reason")), None,
+        )
+        cause = (f"最近一次规则拒绝：{recent_rule_rejection}。" if recent_rule_rejection else
+                 "请检查生成格式、对话质量校验与当前阶段规则。")
+        state.end_reason = (
+            f"角色行动连续落入兜底（连续 {count} 次，最近 {len(previous_actors) + 1} 次中 "
+            f"{recent_fallbacks} 次），已暂停以避免无效推演。{cause}"
+            "请从暂停前检查点创建分支继续，或修正设定重新生成。"
+        )
     message = _message_from_resolution(state, agent, intent, resolution)
     message.intent["generation_fallback"] = True
     return message
@@ -611,6 +740,14 @@ def simulate_narration(
             max_tokens=_token_budget("narration_max_tokens", 480, 360, 900),
         )
         parsed = parse_narrator_event(response.text)
+        if parsed and parsed.get("skip"):
+            phase = state.phase_specs.get(state.current_phase)
+            mandatory = (bool(getattr(phase, "event_only", False))
+                         or getattr(phase, "advance_when", "") == "after_event"
+                         or any(i.status == "pending" for i in active_guidance(state)))
+            if not mandatory:
+                return None
+            parsed = None
         if parsed is None:
             finish_reason = str(getattr(response, "finish_reason", "") or "")
             truncated = finish_reason == "length" or (
@@ -626,12 +763,19 @@ def simulate_narration(
             if not should_retry:
                 break
             continue
+        # The caller owns visibility; a model must not validate against an
+        # audience-only mode and then publish the result to characters.
+        parsed["visibility"] = visibility
         quality_issues = inspect_narration_event(
             state,
             parsed["narration"],
             visibility=visibility,
         )
+        from .narrative_grounding import inspect_claims
+        quality_issues.extend(inspect_claims(state, parsed))
         if quality_issues:
+            if state.model_requests:
+                state.model_requests[-1]["quality_issue_codes"] = [issue.code for issue in quality_issues]
             should_retry = attempt < _single_retry_setting("quality_retries")
             state.record_narration_quality_issues(
                 [issue.code for issue in quality_issues],
@@ -665,6 +809,7 @@ def simulate_narration(
     applied_guidance_ids = mark_guidance_applied(state)
     intent_payload = resolution.intent.to_dict()
     intent_payload["narration_phase"] = state.current_phase
+    intent_payload["evidence_event_ids"] = parsed.get("evidence_event_ids", [])
     intent_payload["arc_updates"] = {
         "resolved_beat_ids": resolved_beat_ids,
         "verified_beats": verified,
@@ -702,6 +847,17 @@ def simulate_next_event(
     director_event = pending_direct_event(state)
     if director_event is not None:
         return intervention_message(state, director_event)
+    factions = {a.faction for a in state.agents.values() if a.faction}
+    def reversed_winner(rule):
+        return (rule.kind == "faction_parity" and rule.winner in factions and rule.winner != rule.faction
+                or any(reversed_winner(child) for child in rule.conditions))
+    if any(reversed_winner(rule) for rule in state.termination_rules):
+        state.run_status = "blocked"
+        state.end_kind = "blocked"
+        state.end_reason = "胜负规则阵营方向与获胜方冲突，需重新生成场景。"
+        raise SceneChatError("invalid_termination_contract",
+                             "该存档的胜负规则阵营方向与获胜方冲突。请重新生成场景；不会继续推演或自动改写既有剧情。",
+                             stage="simulation", status_code=409)
     state.evaluate_termination()
     if state.ended:
         return None

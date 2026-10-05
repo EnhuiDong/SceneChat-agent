@@ -26,8 +26,8 @@ class PacingPolicy:
         if pace <= 60:
             return cls(pace, "均衡", 3, 5, 1, 1.0, "平衡人物互动、事件变化和目标推进")
         if pace <= 80:
-            return cls(pace, "紧凑", 2, 3, 2, 0.75, "减少重复试探，让行动产生清晰后果并推动节点")
-        return cls(pace, "冲刺", 1, 2, 3, 0.55, "合并过渡，优先触发关键转折并自然接近结局")
+            return cls(pace, "紧凑", 3, 3, 2, 0.75, "减少重复试探，优先执行已有方案并呈现真实后果")
+        return cls(pace, "冲刺", 4, 2, 3, 0.55, "压缩过渡，优先完成尚未执行的选择；不增加旁白来替代行动")
 
 
 def _beats(state: SimulationState) -> list[Any]:
@@ -119,8 +119,8 @@ def pacing_context(state: SimulationState) -> str:
     resolution_instruction = ""
     if policy.pace > 80:
         resolution_instruction = (
-            "\n本档位要求：只要不违反硬规则和人物逻辑，本轮旁白应优先让当前节点出现可观察的完成结果，"
-            "不要连续只埋线索或重复加压；完成后再激活下一节点。"
+            "\n本档位要求：角色优先执行已有可行方案、结束无新证据的争论；旁白只呈现已完成的结果。"
+            "缺少决定、资源或证据时仍须真实取得，不能由旁白宣布完成。"
         )
     elif policy.pace > 60:
         resolution_instruction = (
@@ -139,9 +139,20 @@ def should_insert_narration(state: SimulationState) -> bool:
     initialize_arc(state)
     if not state.history or state.history[-1].kind in {"narration", "intervention"}:
         return False
+    phase = state.phase_specs.get(state.current_phase)
+    if phase is not None and phase.advance_when == "all_active_voted":
+        return False  # Ballots are actor events; only the resolver may announce the tally.
+    actors = [m for m in state.history if m.speaker in state.agents][-3:]
+    if len(actors) == 3 and all(m.intent.get("action_type") == "pass" and not m.speech and not m.state_patch for m in actors):
+        return False  # Waiting silently is not material for another waiting scene.
+    if actors and all(
+        message.intent.get("action_type") in {"speak", "pass", "observe"}
+        and not message.intent.get("meaningful_state_change")
+        for message in actors
+    ):
+        return False  # Dialogue-only rounds do not need recurring empty atmosphere.
     policy = PacingPolicy.from_value(state.arc_state.pace)
-    if state.arc_state.turns_since_progress >= policy.stagnation_limit:
-        return True
+    # A stalled discussion needs a different actor decision, not another timer.
     return state.agent_turn_count > 0 and state.agent_turn_count % policy.narration_interval == 0
 
 
@@ -190,7 +201,6 @@ def update_arc_after_message(state: SimulationState, message: Message, *, previo
     meaningful = bool(message.authoritative and message.kind != "narration" and (
         message.intent.get("meaningful_state_change", False)
         or message.intent.get("obligation_resolution") in {"satisfied", "withdrawn"}
-        or message.relationship_updates
     ))
     if message.kind == "intervention" or any(item.applied_at_turn == message.turn for item in state.interventions):
         state.arc_state.plan_adjusted_at_turn = message.turn

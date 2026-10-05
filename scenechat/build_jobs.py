@@ -7,7 +7,7 @@ import uuid
 
 from .build_control import BuildControl
 from .errors import SceneChatError, stage_error
-from .recovery import recovery_advice
+from .recovery import REPAIR_POLICY_VERSION, recovery_advice, upgraded_repair_available
 
 
 class BuildJobs:
@@ -24,6 +24,7 @@ class BuildJobs:
             raise SceneChatError("build_not_found", "构建检查点不存在，请重新开始。", stage="request", status_code=404)
         if (previous and previous["status"] == "failed"
                 and previous["payload"].get("last_error", {}).get("resumable") is False
+                and not upgraded_repair_available(previous)
                 and previous["payload"].get("prompt") == prompt and previous["payload"].get("scene") == scene):
             # Check before preflight: a stalled repair is not a transient outage.
             def stopped():
@@ -39,6 +40,18 @@ class BuildJobs:
             code = str(exc)
             message = "该构建仍在运行或取消中，请稍后继续。" if code == "build_in_progress" else "设定已改变，请开始新的构建。"
             raise SceneChatError(code, message, stage="request", status_code=409) from exc
+        if upgraded_repair_available(previous):
+            semantic = payload.setdefault("recovery", {}).setdefault("semantic", {})
+            semantic["attempts"] = 0
+            semantic["no_progress"] = 0
+            semantic["policy_version"] = REPAIR_POLICY_VERSION
+            world_semantic = payload["recovery"].setdefault("world_semantic", {})
+            world_semantic["attempts"] = 0
+            world_semantic["no_progress"] = 0
+            if previous["payload"].get("last_error", {}).get("error", {}).get("code") == "structured_output_stalled":
+                payload["recovery"].pop("json", None)
+            payload.pop("last_error", None)
+            store.update_build(build_id, owner, payload)
         control.checkpoint = payload["checkpoint"]
         control.model_requests = payload.setdefault("model_requests", [])
         control.recovery = payload.setdefault("recovery", {})

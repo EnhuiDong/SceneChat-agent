@@ -701,7 +701,9 @@ def story_build_status(build_id):
     row = session_store.load_build(build_id)
     if row is None:
         return request_error("build_not_found", "构建检查点不存在。", status_code=404)
+    from scenechat.recovery import upgraded_repair_available
     return jsonify({"build_id": build_id, "status": row["status"],
+                    "recovery_available": upgraded_repair_available(row),
                     "completed_stages": list(row["payload"]["checkpoint"])})
 
 
@@ -1305,6 +1307,7 @@ def full_session_export(session_id: str, session: dict) -> dict:
             "conversation_threads": [
                 asdict(item) for item in state.conversation_threads.values()
             ],
+            "agenda": [asdict(item) for item in state.agenda.values()],
             "last_scheduler_decision": dict(state.last_scheduler_decision),
             "votes": state.votes,
             "pending_events": state.pending_events,

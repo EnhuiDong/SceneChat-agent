@@ -20,3 +20,9 @@
 .beat-evidence article:first-of-type { margin-top: 12px; }
 .beat-evidence p, .beat-evidence span { font-size: .82rem; line-height: 1.6; color: #606a63; }
 .beat-evidence button { display: block; max-width: 100%; margin-top: 6px; padding: 7px 10px; text-align: left; white-space: normal; border: 1px solid #d8e3da; border-radius: 7px; background: #f3f7f3; color: #355440; cursor: pointer; }
+.agenda-card.active { border-left-color: #9a7951; }
+.agenda-card.blocked { border-left-color: #b16a53; }
+.agenda-card.completed { border-left-color: #66866d; }
+.agenda-card.abandoned { border-left-color: #aaa390; }
+.agenda-next { margin: 7px 0; color: #625b4d; font-size: 10px; line-height: 1.5; }
+.agenda-evidence { display: flex; flex-wrap: wrap; gap: 9px; }
