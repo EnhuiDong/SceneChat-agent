@@ -41,7 +41,7 @@ class SimulationLLMAdapter:
 
     def complete(self, prompt: str, max_tokens: int = 360):
         response = self.client.invoke(
-            [("user", prompt)],
+            getattr(prompt, "messages", None) or [("user", prompt)],
             max_tokens=max_tokens,
             response_format={"type": "json_object"},
         )
@@ -176,6 +176,37 @@ def get_generation_chat_model(
             "enable_thinking": _setting_bool("llm", "enable_thinking", False)
         }
 
+    # Capability differences belong to public configuration, not to credentials
+    # or implicit model-name heuristics. The selected model still comes from env.
+    profiles = config_value("llm", "model_profiles", {})
+    if not isinstance(profiles, dict):
+        raise _invalid_setting("llm.model_profiles", "模型参数配置")
+    provider_profiles = profiles.get(provider, {})
+    if not isinstance(provider_profiles, dict):
+        raise _invalid_setting("llm.model_profiles", "供应商参数配置")
+    profile = provider_profiles.get(model_name, {})
+    allowed = {"temperature", "enable_thinking", "json_mode", "reasoning_token_reserve"}
+    if not isinstance(profile, dict) or set(profile) - allowed:
+        raise _invalid_setting("llm.model_profiles", "模型参数字段")
+    native_json_mode = _json_mode(provider)
+    reasoning_reserve = profile.get("reasoning_token_reserve", 0)
+    if (isinstance(reasoning_reserve, bool) or not isinstance(reasoning_reserve, int)
+            or not 0 <= reasoning_reserve <= 32768):
+        raise _invalid_setting("llm.model_profiles.reasoning_token_reserve", "推理 token 预留")
+    if "temperature" in profile:
+        temperature = profile["temperature"]
+        if (temperature is not None and (isinstance(temperature, bool)
+                or not isinstance(temperature, (int, float)) or not 0 <= temperature <= 2)):
+            raise _invalid_setting("llm.model_profiles.temperature", "温度参数")
+    if "enable_thinking" in profile:
+        if not isinstance(profile["enable_thinking"], bool) or provider != "dashscope":
+            raise _invalid_setting("llm.model_profiles.enable_thinking", "思考模式参数")
+        extra_body["enable_thinking"] = profile["enable_thinking"]
+    if "json_mode" in profile:
+        if not isinstance(profile["json_mode"], str) or profile["json_mode"] not in {"native", "prompt"}:
+            raise _invalid_setting("llm.model_profiles.json_mode", "模型 JSON 模式")
+        native_json_mode = profile["json_mode"] == "native"
+
     client = create_openai_client(
         api_key=api_key,
         base_url=base_url,
@@ -187,9 +218,10 @@ def get_generation_chat_model(
         model_name=model_name,
         temperature=temperature,
         max_tokens=max_tokens,
-        native_json_mode=_json_mode(provider),
+        native_json_mode=native_json_mode,
         token_limit_parameter=_token_limit_parameter(),
         extra_body=extra_body,
+        reasoning_token_reserve=reasoning_reserve,
     )
 
 

@@ -59,11 +59,12 @@ class OpenAICompatibleChatModel:
         *,
         client: Any,
         model_name: str,
-        temperature: float,
+        temperature: float | None,
         max_tokens: int | None,
         native_json_mode: bool,
         token_limit_parameter: str = "max_tokens",
         extra_body: dict[str, Any] | None = None,
+        reasoning_token_reserve: int = 0,
     ) -> None:
         self.client = client
         self.model_name = model_name
@@ -73,6 +74,7 @@ class OpenAICompatibleChatModel:
         self.native_json_mode = native_json_mode
         self.token_limit_parameter = token_limit_parameter
         self.extra_body = dict(extra_body or {})
+        self.reasoning_token_reserve = reasoning_token_reserve
 
     def invoke(
         self,
@@ -84,11 +86,12 @@ class OpenAICompatibleChatModel:
         request: dict[str, Any] = {
             "model": self.model_name,
             "messages": [_message_dict(message) for message in messages],
-            "temperature": self.temperature,
         }
+        if self.temperature is not None:
+            request["temperature"] = self.temperature
         token_limit = self.max_tokens if max_tokens is None else max_tokens
         if token_limit is not None:
-            request[self.token_limit_parameter] = token_limit
+            request[self.token_limit_parameter] = token_limit + self.reasoning_token_reserve
         if response_format and self.native_json_mode:
             request["response_format"] = response_format
         if self.extra_body:

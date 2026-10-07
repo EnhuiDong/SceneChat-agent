@@ -7,9 +7,23 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable
 
 from .visibility import normalize_scopes
+from .authoring_policy import normalize_codes as normalize_policy_codes, parse_policies
 
 
 VALID_VISIBILITIES = {"public", "director_only", "audience_only"}
+
+
+def resolve_faction(reference: str, factions: Iterable[str]) -> str:
+    """Bind an existing label, accepting only an unambiguous case variant.
+
+    Exact labels remain distinct (e.g. user-authored AI and ai factions).
+    Unknown or ambiguous labels must never produce an empty winning cohort.
+    """
+    labels = {value for value in factions if value}
+    if reference in labels:
+        return reference
+    matches = [value for value in labels if value.casefold() == reference.casefold()]
+    return matches[0] if len(matches) == 1 else ""
 VALID_TERMINATION_KINDS = {
     "faction_eliminated", "faction_parity", "world_equals", "entity_equals",
     "all_goals_completed", "all_active_at_location", "all_of", "any_of", "manual",
@@ -180,6 +194,7 @@ class ScenarioBrief:
     contradictions: list[str] = field(default_factory=list)
     fixed_canon: list[str] = field(default_factory=list)
     target_beats: list[str] = field(default_factory=list)
+    performance_policies: list[dict[str, str]] = field(default_factory=list)
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> "ScenarioBrief":
@@ -204,6 +219,7 @@ class ScenarioBrief:
             contradictions=_string_list(data.get("contradictions")),
             fixed_canon=_string_list(data.get("fixed_canon")),
             target_beats=_string_list(data.get("target_beats")),
+            performance_policies=parse_policies(data.get("performance_policies")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -251,6 +267,14 @@ class StateFieldSpec:
     mutable_by: list[str] = field(default_factory=lambda: ["resolver"])
     allowed_values: list[str] = field(default_factory=list)
 
+    def accepts_value(self, value: Any) -> bool:
+        if self.allowed_values and str(value) not in self.allowed_values:
+            return False
+        return ((self.value_type == 'integer' and type(value) is int)
+                or (self.value_type == 'boolean' and type(value) is bool)
+                or (self.value_type in {'string', 'enum'} and isinstance(value, str))
+                or self.value_type == 'any')
+
     @classmethod
     def from_mapping(cls, key: str, data: Any) -> "StateFieldSpec":
         if not isinstance(data, dict):
@@ -274,6 +298,7 @@ class PhaseSpec:
     next_phase: str = ""
     event_only: bool = False
     opening_min_cycles: int = 1
+    completion_action_types: list[str] = field(default_factory=list)
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any], index: int) -> "PhaseSpec":
@@ -301,6 +326,7 @@ class PhaseSpec:
             ),
             next_phase=_text(data.get("next_phase")),
             event_only=event_only,
+            completion_action_types=_string_list(data.get("completion_action_types")),
             opening_min_cycles=max(1, min(3, int(data.get("opening_min_cycles") or 1)))
             if str(data.get("opening_min_cycles") or "1").isdigit() else 1,
         )
@@ -342,14 +368,17 @@ class RuleSpec:
     priority: int = 0
     effect_mode: str = "rule"
     behavior_template: str = ""
+    requires: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any], index: int) -> "RuleSpec":
+        from .action_requirements import parse_requirements
         return cls(
             id=_text(data.get("id"), f"rule-{index}"),
             priority=int(data.get("priority", 0)),
             effect_mode=_text(data.get("effect_mode"), "rule"),
             behavior_template=_text(data.get("behavior_template")),
+            requires=parse_requirements(data.get('requires', [])),
             description=_text(data.get("description")),
             action_type=_text(data.get("action_type"), "act"),
             phases=_string_list(data.get("phases")),
@@ -486,6 +515,7 @@ class WorldSpec:
     entities: dict[str, dict[str, Any]] = field(default_factory=dict)
     audience_policy: str = "limited"
     reveal_policy: str = "preserve_suspense"
+    performance_policies: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.beat_specs and self.target_beats:
@@ -498,6 +528,10 @@ class WorldSpec:
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> "WorldSpec":
+        if data.get('execution_version', 1) != 2 and any(
+            isinstance(rule, dict) and rule.get('requires') for rule in data.get('rules') or []
+        ):
+            raise ValueError('requires 仅支持 execution_version=2；不能在旧执行模式下忽略前提')
         if data.get("execution_version", 1) == 2:
             for rule in data.get("rules") or []:
                 if not isinstance(rule, dict):
@@ -508,7 +542,11 @@ class WorldSpec:
                     if any(part.get(key) for key in ("condition", "conditions", "preconditions", "when", "script", "code")):
                         raise ValueError("规则不支持条件表达式或脚本；请使用已声明的阶段、目标和白名单操作")
                     if "op" in part and (part["op"] not in VALID_PATCH_OPERATIONS or any(key in part for key in ("params", "arguments", "path"))):
-                        raise ValueError("effect 必须使用白名单 op，key/target/value/amount 应位于同一层；不支持 params/path 或自造操作")
+                        raise ValueError(
+                            f"规则 {rule.get('id', '未命名')} 的 effect op={part['op']} 必须使用白名单 op："
+                            + "、".join(sorted(VALID_PATCH_OPERATIONS))
+                            + "；key/target/value/amount 应位于同一层，不支持 params/path 或自造操作"
+                        )
         scheduler = _text(data.get("scheduler"), "round_robin")
         if scheduler not in VALID_SCHEDULERS:
             scheduler = "round_robin"
@@ -547,6 +585,7 @@ class WorldSpec:
             entities=dict(data.get("entities") or {}),
             audience_policy=_text(data.get("audience_policy"), "limited"),
             reveal_policy=_text(data.get("reveal_policy"), "preserve_suspense"),
+            performance_policies=normalize_policy_codes(data.get("performance_policies")),
             opening_scene=_text(data.get("opening_scene")),
             public_world_markdown=_text(data.get("public_world_markdown")),
             director_notes_markdown=_text(data.get("director_notes_markdown")),
@@ -882,6 +921,13 @@ class ScenarioPackage:
     characters: list[CharacterSpec]
     warnings: list[str] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        # Repairs/imports cannot independently widen or erase author policies.
+        self.world.performance_policies = normalize_policy_codes([
+            item.get("code") for item in self.brief.performance_policies
+            if isinstance(item, dict) and item.get("source_excerpt")
+        ])
+
     @property
     def worldview_markdown(self) -> str:
         return self.world.to_markdown(include_director=True)
@@ -989,12 +1035,16 @@ def normalize_scenario_phase_references(package: ScenarioPackage) -> None:
     valid_termination_kinds = VALID_TERMINATION_KINDS
 
     def winner_faction(winner: str) -> str:
+        bound = resolve_faction(winner, factions)
+        if bound:
+            return bound
         normalized_winner = re.sub(r"(?:阵营|faction|team)", "", winner.lower()).strip()
-        return next((
+        matches = [
             faction for faction in factions
             if re.sub(r"(?:阵营|faction|team)", "", faction.lower()).strip()
             == normalized_winner
-        ), "")
+        ]
+        return matches[0] if len(matches) == 1 else ""
 
     def normalize_termination(rule: TerminationRule) -> None:
         rule.phases = [resolve(phase) for phase in rule.phases]
@@ -1190,6 +1240,15 @@ def validate_scenario_package(package: ScenarioPackage, *, user_prompt: str | No
             issues.append(f"结束规则“{rule.id}”使用未知 kind")
         if rule.kind in {"all_of", "any_of"} and not rule.conditions:
             issues.append(f"组合结束规则“{rule.id}”缺少 conditions")
+        if rule.kind in {"faction_eliminated", "faction_parity"}:
+            labels = {character.faction for character in package.characters if character.faction}
+            if not resolve_faction(rule.faction, labels):
+                issues.append(f"结束规则“{rule.id}”引用未知或不明确阵营“{rule.faction}”")
+            for opponent in rule.opposing_factions:
+                if not resolve_faction(opponent, labels):
+                    issues.append(f"结束规则“{rule.id}”引用未知或不明确对立阵营“{opponent}”")
+                elif resolve_faction(opponent, labels) == resolve_faction(rule.faction, labels):
+                    issues.append(f"结束规则“{rule.id}”将自己的阵营列为对立阵营“{opponent}”")
         if rule.kind == "world_equals" and rule.key not in package.world.initial_state:
             issues.append(f"结束规则“{rule.id}”引用未知世界状态“{rule.key}”")
         if (

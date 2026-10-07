@@ -43,9 +43,12 @@ class SimulationScheduler:
 
         exit_rule = self._due_phase_exit(state, phase, eligible)
         if exit_rule is not None:
+            from .visibility import ViewerContext, can_access
             actor = self._round_robin_actor(
                 state, [agent for agent in eligible
-                        if matches_role(agent.role, exit_rule.allowed_roles)]
+                        if matches_role(agent.role, exit_rule.allowed_roles)
+                        and can_access(exit_rule.visibility, ViewerContext(
+                            name=agent.name, role=agent.role, location=agent.current_location))]
             )
             return self._record(state, SchedulerDecision(
                 "agent", actor.name,
@@ -182,17 +185,44 @@ class SimulationScheduler:
     @staticmethod
     def _due_phase_exit(state: SimulationState, phase, eligible: list[AgentState]):
         if (phase is None or phase.event_only or phase.advance_when != "manual"
-                or not phase.next_phase or not eligible):
+                or not eligible):
             return None
+        from .visibility import ViewerContext, can_access
+
+        def actors_for(rule):
+            return [agent for agent in eligible
+                    if matches_role(agent.role, rule.allowed_roles)
+                    and can_access(rule.visibility, ViewerContext(
+                        name=agent.name, role=agent.role, location=agent.current_location))]
+
         exits = [
             rule for rule in state.rules
             if (not rule.phases or phase.name in rule.phases)
+            and (getattr(state.world_spec, 'execution_version', 1) != 2
+                 or rule.effect_mode in {'rule', 'stack'})
             and rule.action_type in phase.allowed_action_types
             and rule.target_scope in {"none", "self"}
-            and any(effect.op == "set_phase" and effect.value == phase.next_phase
+            and any(effect.op == "set_phase" and effect.value in state.phase_specs
+                    and effect.value != phase.name
                     for effect in rule.effects)
-            and any(matches_role(agent.role, rule.allowed_roles) for agent in eligible)
+            and actors_for(rule)
         ]
+        if phase.next_phase:
+            exits = [rule for rule in exits if any(effect.op == 'set_phase' and effect.value == phase.next_phase
+                                                   for effect in rule.effects)]
+        else:
+            # A sole explicit route to a structured decision is still real
+            # even if the generated phase omitted next_phase. Do not invent
+            # an exit, choose a branch, or time-limit free conversation.
+            destinations = {effect.value for rule in exits for effect in rule.effects if effect.op == 'set_phase'}
+            if len(destinations) != 1:
+                return None
+            destination = state.phase_specs.get(next(iter(destinations)))
+            if (destination is None or destination.event_only
+                    or destination.advance_when not in {'all_active_voted', 'all_eligible_acted'}
+                    or not destination.allowed_action_types
+                    or set(destination.allowed_action_types).intersection({'speak', 'act', 'observe', 'pass'})):
+                return None
         if not exits:
             return None
         names = {agent.name for agent in eligible}
@@ -224,13 +254,19 @@ class SimulationScheduler:
         # ongoing discussion, negotiation, exploration, or combat phase.
         if phase is None or getattr(phase, "advance_when", "") == "manual":
             return eligible
-        unacted = [
-            agent for agent in eligible if agent.name not in state.phase_action_log
-        ]
+        if (getattr(phase, "advance_when", "") == "all_eligible_acted"
+                and not phase.next_phase
+                and any(not rule.phases or phase.name in rule.phases
+                        for rule in state.termination_rules)):
+            # No transition is possible. A terminal task phase remains open
+            # until its actual termination predicate is met, not merely until
+            # everyone has spoken. Keep logs intact and invent no completion.
+            return eligible
+        acted, previous_turns, revisited = state.phase_qualifying_participation()
+        unacted = [agent for agent in eligible if agent.name not in acted]
         if unacted:
             return unacted
         if getattr(phase, "advance_when", "") == "all_eligible_acted":
-            previous_turns, revisited = state.phase_actor_turn_count()
             required = state.phase_required_actor_turns(phase, len(eligible), revisited=revisited)
             if previous_turns < required:
                 return eligible

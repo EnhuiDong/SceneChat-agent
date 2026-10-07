@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import re
 from typing import Any
 
-from .models import AgentState, MEMORY_TYPES, SimulationState
+from .models import AgentState, MEMORY_TYPES, Message, SimulationState
 from .role_selectors import matches_role
 
 
@@ -13,6 +14,28 @@ CONVERSATION_MOVES = {
     "statement", "answer", "question", "request", "challenge", "deflect",
     "support", "reveal", "acknowledge", "silence",
 }
+
+
+def _supports_verified_claim(state: SimulationState, actor: AgentState, source: Message | None, content: str) -> bool:
+    """Execution evidence cannot verify arbitrary speech in the same event."""
+    if (source is None or not source.authoritative
+            or isinstance(source.intent, dict) and source.intent.get("generation_fallback")):
+        return False
+    if source.kind in {"narration", "intervention"}:
+        return True  # A visible, authoritative world observation; not hearsay.
+    from .prompt_library import visible_action_readback
+    anchors = visible_action_readback(state, actor, source)
+    for operation in source.state_patch:
+        if operation.get("op") == "add_known_fact" and operation.get("target") == actor.name:
+            value = operation.get("value")
+            key = operation.get("key")
+            if isinstance(value, str) and actor.known_facts.get(key) == value:
+                anchors.append(value)
+    normalized = re.sub(r"[\W_]+", "", content).lower()
+    # Exact declared/read-back facts only. Partial word matches do not prove
+    # a different claim about someone's past, intentions or inventory.
+    return bool(normalized and any(normalized == re.sub(r"[\W_]+", "", item).lower()
+                                   for item in anchors))
 
 
 @dataclass
@@ -41,9 +64,11 @@ class Intent:
     used_memory_ids: list[str] = field(default_factory=list)
     claim_updates: list[dict[str, Any]] = field(default_factory=list)
     rule_id: str = ""
+    continuity_notes: list[dict[str, str]] = field(default_factory=list)
 
     @classmethod
     def from_mapping(cls, actor: str, data: dict[str, Any]) -> "Intent":
+        from .continuity import validated_notes
         proposed = data.get("proposed_patch") or data.get("state_patch") or []
         try:
             urgency = max(0.0, min(float(data.get("urgency", 0.0)), 1.0))
@@ -64,6 +89,7 @@ class Intent:
         return cls(
             actor=actor,
             rule_id=str(data.get("rule_id") or "").strip(),
+            continuity_notes=validated_notes(data.get("continuity_notes"), data.get("action")),
             action_type=str(data.get("action_type") or "speak").strip(),
             action=str(data.get("action") or "观察局势").strip(),
             speech=str(data.get("speech") or "").strip(),
@@ -230,6 +256,14 @@ class IntentResolver:
             target_error = self._validate_target(state, actor, intent, ability, None)
         if target_error:
             return Resolution(False, target_error, intent)
+        if rule is not None and getattr(state.world_spec, 'execution_version', 1) == 2:
+            from .action_requirements import requirements_met, failure_details
+            if not requirements_met(state, rule, intent):
+                # No private state values/secret names in the diagnostic;
+                # no lower-priority fallthrough and no costs on a rejection.
+                detail = failure_details(state, actor, rule, intent)
+                return Resolution(False, '该行动的执行前提尚未满足；本次未提交变化'
+                                  + ('。可见当前状态与所需状态：' + detail if detail else ''), intent)
         self._sanitize_conversation_metadata(state, actor, intent)
 
         patch = StatePatch()
@@ -516,13 +550,7 @@ class IntentResolver:
                 status = "heard"
             if status == "verified":
                 source_message = visible_recent.get(source_event_id)
-                is_world_evidence = bool(
-                    source_message
-                    and (
-                        source_message.kind in {"narration", "intervention"}
-                        or source_message.state_patch
-                    )
-                )
+                is_world_evidence = _supports_verified_claim(state, actor, source_message, content)
                 if not is_world_evidence:
                     status = (
                         "heard"
@@ -826,17 +854,18 @@ class IntentResolver:
             for item in state.agents.values()
             if item.eligible and matches_role(item.role, phase.actor_roles)
         ]
-        acted = set(state.phase_action_log)
-        acted.add(actor.name)
+        acted, previous_turns, revisited = state.phase_qualifying_participation()
+        qualifies = not phase.completion_action_types or intent.action_type in phase.completion_action_types
+        if qualifies:
+            acted.add(actor.name)
         should_advance = phase.advance_when == "all_eligible_acted" and set(eligible).issubset(acted)
         if should_advance:
-            previous_turns, revisited = state.phase_actor_turn_count()
             required = state.phase_required_actor_turns(phase, len(eligible), revisited=revisited)
-            should_advance = previous_turns + 1 >= required
+            should_advance = previous_turns + int(qualifies) >= required
         if phase.advance_when == "all_active_voted":
             prospective = set(state.votes)
             if intent.action_type == "vote":
                 prospective.add(actor.name)
             should_advance = set(eligible).issubset(prospective)
-        if should_advance:
-            patch.add("set_phase", value=phase.next_phase or "")
+        if should_advance and phase.next_phase:
+            patch.add("set_phase", value=phase.next_phase)

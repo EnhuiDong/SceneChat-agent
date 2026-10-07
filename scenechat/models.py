@@ -177,12 +177,16 @@ class Message:
     director_changes: List[Dict[str, Any]] = field(default_factory=list)
 
     def as_observation(self) -> str:
+        if self.intent.get("generation_fallback"):
+            return f"[{self.turn}] 系统：本轮生成未成功，没有形成角色回应；不能据此判断{self.speaker}的意愿或情绪。"
         return f"[{self.turn}] {self.speaker}：{self.action} {self.speech}".strip()
 
     def as_observation_for(self, agent_name: str) -> str:
-        content = self.individual_observations.get(agent_name)
-        if content:
-            return f"[{self.turn}] {content}".strip()
+        if self.intent.get("generation_fallback"):
+            return self.as_observation()
+        if agent_name in self.individual_observations:
+            content = self.individual_observations[agent_name]
+            return f"[{self.turn}] {content or '未获得可描述的观察。'}".strip()
         return self.as_observation()
 
     @property
@@ -413,6 +417,10 @@ class AgentState:
         return record
 
     def observe(self, message: Message, phase: str = "") -> None:
+        # A recovery artifact is not a person's choice. Authoritative effects
+        # still commit in add_message and appear in the current rule state.
+        if message.intent.get("generation_fallback"):
+            return
         observation = message.as_observation_for(self.name)
         self.observations.append(observation)
         self.observations = self.observations[-MAX_AGENT_OBSERVATIONS:]
@@ -834,6 +842,27 @@ class SimulationState:
             cycles = min(3, cycles + 1)
         return eligible_count * cycles
 
+    def phase_qualifying_participation(self) -> tuple[set[str], int, bool]:
+        """Actual declared actions, not utterances about doing them.
+
+        Derive from committed history so checkpoint restore needs no second
+        mutable progress log. Legacy phases retain their original semantics.
+        """
+        phase = self.phase_specs.get(self.current_phase)
+        action_types = set(getattr(phase, "completion_action_types", []))
+        if not action_types:
+            count, revisited = self.phase_actor_turn_count()
+            return set(self.phase_action_log), count, revisited
+        started_at, revisited = 0, False
+        for index, message in enumerate(self.history):
+            if any(operation.get("op") == "set_phase" and operation.get("value") == self.current_phase
+                   for operation in message.state_patch) or message.state_updates.get("current_phase") == self.current_phase:
+                started_at, revisited = index + 1, True
+        qualified = [message for message in self.history[started_at:]
+                     if message.authoritative and message.speaker in self.agents
+                     and message.intent.get("action_type") in action_types]
+        return {message.speaker for message in qualified}, len(qualified), revisited
+
     def add_message(self, msg: Message) -> None:
         from .change_log import snapshot, differences
         before_changes = snapshot(self)
@@ -856,7 +885,7 @@ class SimulationState:
                 agent.observe(msg, phase=self.current_phase)
 
         active_agent = self.agents.get(msg.speaker)
-        if active_agent is not None:
+        if active_agent is not None and not msg.intent.get("generation_fallback"):
             if msg.memory:
                 active_agent.remember_structured(
                     msg.memory,
@@ -1274,9 +1303,16 @@ class SimulationState:
         # A counter-question in direct reply is part of the same decision
         # point. It may be spoken, but must not create another mandatory round
         # of answers to the very person who asked first.
-        opens_obligation = move in {"question", "request", "challenge"} and not (
-            reply_to and move in {"question", "challenge"}
-        )
+        obligation_targets = addressed_to
+        if reply_to and move in {"question", "challenge"}:
+            reply_source = next((m for m in reversed(self.history) if m.event_id == reply_to), None)
+            # Suppress only a counter-question to the original requester. A
+            # reply to A that challenges B must still give B a response turn.
+            # Otherwise bystanders repeatedly blame B for not answering an
+            # obligation that the engine silently discarded.
+            obligation_targets = [name for name in addressed_to
+                                  if reply_source is None or name != reply_source.speaker]
+        opens_obligation = move in {"question", "request", "challenge"} and bool(obligation_targets)
         if not summary or not opens_obligation:
             if thread is not None and thread.obligations and all(
                 item.status in {"satisfied", "withdrawn"}
@@ -1294,14 +1330,13 @@ class SimulationState:
             "created_at_turn": msg.turn,
             "thread_id": thread.id if thread is not None else "",
         }
-        obligation_targets = addressed_to
         if (intent.get("address_scope") == "all_present" and move == "question"
-                and len(addressed_to) > 2
+                and len(obligation_targets) > 2
                 and not re.search(r"每(?:个人|位|名)|各自|分别|逐个|人人|一人一句", summary)):
             # A factual question heard by the whole room does not require
             # every listener to repeat the same answer. Explicit requests for
             # each person's own account still reach everyone.
-            obligation_targets = addressed_to[:2]
+            obligation_targets = obligation_targets[:2]
         delivered_to = []
         for name in obligation_targets:
             target = self.agents[name]
@@ -1459,16 +1494,7 @@ class SimulationState:
         field_spec = self.state_schema.get(key)
         if field_spec is None:
             return not self.state_schema
-        allowed_values = list(getattr(field_spec, "allowed_values", []) or [])
-        if allowed_values and str(value) not in allowed_values:
-            return False
-        value_type = getattr(field_spec, "value_type", "string")
-        return (
-            (value_type == "integer" and isinstance(value, int) and not isinstance(value, bool))
-            or (value_type == "boolean" and isinstance(value, bool))
-            or (value_type in {"string", "enum"} and isinstance(value, str))
-            or value_type == "any"
-        )
+        return field_spec.accepts_value(value)
 
     def advance_phase(self, requested_phase: str = "") -> None:
         if not self.phase_sequence:
@@ -1530,11 +1556,25 @@ class SimulationState:
             )
         faction = getattr(rule, "faction", "")
         alive = [agent for agent in self.agents.values() if agent.eligible]
-        if kind == "faction_eliminated" and faction:
+        if kind in {"faction_eliminated", "faction_parity"}:
+            from .scenario import resolve_faction
+            labels = {agent.faction for agent in self.agents.values() if agent.faction}
+            faction = resolve_faction(faction, labels)
+            if not faction:
+                return False
+        if kind == "faction_eliminated":
             return not any(agent.faction == faction for agent in alive)
-        if kind == "faction_parity" and faction:
+        if kind == "faction_parity":
             faction_count = sum(agent.faction == faction for agent in alive)
-            return faction_count > 0 and faction_count >= len(alive) - faction_count
+            opponents = list(getattr(rule, "opposing_factions", []) or [])
+            if opponents:
+                resolved = {resolve_faction(value, labels) for value in opponents}
+                if "" in resolved or faction in resolved:
+                    return False
+                opponent_count = sum(agent.faction in resolved for agent in alive)
+            else:
+                opponent_count = len(alive) - faction_count
+            return faction_count > 0 and faction_count >= opponent_count
         if kind == "world_equals":
             return self.world_state.get(getattr(rule, "key", "")) == getattr(rule, "value", None)
         if kind == "entity_equals":

@@ -6,7 +6,7 @@ from .models import AgentState
 
 CHARACTER_HEADER_RE = re.compile(r"(?=^##\s*角色\s*\d+\s*$)", re.MULTILINE)
 SECTION_RE = re.compile(
-    r"^###\s*(\d+)\.\s*([^\n]+)\n(.*?)(?=^###\s*\d+\.|\Z)",
+    r"^###\s*(\d+)\.(?!\d)\s*([^\n]+)\n(.*?)(?=^###\s*\d+\.|\Z)",
     re.MULTILINE | re.DOTALL,
 )
 
@@ -58,13 +58,16 @@ def parse_character_agents(markdown: str) -> List[AgentState]:
         if knowledge_value and ("知识" in knowledge_title or "信息边界" in knowledge_title):
             private_memory.append(f"我的初始知识边界：{knowledge_value}")
         belief_match = re.search(
-            r"^###\s*7\.1\s*[^\n]*\n(.*?)(?=^###\s*\d+\.|\Z)",
+            r"^###\s*7\.1(?!\d)\s*[^\n]*\n(.*?)(?=^###\s*\d+\.|\Z)",
             profile,
             re.MULTILINE | re.DOTALL,
         )
         belief_text = _clean_value(belief_match.group(1)) if belief_match else ""
         core_beliefs = [] if (
-            not belief_text or belief_text == "未设定额外核心信念"
+            not belief_text or belief_text in {
+                "未设定额外核心信念",
+                "未设定额外核心信念；依据性格、目标和处境判断。",
+            }
         ) else [belief_text]
 
         agents.append(

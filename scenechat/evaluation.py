@@ -102,6 +102,59 @@ def _near_duplicate_rate(speeches: list[str]) -> float:
     return duplicates / (len(speeches) - 1)
 
 
+def minimal_reply_diagnostic(messages) -> QualityScore:
+    """Literal short acknowledgments, not a semantic verdict about the scene."""
+    replies = [m for m in messages if m.kind not in {"narration", "intervention"} and m.speech.strip()]
+    if not replies:
+        return QualityScore(None, None, "N/A：没有公开台词样本")
+    acknowledgments = {"嗯", "嗯嗯", "行", "行吧", "好", "好的", "好吧", "哦", "噢", "对", "是", "知道了", "谢了", "谢谢", "okay", "ok", "yes", "sure", "thanks"}
+    count = streak = longest = 0
+    event_ids = []
+    for message in replies:
+        text = re.sub(r"[\W_]+", "", message.speech.lower())
+        if text in acknowledgments:
+            count += 1
+            streak += 1
+            longest = max(longest, streak)
+            event_ids.append(message.event_id)
+        else:
+            streak = 0
+    return QualityScore(round(count / len(replies), 4), None,
+                        f"极简附和={count}/{len(replies)}，最长连续演员台词={longest}；"
+                        f"事件={','.join(event_ids[:8]) or '无'}。仅词面诊断，不判行动是否推进，不作为质量总分或重试依据。")
+
+
+def silent_action_diagnostic(messages) -> QualityScore:
+    """Expose silent cycles hidden by dialogue-only repetition metrics.
+
+    A quiet vigil can be intentional; this never rejects an event or awards a
+    semantic pass/fail. Explicit state effects and speech break the span.
+    """
+    actors = [m for m in messages if m.kind not in {"narration", "intervention"}]
+    if not actors:
+        return QualityScore(None, None, "N/A：没有角色事件")
+    silent = []
+    current = []
+    longest = []
+    for message in actors:
+        quiet = (not message.speech.strip() and not message.state_patch
+                 and not message.public_changes
+                 and not message.intent.get("meaningful_state_change")
+                 and not message.intent.get("generation_fallback")
+                 and message.intent.get("action_type") in {"act", "pass", "observe"})
+        if quiet:
+            silent.append(message)
+            current.append(message)
+            if len(current) > len(longest):
+                longest = list(current)
+        else:
+            current = []
+    return QualityScore(round(len(silent) / len(actors), 4), None,
+                        f"无台词且无显式状态变化={len(silent)}/{len(actors)}，最长连续角色事件={len(longest)}；"
+                        f"事件={','.join(m.event_id for m in longest[:8]) or '无'}。"
+                        "只标记需阅读的静默区间，不判静默是否合理，不作为自动重试或收束依据。")
+
+
 def evaluate_trace(
     messages: Iterable[Message],
     *,
@@ -146,7 +199,8 @@ def evaluate_trace(
     differentiation = 1 - (sum(pairs) / len(pairs)) if pairs else (1.0 if len(sample_values) == 1 else 0.0)
 
     ended = bool(state and state.ended)
-    natural_end = ended and bool(state.end_reason) and state.end_kind not in {"max_turns", "blocked"}
+    natural_end = (ended and bool(state.end_reason) and state.run_status != "blocked"
+                   and state.end_kind not in {"max_turns", "blocked", "safety_limit", "generation_failure"})
     failure_count = state.failed_generation_count if state else 0
     fallback_count = getattr(state, "structured_output_fallback_count", 0) if state else 0
     blocked = bool(state and state.run_status == "blocked")
@@ -172,11 +226,8 @@ def evaluate_trace(
         for message in dialogue
         if isinstance(message.intent, dict)
     ) / max(len(dialogue), 1)
-    monologues = sum(
-        len(message.speech) > 240
-        or len([part for part in re.split(r"[。！？!?；;]+", message.speech) if part.strip()]) > 4
-        for message in dialogue
-    )
+    from .dialogue_quality import overlong_dialogue
+    monologues = sum(overlong_dialogue(message.speech) for message in dialogue)
     relationship_updates = [
         update
         for message in dialogue
@@ -190,6 +241,8 @@ def evaluate_trace(
     )
 
     metrics = {
+        "minimal_reply_share": minimal_reply_diagnostic(trace),
+        "silent_action_share": silent_action_diagnostic(trace),
         "non_empty_dialogue": _score(1.0 if dialogue else 0.0, f"{len(dialogue)} dialogue events", 1.0),
         "duplicate_avoidance": _score(1 - duplicate_rate, f"near-duplicate rate={duplicate_rate:.3f}"),
         "cast_participation": _score(participation, f"{len(set(counts).intersection(expected))}/{len(expected)} expected characters spoke" if expected else f"{len(counts)} speakers"),
@@ -500,9 +553,10 @@ def compare_pacing_runs(
 
 
 def summarize_quality(metrics: dict[str, QualityScore]) -> dict:
-    values = [metric.value for metric in metrics.values()]
+    scored = [metric for metric in metrics.values() if metric.passed is not None and metric.value is not None]
+    values = [metric.value for metric in scored]
     return {
-        "score": round(sum(values) / max(len(values), 1), 4),
-        "passed": all(metric.passed for metric in metrics.values()),
+        "score": round(sum(values) / len(values), 4) if values else None,
+        "passed": all(metric.passed for metric in scored) if scored else None,
         "metrics": {name: metric.to_dict() for name, metric in metrics.items()},
     }

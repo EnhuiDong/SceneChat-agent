@@ -15,9 +15,16 @@ class DialogueQualityIssue:
     hard: bool = False
 
 
+def overlong_dialogue(speech: str) -> bool:
+    """A soft size warning, not a rule that humans may only say four sentences."""
+    sentence_count = len([part for part in re.split(r"[。！？!?；;]+", speech) if part.strip()])
+    return len(speech) > 480 or (len(speech) > 240 and sentence_count > 8)
+
+
 def _normalized(value: Any) -> str:
     text = str(value or "").lower()
     replacements = {
+        "没有": "没",  # Preserve negation while matching ordinary contracted wording.
         "害怕": "担心", "担忧": "担心", "恐怕": "担心",
         "丢掉": "失去", "保不住": "失去", "饭碗": "职位", "工作": "职位",
         "同伙": "队友", "同伴": "队友", "一伙": "队友",
@@ -52,19 +59,47 @@ def _looks_like_secret(fragment: str, output: str) -> bool:
         return False
     if secret in candidate:
         return True
-    if SequenceMatcher(None, secret, candidate).ratio() >= 0.68:
-        return True
     secret_pairs = {secret[index:index + 2] for index in range(len(secret) - 1)}
-    output_pairs = {candidate[index:index + 2] for index in range(len(candidate) - 1)}
-    shared = secret_pairs.intersection(output_pairs)
-    if len(shared) >= 5 and len(shared) / max(len(secret_pairs), 1) >= 0.58:
-        return True
-    secret_characters = set(secret)
-    shared_characters = secret_characters.intersection(set(candidate))
-    return (
-        len(shared_characters) >= 6
-        and len(shared_characters) / max(len(secret_characters), 1) >= 0.68
-    )
+    def compact(value: str) -> str:
+        return re.sub(r"自己|那次|那场|这个|的|会|让|了", "", value)
+    # Compare coherent clauses, not a bag of characters from speech + notes +
+    # memory. Common characters scattered over a long Intent are not a leak.
+    for part in re.split(r"[。！？!?；;\n]+", str(output or "")):
+        clause = _normalized(part)
+        if len(clause) < 8:
+            continue
+        compact_secret, compact_clause = compact(secret), compact(clause)
+        if (SequenceMatcher(None, secret, clause).ratio() >= 0.68
+                or min(len(compact_secret), len(compact_clause)) >= 6
+                and SequenceMatcher(None, compact_secret, compact_clause).ratio() >= 0.66):
+            return True
+        output_pairs = {clause[index:index + 2] for index in range(len(clause) - 1)}
+        shared = secret_pairs.intersection(output_pairs)
+        if (len(shared) >= 5 and len(shared) / max(len(secret_pairs), 1) >= 0.65
+                and len(shared) / max(len(output_pairs), 1) >= 0.35):
+            return True
+    return False
+
+
+def _private_profile_lines(agent: AgentState) -> list[str]:
+    from .character_parser import _sections
+    sections = _sections(agent.profile)
+    if 5 not in sections:
+        return agent.profile.splitlines()  # Legacy/free-form dossiers.
+    # Stable personality and decision tendencies are not hidden evidence.
+    # Hard privacy checks protect identities and private knowledge; arbitrary
+    # motive secrecy can additionally use protected_propositions in world facts.
+    identity = sections[5][1].splitlines()
+    knowledge = re.split(r"[。；;\n]+", sections.get(8, ("", ""))[1])
+    # The Markdown key is metadata, not part of the protected proposition.
+    # "**确定知道**：<public fact>" otherwise fails the public-profile check
+    # and turns an ordinary recollection into a false secret leak. Strip only
+    # the generated Markdown field label, not arbitrary prose before a colon.
+    return identity + [
+        re.sub(r"^\s*[-*]?\s*\*\*[^*\n]+\*\*[：:]\s*", "", line)
+        for line in knowledge
+        if not any(marker in line for marker in ("不知道", "未知", "怀疑", "可能错误相信"))
+    ]
 
 
 def _known_parts(agent: AgentState) -> list[str]:
@@ -121,7 +156,7 @@ def _hidden_fragments(state: SimulationState, agent: AgentState) -> list[str]:
         if other.name == agent.name:
             continue
         public = _normalized(other.public_profile)
-        for raw_line in other.profile.splitlines():
+        for raw_line in _private_profile_lines(other):
             line = raw_line.strip().lstrip("-* ").strip()
             normalized = _normalized(line)
             if (
@@ -185,11 +220,10 @@ def inspect_dialogue_intent(
                 hard=len(normalized_speech) >= 24,
             ))
 
-        sentence_count = len([part for part in re.split(r"[。！？!?；;]+", speech) if part.strip()])
-        if len(speech) > 240 or sentence_count > 4:
+        if overlong_dialogue(speech):
             issues.append(DialogueQualityIssue(
                 "monologue",
-                "台词像一次完整演讲；压缩到一至三句，只推进一个主要意图。",
+                "台词篇幅过长；保留当场必要的解释和回应，删去重复铺垫与总结，不强行把自然交流压成一句话。",
             ))
 
         if (getattr(intent, "action_type", "") == "vote"
@@ -282,6 +316,47 @@ def inspect_dialogue_intent(
     return issues
 
 
+def sanitize_private_annotations(state: SimulationState, agent: AgentState, intent: Any) -> list[str]:
+    """Drop suspect bookkeeping instead of discarding a safe performance.
+
+    Disclosure matching is conservative and may reject a faithful paraphrase
+    of a heard statement. Never whitelist a hidden fact or promote that
+    paraphrase: retain the actual scoped dialogue, omit the suspect new note.
+    Public action/speech still pass the unchanged hard privacy gate.
+    """
+    fragments = _hidden_fragments(state, agent)
+    removed = []
+
+    def suspect(value):
+        if isinstance(value, dict):
+            return any(suspect(item) for item in value.values())
+        if isinstance(value, list):
+            return any(suspect(item) for item in value)
+        return isinstance(value, str) and any(_looks_like_secret(fragment, value) for fragment in fragments)
+
+    for field in ("memory_candidates", "claim_updates"):
+        items = getattr(intent, field, [])
+        if not isinstance(items, list):
+            continue
+        retained = []
+        for index, item in enumerate(items):
+            if suspect(item):
+                removed.append(f"{field}[{index}]")
+            else:
+                retained.append(item)
+        setattr(intent, field, retained)
+    updates = getattr(intent, "relationship_updates", {})
+    if isinstance(updates, dict):
+        retained = {}
+        for name, item in updates.items():
+            if suspect(item):
+                removed.append("relationship_updates")
+            else:
+                retained[name] = item
+        intent.relationship_updates = retained
+    return removed
+
+
 def quality_retry_instruction(issues: list[DialogueQualityIssue]) -> str:
     return "\n".join(f"- [{issue.code}] {issue.message}" for issue in issues)
 
@@ -296,6 +371,32 @@ def inspect_narration_event(
 
     text = str(narration or "").strip()
     issues: list[DialogueQualityIssue] = []
+    # Explicit reader-only inserts cannot ride inside a public observation.
+    # Include declarative offscreen viewpoint clauses, not just a labelled
+    # parenthesis. This is still not a general unseen-world fact classifier.
+    camera_text = re.sub(r'“[^”]*”|「[^」]*」|『[^』]*』|"[^"\n]*"', "", text)
+    labelled_camera = re.search(
+        r"(?:[（(]\s*|^|\n)\s*(?:镜头之?外|幕后镜头|仅(?:供)?读者可见)\s*[:：]", camera_text)
+    offscreen_pattern = (
+        r"(?:从|在)[^。！？!?；;\n]{0,24}(?:无法看见|看不见|无法看到|看不到)的"
+        r"[^。！？!?；;\n]{1,12}(?:上|里|内|中)[，,:：]"
+        r"|(?:在|从)(?:众人|所有人|在场(?:者|人物|角色))的?视线(?:之)?外[，,:：]"
+        r"|(?:在|从)(?:无人|没人|在场者都未|众人都未)(?:察觉|看见|注意到)的"
+        r"[^。！？!?；;\n]{1,12}(?:上|里|内|中)[，,:：]"
+    )
+    # Unseen does not mean imperceptible: a sound/smell can reach the actors.
+    # Check each viewpoint separately; one audible clause must not exempt a
+    # later private visual insert. Explicit reader-only labels stay forbidden.
+    offscreen_viewpoint = any(
+        not re.match(r"\s*(?:传来|响起|飘来|散发|涌来)", camera_text[match.end():])
+        for match in re.finditer(offscreen_pattern, camera_text)
+    )
+    if visibility == "public" and (labelled_camera or offscreen_viewpoint):
+        issues.append(DialogueQualityIssue(
+            "public_private_camera",
+            "public 旁白含读者专属镜头；删除在场角色无法观察的插入，保留可见后果。不能把包内屏幕或幕后信息当作全员知识。",
+            hard=True,
+        ))
     recent = [
         message.speech for message in state.history[-12:]
         if message.kind == "narration" and message.speech.strip()

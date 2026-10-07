@@ -4,7 +4,27 @@
     "max_retries": 1,
     "json_mode": "auto",
     "token_limit_parameter": "max_tokens",
-    "enable_thinking": false
+    "enable_thinking": false,
+    "model_profiles": {
+      "dashscope": {
+        "kimi-k3": {
+          "temperature": 1.0,
+          "enable_thinking": true,
+          "json_mode": "prompt",
+          "reasoning_token_reserve": 8192
+        },
+        "glm-5.3": {
+          "enable_thinking": true,
+          "json_mode": "prompt",
+          "reasoning_token_reserve": 8192
+        },
+        "qwen3.8-2.4t-a95b": {
+          "enable_thinking": true,
+          "json_mode": "prompt",
+          "reasoning_token_reserve": 8192
+        }
+      }
+    }
   },
   "embedding": {
     "batch_size": 20,
@@ -23,6 +43,14 @@
     "repair_max_tokens": 4096
   },
   "simulation": {
+    "actor_generation_mode": "single_pass",
+    "actor_prompt_style": "classic",
+    "scene_continuity_mode": "off",
+    "conversation_recall": "linked",
+    "narrator_mode": "periodic",
+    "intent_field_order": "speech_first",
+    "action_grounding": "off",
+    "performance_max_tokens": 500,
     "input_budget_bytes": 96000,
     "context_section_bytes": 6000,
     "parse_retries": 1,

@@ -134,6 +134,16 @@ EMBEDDING_MODEL=text-embedding-v2
 
 `llm.json_mode` 为 `auto` 时，OpenAI 与 DashScope 使用原生 JSON Mode，未知兼容服务只依赖严格 Prompt 和本地 JSON 校验；确认服务支持 `response_format` 后可改为 `native`。结构化长文本默认关闭 DashScope thinking，避免推理 token 占满输出预算而截断 JSON。
 
+不同模型的参数能力可能不同。`llm.model_profiles` 可按供应商及 `.env` 中选定的模型名覆盖 `temperature`（`null` 表示不发送）、`enable_thinking`（DashScope）、`json_mode`（`native` 或 `prompt`）和 `reasoning_token_reserve`。它不选择或替换模型，也不保存密钥。例如仓库中的 `dashscope/kimi-k3` 配置采用固定温度 1.0、开启思考、Prompt JSON 校验并预留 8192 个推理 tokens；固定温度与仅思考模式见[百炼 Kimi 接口说明](https://help.aliyun.com/zh/model-studio/kimi-api)。预留值加在每次请求的输出预算上，可能增加费用，不保证模型不会截断；按实际部署与评测调整。
+
+仓库还提供 `dashscope/glm-5.3` 与 `dashscope/qwen3.8-2.4t-a95b` 的精确型号配置，开启其要求的 thinking 模式、使用 Prompt JSON 校验并预留推理预算。只有 `.env` 选中对应型号时生效；其他 Qwen 或其他供应商参数不会被套用。服务端参数能力与延迟仍需按实际部署验证，预留推理预算可能增加输出费用。
+
+角色默认使用 `simulation.actor_generation_mode: "single_pass"`：人物指令、场景资料、执行协议与最近交流通过独立聊天消息提交。可选 `"performance_first"` 先生成当场表演，再补状态与执行字段，通常每个角色回合多一次调用；表演输出预算由 `simulation.performance_max_tokens` 控制（默认 500）。表演不能绕过动作、秘密或重复校验，无效草稿退回单步路径，仍共享原有超时和请求上限。这个可选模式需要针对模型和场景实测，不代表自动提升质量。提示词修改入口见 [docs/PROMPTS.md](docs/PROMPTS.md)。
+
+另提供默认关闭的场景质量实验选项：精简角色合同、动作原文连续性记录、执行字段优先、专用动作一致性检查，以及只抑制可选旁白的模式。它们不保证对所有模型与题材都有改善；成本、权限边界和使用限制见 [提示词配置说明](docs/PROMPTS.md#可回退的场景质量实验选项)。
+
+人物可以有限回应、拒绝、误判或有动机地说谎；私密念头与公开主张分离，台词不自动成为真实背景。开场描述不作为每回合重置的现状；普通行动可以完成一个小步骤，规则结果仍由引擎执行。直接待回应回合优先于周期性可选旁白。质量评测提供极简附和链的诊断，但不将短句直接判为失败，也不把结构成功率视为自然对话质量保证。
+
 `scenario.json_repair_retries` 控制不完整 JSON 的重新生成次数，`scenario.semantic_repair_retries` 控制设定未通过确定性校验时的定向修复次数，`scenario.transport_retries` 只在超时、断连或网关临时故障时重发当前步骤；三者有效范围均为 0–2。鉴权、额度、模型名称和请求参数错误不会重复发送。`simulation.intent_max_tokens` 与 `simulation.narration_max_tokens` 分别控制单轮角色 Intent 和旁白 JSON 的输出预算。
 
 ### 构建时间预算与断点恢复
@@ -221,3 +231,5 @@ python -m scenechat.benchmark --cases
 可选语义评审：`python -m scenechat.benchmark before.json after.json --judge`。该选项会把两份故事内容发送给 `.env` 配置的生成模型，最多额外请求一次、输出 2000 tokens、总时限 60 秒，不重试；超出输入预算会直接拒绝。评审匿名打乱 A/B 顺序，逐项给出设定忠实、动机、实质回应、因果与收尾判断，缺失或伪造来源事件的评分不予接受。
 
 报告分开列出结构指标、语义判断、耗时、已知 token 用量及未知用量。应用层调用次数不等于 SDK 底层尝试次数；未取得 usage 的失败调用不算零费用，没有单价时不估算金额。存档记录公开配置白名单、代码/提示版本摘要及调用模型，不记录 API Key 或服务地址。评测报告可能包含剧情秘密，不应提交到公共仓库；少量测试通过不等于所有题材都已稳定。
+
+收尾评审仅适用于双方都已记录实际故事结束的样本。短窗口、角色道晚安或安全暂停不代表完整剧情通过；这类对比的 ending 项保持 `not_applicable`。

@@ -171,7 +171,8 @@ def validate_resolved_beats(state: SimulationState, values: Any, verified=None) 
 
 def update_arc_after_message(state: SimulationState, message: Message, *, previous_phase=None) -> None:
     initialize_arc(state)
-    arc_updates = message.intent.get("arc_updates", {}) if isinstance(message.intent, dict) else {}
+    arc_updates = (message.intent.get("arc_updates", {})
+                   if isinstance(message.intent, dict) and not message.intent.get("generation_fallback") else {})
     verified = arc_updates.get("verified_beats", {})
     resolved_now = validate_resolved_beats(state, arc_updates.get("resolved_beat_ids", []), verified)
     if getattr(state.world_spec, "execution_version", 1) == 2:
@@ -200,7 +201,8 @@ def update_arc_after_message(state: SimulationState, message: Message, *, previo
 
     meaningful = bool(message.authoritative and message.kind != "narration" and (
         message.intent.get("meaningful_state_change", False)
-        or message.intent.get("obligation_resolution") in {"satisfied", "withdrawn"}
+        or (not message.intent.get("generation_fallback")
+            and message.intent.get("obligation_resolution") in {"satisfied", "withdrawn"})
     ))
     if message.kind == "intervention" or any(item.applied_at_turn == message.turn for item in state.interventions):
         state.arc_state.plan_adjusted_at_turn = message.turn

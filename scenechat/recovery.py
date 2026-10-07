@@ -12,7 +12,7 @@ from .errors import SceneChatError
 
 # Bump only when stalled structured or semantic checkpoints gain a genuinely
 # new repair policy. Older failed builds may then receive one bounded retry epoch.
-REPAIR_POLICY_VERSION = 5
+REPAIR_POLICY_VERSION = 7
 
 
 def upgraded_repair_available(row):

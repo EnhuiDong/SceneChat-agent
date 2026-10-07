@@ -7,7 +7,7 @@ from .scenario import extract_json_object
 from .build_control import CURRENT_BUILD, BuildControl
 from .telemetry import measured_call
 from .recovery import transport_call
-from .config import config_int
+from .config import config_int, validate_simulation_modes
 
 
 def _probe_request(operation):
@@ -57,6 +57,7 @@ def validate_model_availability() -> ModelPreflightResult:
     """Fail fast with minimal requests before expensive document generation."""
     # Construct both clients first so missing configuration is reported without
     # making any external request.
+    validate_simulation_modes()
     embedding_model = get_embedding_model()
     generation_model = get_generation_chat_model(temperature=0)
 
@@ -90,6 +91,7 @@ def validate_model_availability() -> ModelPreflightResult:
 
 def validate_generation_model_availability() -> str:
     """Probe the same JSON path used by scenario and simulation generation."""
+    validate_simulation_modes()
     generation_model = get_generation_chat_model(temperature=0, max_tokens=12)
     try:
         _probe_generation_model(generation_model)
@@ -106,6 +108,7 @@ def validate_generation_model_availability() -> str:
 
 def validate_embedding_model_availability() -> str:
     """Probe the indexing batch API before spending tokens on scenario generation."""
+    validate_simulation_modes()
     embedding_model = get_embedding_model()
     try:
         _probe_request(lambda: embedding_model.get_text_embedding_batch(

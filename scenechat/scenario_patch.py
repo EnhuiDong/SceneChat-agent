@@ -2,11 +2,25 @@
 
 from copy import deepcopy
 from dataclasses import fields
+import json
+import re
 
 from .scenario import CharacterSpec, ScenarioPackage, ScenarioValidationError, WorldSpec
 
 
-def apply_scenario_patch(package, payload):
+def _polymorphic_value(parts):
+    """Only protocol fields declared Any may legitimately change JSON type."""
+    path = "/" + "/".join(parts)
+    return bool(re.fullmatch(
+        r"/(?:world/rules/\d+/effects/\d+|characters/\d+/abilities/\d+/effects/\d+"
+        r"|world/termination_rules/\d+(?:/conditions/\d+)*|world/rules/\d+/requires/\d+"
+        r"|world/beat_specs/\d+/completion_conditions/\d+)/value", path))
+
+
+def apply_scenario_patch(package, payload, *, allow_noop=False):
+    # A well-formed no-op is a semantic non-progress result, not broken JSON.
+    # Only generation opts in so its semantic ledger accounts for the attempt;
+    # interactive callers still reject it. Path/type/identity guards never relax.
     changes = payload.get("changes")
     if not isinstance(changes, list) or not 1 <= len(changes) <= 80:
         raise ScenarioValidationError(["修复响应必须包含 1–80 项 changes 字段补丁，不能返回整份设定"])
@@ -25,8 +39,15 @@ def apply_scenario_patch(package, payload):
         if parts[0] == "characters" and len(parts) >= 3:
             valid = parts[1].isdigit() and int(parts[1]) < len(data["characters"])
             valid = valid and parts[2] in data["characters"][int(parts[1])] and parts[2] != "id"
-        if not valid or any(path == prior or path.startswith(prior + "/") or prior.startswith(path + "/") for prior in seen):
-            raise ScenarioValidationError(["补丁包含越界、重叠或禁止修改的路径；约束账本、人数及角色 ID 不可修改"])
+        if not valid:
+            raise ScenarioValidationError([f"补丁包含越界或禁止修改的路径 {path}；约束账本、人数及角色 ID 不可修改"])
+        conflict = next((prior for prior in sorted(seen)
+                         if path == prior or path.startswith(prior + "/") or prior.startswith(path + "/")), None)
+        if conflict:
+            raise ScenarioValidationError([
+                f"补丁路径重叠：{path} 与 {conflict}；替换父字段时不要同时补丁它的子字段，"
+                "把必要子字段修改合并到父字段 value，或只保留不重叠的子字段补丁"
+            ])
         seen.add(path)
         node = data
         try:
@@ -39,13 +60,15 @@ def apply_scenario_patch(package, payload):
                 raise TypeError
             previous = node[key] if isinstance(node, list) or key in node else None
             value = change["value"]
-            if previous is not None and type(previous) is not type(value):
+            if previous is not None and type(previous) is not type(value) and not _polymorphic_value(parts):
                 if not (type(previous) is float and type(value) is int):
                     raise TypeError
             node[key] = deepcopy(change["value"])
         except (KeyError, ValueError, IndexError, TypeError):
-            raise ScenarioValidationError(["补丁路径不存在；请替换已声明字段，不得构造虚假层级"]) from None
-    if data == package.to_dict():
+            raise ScenarioValidationError([f"补丁路径 {path} 不存在或 value 类型不匹配；请替换已声明字段，不得构造虚假层级"]) from None
+    # Python equality conflates True and 1 inside otherwise identical objects.
+    # JSON type changes in Any-valued fields are real semantic modifications.
+    if json.dumps(data, sort_keys=True) == json.dumps(package.to_dict(), sort_keys=True) and not allow_noop:
         raise ScenarioValidationError(["修复补丁未产生任何变化，停止重复修复"])
     result = ScenarioPackage(
         brief=package.brief, world=WorldSpec.from_mapping(data["world"]),

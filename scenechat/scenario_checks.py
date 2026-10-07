@@ -43,7 +43,10 @@ def additional_scenario_issues(package, user_prompt=None):
     issues = validate_mechanics(package)
     factions = {actor.faction for actor in package.characters if actor.faction}
     def check_winner(rule):
-        if rule.kind == "faction_parity" and rule.winner in factions and rule.winner != rule.faction:
+        from .scenario import resolve_faction
+        winner = resolve_faction(rule.winner, factions)
+        faction = resolve_faction(rule.faction, factions)
+        if rule.kind == "faction_parity" and winner and faction and winner != faction:
             issues.append(f"结束规则 {rule.id} 的 faction_parity 阵营方向与 winner 相反：faction 是达到人数优势的一方，应与获胜阵营一致")
         for child in rule.conditions:
             check_winner(child)

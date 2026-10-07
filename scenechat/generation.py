@@ -6,7 +6,6 @@ from copy import deepcopy
 from dataclasses import asdict
 from typing import Any
 
-from Character import CHARACTER_DESIGN_PROMPT
 from .config import config_int
 from .build_control import BuildControl, CURRENT_BUILD
 from .scenario_patch import apply_scenario_patch
@@ -21,6 +20,7 @@ from .scenario import (
     ScenarioPackage,
     ScenarioValidationError,
     StateFieldSpec,
+    VALID_PATCH_OPERATIONS,
     WorldSpec,
     extract_json_object,
     normalize_scenario_phase_references,
@@ -33,12 +33,14 @@ BRIEF_SYSTEM_PROMPT = """你是 SceneChat 的用户约束分析器。你的任�
 工作规则：
 1. 用户明确给出的题材、人物、人数、身份、技能、关系、规则、剧情节点、结局、场地和风格都是 locked 硬约束。
 2. 短输入要补足正常运行所需的默认信息；详细输入要尽量少添加，只补真正缺失的运行条件。
-3. 将用户已规定必须发生的内容放入 fixed_canon；将希望发生但实现方式可由角色推演的内容放入 target_beats。
-4. 识别信息可见性：公开信息用 public，导演秘密用 director_only，指定角色或身份可见时用 agent:<名称> 或 role:<身份>。
+3. 将用户已规定必须发生的内容放入 fixed_canon；将希望发生但实现方式可由角色推演的内容放入 target_beats。尚未发生的要求保留“必须/最终/当……才……”等未来或条件语义，不改成“已经完成”的开场事实；结束条件不是提前发生的结局。
+4. 识别信息可见性：public 表示开场时所有角色都有权知道，不是“用户已经告诉作者”。某人尚未告诉同伴的通知、打算和准备属于本人初始知识；未来可能在对话中公开，仍先用 agent:<名称>。导演秘密用 director_only，身份共有信息用 role:<身份>。不要给陌生人或尚未听到消息者预先授权。
 5. 对轻微歧义选择最符合上下文的解释并写入 assumptions。互相冲突的硬约束写入 contradictions，并采用“更具体、明确列举、位置更靠后的要求优先”的可重复规则解决。
 6. requested_character_count 必须是本次实际应生成的人数。用户未指定时，根据题材合理选择；单人场景允许 1 人。
 7. 不得从单个概念词擅自推导整体时代或审美。“AI 玩家”不等于赛博朋克；没有明确风格要求时，采用最少额外假设的现实实现。
 8. 用户未命名时，只记录需要生成独立姓名，不要在 assumptions 预先安排“林探长/苏医生”等职业姓名模板。公开的阵营人数与具体谁属于该阵营是不同事实，不能因为身份隐藏就把用户明确的游戏构成一并当作秘密。
+9. assumptions 只补必要的运行与场景条件，不预定所有人的情绪、关系走向或对话程序。“告别”不等于必须温情怀旧，“危机”不等于所有人冷静合作。用户未规定的解释不得升级为 fixed_canon；目标节点不要求引用尚未建立的具体旧事。
+10. 创作约束与角色知情权限不是同一件事。用户明确禁止补写时，另记录 performance_policies；只含固定 code 与逐字原文，不含剧情事实。只编译明确适用于全场的创作边界，某人的局部限制、某一特定物件的要求保留在原有 constraints，不能升级为全场禁令。宽范围 code：no_new_background_people（不增背景人物）、no_new_background_items（不增背景物品记录）、no_new_background_quantities（不增任何具体背景数字）、no_new_background_history（不增过去事实）。更窄 code：no_new_amounts（只禁新金额数额）、no_new_cast_members（只禁新增登场人物）、no_new_hidden_defects（不增隐藏缺陷故障）、no_new_task_items（不增已限定的任务事项）。按用户实际范围选，不能扩大禁令。“只有两名出场人物”用 no_new_cast_members，不等于背景不能有其他人；“不增加具体数额”用 no_new_amounts，不禁止计划新的日期。用户明确“不要增加任何未给出的背景信息”可记录四项宽范围 code；短输入、详细程度或秘密身份本身不触发任何 policy。没有明确要求就用空数组。隐藏真相、揭晓时间、未来剧情、风格与人物行为不能塞进此字段，保留原有带权限的 constraints。
 
 只输出一个 JSON 对象，不要使用 Markdown 代码块：
 {
@@ -60,7 +62,8 @@ BRIEF_SYSTEM_PROMPT = """你是 SceneChat 的用户约束分析器。你的任�
   "assumptions": ["系统补全或歧义解释"],
   "contradictions": ["冲突以及采用的解释"],
   "fixed_canon": ["必须发生或保持不变的内容"],
-  "target_beats": ["应努力引导但不强迫角色具体选择的节点"]
+  "target_beats": ["应努力引导但不强迫角色具体选择的节点"],
+  "performance_policies": [{"code":"上述固定 code 之一；无明确要求时整个数组为空", "source_excerpt":"对应用户逐字原文"}]
 }"""
 
 
@@ -82,23 +85,23 @@ WORLD_JSON_INSTRUCTION = """在遵守上方所有世界设计规则的同时，�
     {"id":"cooperation","label":"合作倾向","low_label":"对抗","high_label":"协作","description":"本场景中这一关系维度的含义"}
   ],
   "facts": [
-    {"id":"fact-1", "content":"一条原子事实", "visibility":["public|director_only|audience_only|agent:姓名|role:身份|location:地点"], "source":"user|world|inferred", "protected_propositions":["非公开事实的 1–3 条不可被未知角色直接断言的核心命题；公开事实可为空"], "covered_constraint_ids":["对应约束 ID"]}
+    {"id":"fact-1", "content":"开场已成立的一条原子事实，不是未来目标或条件达成后的结果", "visibility":["public|director_only|audience_only|agent:姓名|role:身份|location:地点"], "source":"user|world|inferred", "protected_propositions":["非公开事实的 1–3 条不可被未知角色直接断言的核心命题；公开事实可为空"], "covered_constraint_ids":["对应约束 ID"]}
   ],
   "state_schema": {
     "状态变量名": {"value_type":"string|integer|boolean|enum|any", "visibility":["public"], "mutable_by":["resolver"], "allowed_values":[]}
   },
   "scheduler": "round_robin|phase_order|initiative|urgency_director|event_first",
   "phase_specs": [
-    {"name":"自由推进", "scheduler":"round_robin", "allowed_action_types":["speak","pass"], "actor_roles":[], "advance_when":"manual", "next_phase":"", "event_only":false, "opening_min_cycles":1}
+    {"name":"自由推进", "scheduler":"round_robin", "allowed_action_types":["speak","pass"], "actor_roles":[], "advance_when":"manual", "next_phase":"", "event_only":false, "opening_min_cycles":1, "completion_action_types":[]}
   ],
   "rules": [
-    {"id":"rule-1", "description":"普通发言", "action_type":"speak", "phases":["自由推进"], "allowed_roles":[], "target_scope":"none", "priority":0, "effect_mode":"rule", "behavior_template":"", "effects":[], "visibility":["public"]}
+    {"id":"rule-1", "description":"普通发言", "action_type":"speak", "phases":["自由推进"], "allowed_roles":[], "target_scope":"none", "priority":0, "effect_mode":"rule", "behavior_template":"", "requires":[], "effects":[], "visibility":["public"]}
   ],
   "termination_conditions": ["自然结束或胜负条件"],
   "termination_rules": [
     {"id":"end-1", "kind":"faction_eliminated|faction_parity|world_equals|entity_equals|all_goals_completed|all_active_at_location|all_of|any_of|manual", "description":"结束说明", "phases":["允许判定胜负的结算/公布阶段；自由场景可为空"], "faction":"可选阵营", "opposing_factions":[], "target":"entity_equals 的实体 ID", "key":"相等比较使用的状态键", "value":"目标值，必须保持实际类型", "location":"all_active_at_location 使用的地点", "winner":"胜方", "conditions":[]}
   ],
-  "fixed_canon": ["从用户约束账本继承的必须发生内容"],
+  "fixed_canon": ["继承用户约束；未来必须发生的内容仍用未来/条件措辞，不写成已经发生"],
   "target_beats": ["需要跟踪但不强迫具体角色选择的节点"],
   "beat_specs": [
     {"id":"beat-1","description":"可观察、可判定是否已经发生的剧情节点","required":false,"weight":1,"prerequisites":[],"phase_hint":"可选阶段名","completion_mode":"narrative","completion_conditions":[],"resolution_signals":["已提交角色行动中的具体证据"]}
@@ -108,15 +111,17 @@ WORLD_JSON_INSTRUCTION = """在遵守上方所有世界设计规则的同时，�
 
 多个条件必须同时成立时，使用一个 kind=all_of 的顶层规则，把原子规则放入 conditions；任选其一时使用 any_of。不得把“且/全部/同时”条件拆成多个并列顶层规则，因为顶层规则之间按任一满足处理。
 
+rule.requires 是执行之前必须全部成立的类型化条件数组，空列表保留原行为。只支持四种完整格式：{"kind":"world_equals","key":"已声明键","value":同类型字面值}、{"kind":"entity_equals","target":"真实实体ID或$target","key":"已声明键","value":同类型字面值}、{"kind":"agent_location","target":"$actor或人物目标$target","value":"已声明地点"}、{"kind":"all_active_at_location","location":"已声明地点"}。不能嵌套条件、表达式、比较运算符或脚本；world/entity 相等保持类型严格。人物位置用 move_agent，不能以登车布尔字段冒充位置。前提在效果之前判定，不能用本次效果满足自己的前提。例如发车要求伤员已载入且全体已实际登车，应声明实体载入条件和 all_active_at_location 前提，再用独立发车效果。能力说明、description 不作为前提执行；能力没有 requires，依赖放在同动作可匹配的世界规则。
+
 新场景使用 execution_version=2：行动名称不隐含效果，必须显式填写 effects。rule.effect_mode=rule（默认，仅规则结果）、ability（仅能力结果）、stack（明确叠加）。能力使用次数与 consume_resource 成本始终校验扣除，不要重复声明 consume_ability。规则重叠用不同 priority 选最大者，禁止依赖顺序。没有规则时使用能力自身效果。会议 vote 只记录提案投票，不淘汰角色；医治 heal 不等于复活；inspect 只返回规则准许的事实。只有用户设定确实要求传统桌游效果时，才可显式选 behavior_template=legacy_tabletop，此时 effects 留空；不得根据题材名称强制套模板。
 target_scope 除角色 same_location/any_active/character/self/none，还支持 location/object/proposal。物品或提案声明在 entities 对象中，例如 {"proposal-A":{"kind":"proposal","state":{"passed":false}}}；通过 set_entity(target,key,value) 修改已声明的同类型字段。地点用 locations。资源在角色 resources 声明。move_agent 的 target=$actor、value=$target；record_vote 的 target=$target。不能发明运算符或运行代码；复杂统计若无法由已有操作精确表达，不能伪称支持。
 观众策略 audience_policy=limited|omniscient、reveal_policy=preserve_suspense|allow_reveal 应遵从用户要求，默认 limited + preserve_suspense。全知读者镜头仍是 audience_only，不能因此让角色知晓秘密。
 
 allowed_action_types 只能列出本阶段确实允许的行动；允许弃权或观察时才加入 pass/observe。强制投票阶段可以只允许 vote，不能为了通过校验而虚构 pass：pass 不记录选票，也不能满足 all_active_voted。生成失败后由运行时停止无效行动，不靠添加虚假动作掩盖机制缺口。
-advance_when=manual 表示阶段可无限持续；如果同时填写 next_phase，必须提供一条在本阶段可执行且包含 set_phase 到 next_phase 的规则，不能只在自然语言中说“之后进入下一阶段”。阶段切换必须是独立、明确的 act 行动；不能把它设为普通 speak 的高优先级规则，否则任何发言都会立刻跳阶段。初次见面的多人场景，不能在只听到一人发言后就切到表决，应让人物先有基本认识、试探和不同关注点。阵营对抗或比赛场景的 termination_rules 必须明确 winner，并能区分主要胜负结果。
+advance_when=manual 表示阶段可无限持续；如果同时填写 next_phase，必须提供一条在本阶段可执行且包含 set_phase 到 next_phase 的规则，不能只在自然语言中说“之后进入下一阶段”。阶段切换使用独立自定义 action_type（例如 enter_vote），并同步加入本阶段 allowed_action_types；不要使用普通 act/speak 承载切换，否则日常动作或发言也会跳阶段。初次见面的多人场景，不能在只听到一人发言后就切到表决，应让人物先有基本认识、试探和不同关注点。阵营对抗或比赛场景的 termination_rules 必须明确 winner，并能区分主要胜负结果。
 有夜间技能、治疗、反制或结算顺序时，termination rule 必须用 phases 限制到结算/公布阶段，不能在中间行动后提前判胜。
 
-状态 effect 仅允许 set_world、increment_world、set_entity、move_agent、set_agent_status、set_resource、consume_resource、set_goal_status、set_relationship、record_vote、clear_votes、set_phase、add_known_fact、protect_agent、clear_protections。模板中的 $actor、$target、$value 会在运行时由 Resolver 安全替换。
+状态 effect 仅允许 set_world、increment_world、set_entity、move_agent、set_agent_status、set_resource、consume_resource、set_goal_status、set_relationship、record_vote、clear_votes、set_phase、add_known_fact、protect_agent、clear_protections。模板中的 $actor、$target、$value 会在运行时由 Resolver 安全替换。$value 对应 Intent.expected_effect 的字符串，不是任意 JSON 值或语义推断：不能给布尔值、数字、null 字段填 $value。需要选择接受/拒绝等布尔结果时使用不同的合法 action_type 与固定 true/false 效果，不把说出的“我愿意”当成布尔输入。
 仅这三个占位符可用；$max_votes_target、$winner 等不会计算票数，也不会被替换。若用户确实要求狼人杀式“全员投票后最高票角色出局，平票无人出局”，可在 vote 角色规则明确使用 behavior_template=legacy_tabletop 且 effects=[]；不要另造 host 角色或在 event_only 结算阶段放一条需要角色执行的规则。环境事件只能播报已经由投票规则提交的结果。普通提案表决仍使用下方声明式 settle_votes，不能误套淘汰模板。
 faction_eliminated 结束规则只有角色实际变成不可行动时才能触发。record_vote 只是记录选票，settle_votes 只修改提案布尔状态，二者都不会淘汰角色；若故事必须按投票淘汰角色，就要有明确可执行的淘汰效果（例如符合用户设定的 legacy_tabletop），不可用一条提案表决规则冒充角色淘汰结算。同一阶段同名行动如同时面向人物与提案，应明确区分 target_scope，并确保目标与效果一致。
 每条结构化结束规则都要有真实、可执行的状态来源：如果 entity_equals 指向某个实体状态，必须有角色规则、能力或合法结算效果会更新同一实体与状态键；不能只把初始 false/true 当成“胜负统计”，进入公布阶段就预定胜者。隐藏身份不能靠只为真实卧底建立公开实体 ID 来暗示答案；若结局取决于隐藏阵营，优先用实际淘汰/存活状态的通用条件，而不是在公共世界中硬编码卧底姓名。
@@ -132,7 +137,10 @@ all_eligible_acted、all_active_voted、phase_advanced 是阶段推进方式或�
 relationship_dimensions 应选择 2–5 个对本场景真正有用、含义互不重复的主观关系维度，必须兼容题材而不是默认套用猜疑游戏：战斗可使用敌对/协作、威胁判断、敬重或服从；职场可使用合作、可靠判断、影响力；家庭或情感场景可使用亲密、信赖、依赖或边界感。不要把战斗胜负、生命值、距离等客观状态伪装成关系维度。若题材没有特殊需要，可使用 cooperation、confidence、regard 三个通用维度。"""
 
 RUNTIME_GENERATION_GUIDANCE = """
+效果占位符仅支持完整的 $actor、$target、$value。不存在 $world.xxx、$actor_boarded、拼接字段、读取状态表达式或动态键；不能用一个未支持的占位符替换另一个。效果用固定字段和值或这三个占位符。若机制需要累积进度，用 increment_world 更新已声明的数值，结束规则用 world_equals 匹配明确目标值；不能给同一 repair 再加一条无条件的高优先级“成功”规则。
+规则 description 不是执行条件：引擎不会判断“双方同意后”“修好后”“当……时”。同阶段、角色与目标范围内，同一 action_type 只执行最高 priority 的匹配规则，rule_id 不能绕过它。普通 speak/act/pass/observe 与明确的结束、提交或阶段切换必须使用不同 action_type，例如普通 speak 无效果，close_scene 更新结束状态，phase_specs.allowed_action_types 同时列出 speak 和 close_scene。不得把结束、确认或成功效果挂在高优先级普通 speak 上。只有确实无条件适用的共同行动成本可直接挂在普通行动上；不要依靠自然语言条件控制效果。
 set_phase 使用 value 存放目标阶段原文，例如 {"op":"set_phase","value":"秘密投票"}；target 不是目标阶段字段。不得写 value=null 再把阶段填入 target。
+increment_world 仅以 amount 作为整数增量，减少用 amount=-1；value 不参与计算，不能写 value=-1、amount=1 来表示减少。普通道具的归属、已收拾等若要进入结构化状态，必须有对应动作 effects 更新它；不需要追踪的装饰信息留在背景文本，不声明永远停在开场的可变状态来误导人物。
 结构化协议必须逐字段遵循：effects 是数组，每项操作的 op/key/target/value/amount 均在同一层，禁止嵌套 params、arguments、path 或自造操作（例如 check_condition_and_set）。set_agent_status 只允许 key=alive/active 和布尔 value；其他人物数值放 resources。实体结构必须是 {"实体ID":{"kind":"object或proposal","state":{"状态键":初始值}}}，不得把 state 改叫 properties。地点在 locations、opening_scene 与人物 initial_location 中使用一致的原文名称，不要混用英文 ID 和中文名。
 V2 提案表决的最小操作示例（仅在用户要求此机制时使用，不能强加给其他场景）：先声明 entities={"proposal-A":{"kind":"proposal","state":{"passed":false}}}，对应 rule.action_type=vote、target_scope=proposal、effect_mode=rule、effects=[{"op":"record_vote","target":"$target"},{"op":"settle_votes","target":"$target","key":"passed","amount":2}]。两人投票通过的结束规则为 {"id":"end","kind":"entity_equals","target":"proposal-A","key":"passed","value":true,"description":"提案通过"}。不得增加未经支持的条件脚本或把 passed 当成角色状态。
 运行可达性与人物命名约束：
@@ -141,6 +149,7 @@ V2 提案表决的最小操作示例（仅在用户要求此机制时使用，�
 - 短输入优先设计可复用的一轮阶段循环，不预先复制 Round 1/2/3 三套同构阶段与规则；轮数由运行时推进。若确需手动阶段，先确认退出动作和 set_phase 规则都在该角色阶段可执行，不能把角色规则放到 event_only 阶段。
 - 普通环境事件阶段使用 after_event 并明确 next_phase；事件阶段链必须能回到角色行动阶段。终局可以没有 next_phase，但必须有在该阶段适用的结构化结束规则；不得依赖旁白永远循环。
 - opening_min_cycles 仅用于 all_eligible_acted 阶段第一次进入时的最低角色行动周期数（1-3），回到同一阶段后仍按一轮完成；短设定里陌生人初遇就要表决时通常给首轮两次互动机会，避免七个人各说一句就立刻投票。用户明确规定流程时照其规则，不要覆盖。
+- completion_action_types 可选：仅 all_eligible_acted 角色阶段使用。空数组保持“每人一次获准行动”的原语义；需要每人实际登车、签收、提交等才推进时，列入本阶段获准的真实动作类型，其他 speak/pass 不算完成参与。每名 actor_roles 覆盖的人都必须有权限执行至少一种列出的动作；不要把单人搬运阶段要求成所有人都搬一次。实际执行阶段通常 opening_min_cycles=1，讨论与表演仍允许，但不代替真实提交。不将此字段写成条件表达式，不用于 manual、event_only 或 all_active_voted。
 - 使用 legacy_tabletop 的角色投票已经在最后一张合法选票时由引擎结算淘汰。随后如需“公布/结算”场景，应设 event_only=true、scheduler=event_first、advance_when=after_event；不要安排所有角色轮流执行 settle_votes 或“等待结果”，也不要制造与真实淘汰无关的 proposal.passed 占位状态来证明已结算。
 - world_equals 是类型严格的相等比较，不执行 >=、<= 或表达式；存活阵营数量的胜负使用 faction_eliminated/faction_parity，不能依赖无人维护的计数字段。
 - 普通问答或质疑使用 speak + question/challenge，inspect 仅用于场景明确授权的事实查验能力，不得让普通玩家提问就读取秘密阵营。
@@ -149,6 +158,29 @@ V2 提案表决的最小操作示例（仅在用户要求此机制时使用，�
 - 只有用户明确要求必经的节点才标 required=true，系统补全的剧情目标不得自动升级成硬约束；节点完成必须有实际事件支持，灯光变化不能代替规则宣读或角色讨论。
 - 新世界 execution_version=2 时，角色能力必须显式写 effects；行动名称本身不会查验身份、复活或杀人。若配套规则选择 rule 来源，能力效果仅扣 consume_resource 成本；能力次数由引擎扣除。目标只可使用声明的 target_scope，效果值必须符合世界 schema 和角色 resources 类型。旧版示例不是隐式授权。
 """
+
+
+RUNTIME_GENERATION_GUIDANCE += (
+    "\neffects.op 的完整白名单：" + "、".join(sorted(VALID_PATCH_OPERATIONS))
+    + "。修改实体状态用 set_entity，不存在 set_entity_state。"
+    '例如 {"op":"set_entity","target":"已声明的实体ID","key":"已声明的状态键","value":true}；'
+    "值必须匹配目标字段类型。禁止修改动作以代替另一人物登车；"
+    "多人共同抵达一个地点可用 move_agent(target=$actor,value=地点原文) "
+    "配合 all_active_at_location(location=该地点)，但抵达不等于完成额外的登车/检修条件。"
+    "如果同一个动作要更新每人不同的固定实体状态键，可在各人自己的同名能力中"
+    "声明对应固定键的 effects，将公共规则 effect_mode 设为 ability、effects 留空；"
+    "这样只执行行动者本人能力的效果，不需要动态键或把一人的行动登记成全体完成。"
+    '\n人物、物品与地点不要混成同一种对象：CharacterSpec.name 不是 entities 的 ID，'
+    '人物位置由 move_agent 更新，不能用 entity_equals(target=人物姓名,key=location) 检查。'
+    '共同抵达的最小例子：locations=["起点","目的地"]，规则 action_type=arrive、target_scope=self、'
+    'effect_mode=rule、effects=[{"op":"move_agent","target":"$actor","value":"目的地"}]，'
+    '相应阶段 allowed_action_types 包含 arrive，结束规则 {"id":"arrived","kind":"all_active_at_location",'
+    '"location":"目的地","description":"在场参与者均已抵达"}。这里只示范用户确实要求的抵达，'
+    '不是任何场景都需要赶路；未进人物表的背景人物不得被默认为必须行动的参与者。'
+)
+
+
+RUNTIME_GENERATION_GUIDANCE += "\n\n" + prompt_contract("execution_design")
 
 
 CHARACTER_JSON_INSTRUCTION = """在遵守上方所有角色设计规则的同时，只输出一个 JSON 对象，不要使用 Markdown 代码块：
@@ -168,12 +200,12 @@ CHARACTER_JSON_INSTRUCTION = """在遵守上方所有角色设计规则的同时
       "goals": ["目标、顾虑和可接受代价"],
       "core_beliefs": ["只有当用户设定或人物经历确实支持时，填写会持续影响选择的价值信念；否则为空数组"],
       "knowledge": {
-        "确定知道": "...",
-        "不知道": "...",
-        "怀疑": "...",
-        "可能错误相信": "..."
+        "确定知道": "直接写本人掌握的具体事实或原文，不仅写知道某项信息",
+        "不知道": "本人确未掌握的内容；不能把其他人未知误写为全员未知",
+        "怀疑": "本人尚未证实的猜测；没有可省略",
+        "可能错误相信": "本人已有但可能错误的具体主张；没有可省略"
       },
-      "decision_logic": "在本题材关键局面中如何随新事实、压力和关系改变选择；不要给固定万能话术",
+      "decision_logic": "取舍依据：此人更愿承受哪种代价、更难接受哪种代价、怎样的真实信息会改变判断。写依据与偏好，不写先问再查最后接受的流程，不预排开场发言或示例台词；用户明确提供的行为规则原样保留",
       "voice_profile": {
         "register": "自然口语、正式、古典、粗粝、克制等；优先使用用户明确设定",
         "sentence_length": "短句为主|中等|长短交替",
@@ -182,7 +214,7 @@ CHARACTER_JSON_INSTRUCTION = """在遵守上方所有角色设计规则的同时
         "politeness": 0.5,
         "humor_style": "没有时为空字符串",
         "rhetorical_habits": ["用户明确指定或确有必要时才填写；不能是每轮都要说的标志性比喻或句子"],
-        "avoidances": ["该角色不会使用的措辞或表达方式"],
+        "avoidances": ["仅填写用户明确规定的禁语或明确的时代/文化禁忌；未规定时为空数组，害羞或克制不是禁令"],
         "vocabulary_hints": ["用户明确要求或时代语境确有需要时才填写；普通人物可为空数组"]
       },
       "relationships": {"其他角色姓名": "该角色的主观认知，不得包含无权知道的秘密"},
@@ -201,12 +233,53 @@ CHARACTER_JSON_INSTRUCTION = """在遵守上方所有角色设计规则的同时
 
 角色数量必须与约束账本的 requested_character_count 完全一致；各阵营人数也必须逐一满足 locked 约束，不能只对上总人数。例如七人中两名 AI，faction=AI 必须恰好出现两次，其余五人不是 AI，private_identity 与彼此已知秘密也要同步。公开字段不能泄露 private_identity、faction、私有知识、隐藏阵营或秘密任务。能力必须结构化且引用真实阶段；普通交谈能力可以为空。夜袭、查验、守护等秘密技能默认 director_only；只有在场角色可直接观察的技能才标 public。execution_version=2 中行动名称不隐含效果，能力必须显式声明 effects，并与规则的 effect_mode 配合；只有规则明确采用 behavior_template=legacy_tabletop 时才使用相应内置效果。
 
+上述 JSON 展示可用字段，不是每个人都必须填满的空表。没有能力、资源、既有关系、错误认知或特殊语言习惯时，省略对应可选字段；不要用空字典、重复“无”或同一段世界规则铺满七份档案。用户已经给出的细节完整保留；用户未指定的人物描述写具体但紧凑的性格、牵挂与选择方式，每个事实只放在适当字段，不再复制到其他字段。不要在 observation_value 中写长篇评价。这是减少重复输出，不是把人物压缩为职业加三个形容词。
+
 personality 与 decision_logic 是影响行动的两个独立字段：前者写此人面对风险、冲突和未知时的稳定倾向及来源，后者写这些倾向与目标在本场景里如何改变具体选择。不能只重复职业、阵营或 voice_profile；同一事项交给不同人物，可以有不同的接受条件、拒绝边界、冒险程度或信息披露策略，也允许偶尔犯与惯常形象不一致但有情境原因的错。
+人物不是为解决主线定制的七种讨论策略。先依据用户设定，写出此人在当前生活/关系/危急处境中实际放不下的一点东西，以及它怎样使他说不出口、逞强、先行动、愿意靠近或疏远某个人；普通直率、稳定而不善分析的人同样合理，不强求人人都有心理矛盾。再落实身份带来的任务。不要让整组 personality 只区别“谨慎分析/尖锐追问/温和协调”，goals 只区别“取得信息/避免怀疑”，decision_logic 都是“先问依据再改判断”。相同外部目标下，人物可以因不同代价采取不同选择；其私心不必被公开台词完整解释。明确详细输入已有的人物设定保持原样，这些补全只用于用户未规定的部分。
 短输入的补全也应保留信息不对称与动机不对称：不要把所有人物写成“表面指责、暗中也心虚”的镜像，或者给每人安排一件恰好对称的隐情。private_identity 可以是“无额外秘密”。decision_logic 写可随事实变化的判断边界，不要预定“被揭穿后最终承认/妥协”的剧情。未被世界或人物档案确立的具体旧事、设备状况或责任归属，应留待后续可见事件核验。
 如果用户设定是陌生人初遇，不得补共同回忆、此前结盟或相互熟悉的判断。高压场景也不要把每个人的 personality、goals、decision_logic 都写成单一胜负任务的分支算法：各人可能先关心规则可信度、身体安全、如何与陌生人共处、家人或自身处境；只挑与此人当下有关的部分，不用随机家常话装点。少数有具体理由的人可以从第一轮就质疑、施压或挑衅，但不让全员开场就像完成过多轮分析。性格写可以改变的倾向，不写“第三轮必质问/后期必一击命中”的预定剧本。
 voice_profile 只是倾向，不是台词模板或必须兑现的差异配额。用户明确写过语气、时代用语、措辞禁忌或表达习惯时必须原样落实；用户未写时以自然口语为基线，不为每个人硬造风格。职业术语、文化标记、隐喻与幽默只有在此人此刻真的会用时才出现；rhetorical_habits、humor_style、vocabulary_hints 没有可靠依据时留空。差异首先来自具体处境与选择，而不是词汇表。
 
 core_beliefs 是可选的人物驱动力，不是必填装饰。只有用户明确给出，或人物经历足以支持一种会跨情境影响选择的价值信念时才填写；普通人物允许为空。relationship_facets 只能引用世界已经声明的 relationship_dimensions，数值 0–1 表示从 low_label 到 high_label 的位置；战斗人物也不能被强制套用亲密或猜疑维度。"""
+
+
+CHARACTER_RUNTIME_GUIDANCE = """仅对接既有运行机制，不修改世界：
+role 必须匹配已有 phase_specs.actor_roles 与 rules.allowed_roles；阵营人数和私有身份须满足用户约束，不能额外生成 host。
+faction 与结束规则引用的阵营名称原样一致，不用另一种大小写、同义词或翻译另造标签；没有阵营时为空。
+role 是引擎匹配的执行标签，不一定是职业。若世界已经用人物姓名作为 allowed_roles，人物 role 也必须原样使用该标签；其职业、亲属或战友身份仍保留在 public_identity/public_background，不能为了让身份好看而改掉执行标签。不要把 required 的阶段或专用动作分配给无人持有的角色标签。
+initial_location、ability.phases、target_scope、known_fact_ids 均使用已有名称或 ID。resources 声明实际初始数量，不虚构已消耗或未来所得。
+execution_version=2 的 ability.effects 只使用已有支持的操作，op/key/target/value/amount 在同一层，不嵌套 params；占位符仅 $actor、$target、$value。次数由引擎扣除，不重复 consume_ability。
+effects 仅支持 set_world、increment_world、set_entity、move_agent、set_agent_status、set_resource、consume_resource、set_goal_status、set_relationship、record_vote、clear_votes、set_phase、add_known_fact、protect_agent、clear_protections、settle_votes；值与世界 schema 类型一致。
+规则的 effect_mode=rule/ability/stack 以世界为准，行动名不隐含效果。普通交谈无需添加查验身份等能力；只有既有规则明确用 legacy_tabletop 时才依相应模板。
+公共档案不泄露阵营、私有知识或秘密技能；关系只引用真实人物姓名，关系维度只引用本世界已声明的维度。"""
+
+
+def _character_runtime_contract(world):
+    """Prominent binding inventory, not an inferred cast or changed authority."""
+    return json.dumps({
+        "phase_role_bindings": [{"phase": phase.name, "actor_roles": phase.actor_roles,
+                                  "event_only": phase.event_only,
+                                  "completion_action_types": phase.completion_action_types} for phase in world.phase_specs],
+        "rule_role_bindings": [{"rule_id": rule.id, "action_type": rule.action_type,
+                                 "allowed_roles": rule.allowed_roles,
+                                 "effect_mode": rule.effect_mode,
+                                 "target_scope": rule.target_scope,
+                                 "requires": rule.requires,
+                                 "phases": rule.phases,
+                                 "description": rule.description} for rule in world.rules],
+        "completion_bindings": {
+            "entity_initial_states": {key: entity.get("state", {}) for key, entity in world.entities.items()
+                                      if isinstance(entity, dict)},
+            "termination_rules": [asdict(rule) for rule in world.termination_rules],
+        },
+        "instruction": ("非空标签逐字匹配 CharacterSpec.role；空数组才表示不限角色。"
+                        "规则已采用 effect_mode=rule 时，不复制其完成效果到普通 act/speak 能力；"
+                        "那会允许拥抱、聊天等普通行为绕过真正的提交动作。"
+                        "effect_mode=ability 的规则必须给有权行动的人提供同类型的明确能力；"
+                        "多人独立签署/确认时，本人能力只登记自己的固定状态键，不能代替别人的选择；"
+                        "各结束条件使用实际已声明的键与类型，不添加动态键或修改世界。"),
+    }, ensure_ascii=False, separators=(",", ":"))
 
 
 def _content(response: Any) -> str:
@@ -588,14 +661,17 @@ def _invoke_json(
     max_tokens: int = 12000,
     allow_json_repair: bool = True,
     validate_payload=None,
+    *,
+    repair_shape: str = "object",
 ) -> dict[str, Any]:
     if CURRENT_BUILD.get() is None:
         control = BuildControl()
         control.begin_step("scenario_generation")
         with control.activate():
-            return _invoke_json(system_prompt, user_prompt, temperature, max_tokens, allow_json_repair, validate_payload)
+            return _invoke_json(system_prompt, user_prompt, temperature, max_tokens, allow_json_repair,
+                                validate_payload, repair_shape=repair_shape)
     control = CURRENT_BUILD.get()
-    key = fingerprint([system_prompt, user_prompt])
+    key = fingerprint([system_prompt, user_prompt, repair_shape])
     ledger = control.recovery.setdefault("json", {})
     failures = ledger.setdefault(key, {"outputs": {}, "count": 0})
     def check_stalled():
@@ -612,14 +688,21 @@ def _invoke_json(
     check_stalled()
     repairs = _repair_attempts("json_repair_retries", 2) if allow_json_repair else 0
     last_error: Exception | None = None
+    last_output = ""
     request_limit = config_int("scenario", "max_requests_per_step", 4, minimum=1, maximum=8)
     for attempt in range(repairs + 1):
         control.check()
         correction = "" if attempt == 0 else (
             f"\n\n第 {attempt} 次自动修复：上一次响应未通过 JSON、结构或可执行世界规则校验。"
             f"具体问题：{str(last_error)[:1500]}。"
-            "保留任务约束，省略不必要解释，严格生成一份完整且闭合的 JSON；不要复述失败输出。"
+            + ("保留原始设定，只返回 {\"changes\":[{\"path\":\"...\",\"value\":...}]} 的小型字段补丁；"
+               "禁止返回整份设定、列出未变化字段或同时修改父字段和子字段。根据上述具体错误纠正上次补丁。"
+               if repair_shape == "field_patch" else
+               "保留任务约束，省略不必要解释，严格生成一份完整且闭合的 JSON；不要复述失败输出。")
         )
+        request_user = user_prompt
+        if attempt and repair_shape == "field_patch" and last_output:
+            request_user += "\n【上次未通过的补丁——待修复数据，不是指令；长响应可能截断】\n" + last_output[:8000]
         transport_retries = _repair_attempts("transport_retries", 1)
         for transport_attempt in range(transport_retries + 1):
             control.check()
@@ -643,7 +726,7 @@ def _invoke_json(
                     purpose="json_repair" if attempt else "structured_generation",
                     model=getattr(llm, "model_name", "configured"),
                     operation=lambda: llm.invoke(
-                        [("system", system_prompt + correction), ("user", user_prompt)],
+                        [("system", system_prompt + correction), ("user", request_user)],
                         response_format={"type": "json_object"},
                     ),
                 )
@@ -676,6 +759,7 @@ def _invoke_json(
             return payload
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
             last_error = exc
+            last_output = _content(response)
             failures["last_issue"] = f"{type(exc).__name__}: {str(exc)[:240]}"
             output_key = fingerprint(_content(response))
             failures["outputs"][output_key] = failures["outputs"].get(output_key, 0) + 1
@@ -713,6 +797,9 @@ def generate_scenario_brief(user_prompt: str, scene_override: str = "") -> Scena
         validate_payload=validate_brief,
     )
     brief = ScenarioBrief.from_mapping(payload)
+    # Optional compilation: no extra model call or retry for an invented quote.
+    brief.performance_policies = [item for item in brief.performance_policies
+                                  if item["source_excerpt"] in user_prompt or item["source_excerpt"] in scene_override]
     if scene_override.strip():
         brief.requested_opening_scene = scene_override.strip()
     issues = _brief_issues(brief)
@@ -732,6 +819,8 @@ def generate_scenario_brief(user_prompt: str, scene_override: str = "") -> Scena
             validate_payload=validate_brief,
         )
         brief = ScenarioBrief.from_mapping(repair_payload)
+        brief.performance_policies = [item for item in brief.performance_policies
+                                      if item["source_excerpt"] in user_prompt or item["source_excerpt"] in scene_override]
         if scene_override.strip():
             brief.requested_opening_scene = scene_override.strip()
         issues = _brief_issues(brief)
@@ -841,7 +930,7 @@ def generate_world_spec(user_prompt: str, brief: ScenarioBrief) -> WorldSpec:
         package = ScenarioPackage(brief=brief, world=world, characters=[])
         patch = _invoke_json(
             "你是 SceneChat 世界规则局部修复器。只输出 JSON 字段补丁："
-            '{"changes":[{"path":"/world/phase_specs/0/advance_when","value":"all_eligible_acted"}]}。'
+            '{"changes":[{"path":"具体待修字段的 JSON Pointer","value":"按该字段实际类型填写的修正值"}]}。'
             "path 必须以 /world/ 开头，最多 40 项，禁止修改 execution_version，禁止重写整个 world。"
             "仅修复列出的错误及其直接依赖；不得删除用户明确设定，不能虚构主持角色、脚本或新机制。"
             "manual 且有 next_phase 时必须有本阶段真实可执行的 set_phase 出口；"
@@ -849,19 +938,24 @@ def generate_world_spec(user_prompt: str, brief: ScenarioBrief) -> WorldSpec:
             "先判断它是否与已有可执行规则重复；重复时可替换 /world/rules 数组删除冗余规则，"
             "否则把它修到真正允许该 action_type 的角色行动阶段，并检查效果触发时机；"
             "不得只改阶段名称却让投票结算在第一张票时发生。"
+            "如果校验指出非 event_only 阶段未允许规则动作，直接检查提示给出的 allowed_action_types 路径；"
+            "同步规则 action_type 与阶段许可，或移除已被自动推进替代的纯切换冗余规则。只复写规则而不改缺失许可不会修复问题。"
             "有限讨论阶段可用 all_eligible_acted，强制投票阶段可只允许 vote，"
-            "不要添加不计票的 pass 冒充结算。",
+            "不要添加不计票的 pass 冒充结算。\n\n" + RUNTIME_GENERATION_GUIDANCE,
             "【用户原始输入】\n" + user_prompt
             + "\n【不可修改的约束账本】\n"
             + json.dumps(brief.to_dict(), ensure_ascii=False, separators=(",", ":"))
             + "\n【校验错误】\n" + json.dumps(issues, ensure_ascii=False)
+            + "\n【此前局部修复结果；未减少错误的路径方案不要重复】\n"
+            + json.dumps(ledger["history"][-2:], ensure_ascii=False, separators=(",", ":"))
             + "\n【当前世界候选；请在它上面局部修改】\n"
             + json.dumps(asdict(world), ensure_ascii=False, separators=(",", ":")),
             temperature=0.0,
             max_tokens=config_int("scenario", "repair_max_tokens", 4096, minimum=512, maximum=10000),
-            validate_payload=lambda candidate: apply_scenario_patch(package, candidate),
+            validate_payload=lambda candidate: apply_scenario_patch(package, candidate, allow_noop=True),
+            repair_shape="field_patch",
         )
-        candidate = apply_scenario_patch(package, patch).world
+        candidate = apply_scenario_patch(package, patch, allow_noop=True).world
         candidate, _ = _repair_vote_contract(candidate, user_prompt)
         candidate, _ = _repair_world_phase_beats(candidate)
         candidate, _ = _prune_unreachable_noop_rules(candidate)
@@ -878,6 +972,8 @@ def generate_world_spec(user_prompt: str, brief: ScenarioBrief) -> WorldSpec:
         ledger["history"].append({
             "before_count": len(issues), "after_count": len(candidate_issues),
             "accepted": improved,
+            "patched_paths": [change["path"] for change in patch["changes"]],
+            "remaining_issues": candidate_issues[:10],
             "new_components": sorted({_issue_anchor(item) for item in candidate_issues}
                                      - {_issue_anchor(item) for item in issues})[:20],
         })
@@ -893,6 +989,7 @@ def generate_world_spec(user_prompt: str, brief: ScenarioBrief) -> WorldSpec:
     if issues:
         check_stalled()
         raise ScenarioValidationError(issues)
+    world.performance_policies = [item["code"] for item in brief.performance_policies]
     return world
 
 
@@ -910,11 +1007,13 @@ def generate_character_specs(
                 raise ScenarioValidationError([f"/characters/{index - 1} 必须是角色对象"])
             CharacterSpec.from_mapping(item, index)
     payload = _invoke_json(
-        f"{CHARACTER_DESIGN_PROMPT}\n\n{prompt_contract('scenario')}\n\n{CHARACTER_JSON_INSTRUCTION}\n\n{RUNTIME_GENERATION_GUIDANCE}",
+        f"{prompt_contract('characters')}\n\n{CHARACTER_JSON_INSTRUCTION}\n\n{CHARACTER_RUNTIME_GUIDANCE}",
         "【用户原始输入——所有明确细节均为最高级约束】\n"
         f"{user_prompt}\n\n"
         "【结构化约束账本】\n"
         f"{json.dumps(brief.to_dict(), ensure_ascii=False, indent=2)}\n\n"
+        "【必须对接的执行标签与效果来源——先绑定，再写人物身份】\n"
+        f"{_character_runtime_contract(world)}\n\n"
         "【结构化世界设定——导演信息只用于分配正确的私有档案】\n"
         f"{json.dumps(asdict(world), ensure_ascii=False, indent=2)}",
         temperature=0.75,
@@ -931,6 +1030,25 @@ def generate_character_specs(
     ]
 
 
+def _repair_array_inventory(value, path=""):
+    """Exact existing array addresses; identifiers are not positional indices."""
+    lines = []
+    if isinstance(value, list):
+        lines.append(f"{path}：length={len(value)}；合法下标=" + (",".join(map(str, range(len(value)))) or "无"))
+        for index, item in enumerate(value):
+            if isinstance(item, dict):
+                label = item.get("id") or item.get("name") or item.get("op") or item.get("kind")
+                if label:
+                    lines.append(f"  {path}/{index} -> {label}")
+            lines.extend(_repair_array_inventory(item, f"{path}/{index}"))
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            escaped = str(key).replace("~", "~0").replace("/", "~1")
+            if isinstance(item, (dict, list)):
+                lines.extend(_repair_array_inventory(item, f"{path}/{escaped}"))
+    return lines
+
+
 def repair_scenario_package(
     user_prompt: str,
     package: ScenarioPackage,
@@ -941,6 +1059,7 @@ def repair_scenario_package(
   "changes": [{"path":"/world/phase_specs/0/actor_roles", "value":[]}]
 }
 path 使用 JSON Pointer，数字为从 0 开始的数组索引。仅可修改 /world/<字段> 或 /characters/<索引>/<字段> 下的值。禁止修改 brief、角色数量及角色 id，禁止替换整个 world 或整个人物。只输出发生变化的字段，保持其他字段原样；新增字典键的父路径必须已存在。修改姓名必须同时修复所有关联引用。最多 80 个不重叠的修改；不要添加解释或未变化字段。
+数组下标只能指向“待修复结果”中实际已有的元素，不是规则 id 的数字，也不允许凭空添加 /rules/3。若确需新增规则，替换 /world/rules 整个数组，原样保留无关规则，并放入新增规则；本次不能再同时补丁该数组的子路径。若报错只是一个结束状态没有来源，优先补已有相关动作的 effects，不要顺手删除观察动作或重做整套流程。
 优先最小修复：例如 actor_roles 引用了不存在的角色，只修复 actor_roles；不要同时新增胜负规则、角色能力、剧情或世界状态。以下通用约束只限制确实需要修改的字段，不要求补全原设定中所有可选字段。未被报错涉及且无关联依赖的字段必须保持不变。
 节点若标为 completion_mode=state，completion_conditions 不能是空数组，也不能填 all_eligible_acted/all_active_voted/phase_advanced 等阶段推进条件。若报错只涉及这种节点，且没有可声明的世界/实体/角色状态结果，应同时将该节点的 completion_mode 改成 narrative、清空无效条件，并把 resolution_signals 改为可由已提交角色行动核验的证据；不能只删掉条件而保留 state。纯粹的开场、投票、结算等自动流程不是用户明确要求的故事里程碑时，也可以移除对应 beat_specs，并同步修正 target_beats 与 prerequisites；不要把不存在的主持人行动写成证据。
 所有 covered_constraint_ids 必须真实对应其落实位置。公共世界仍不得包含导演秘密。
@@ -948,8 +1067,26 @@ path 使用 JSON Pointer，数字为从 0 开始的数组索引。仅可修改 /
 严格保留 world.execution_version。版本1才有 move/vote/inspect/protect/eliminate/poison/heal 的隐式内置效果。版本2行动名称没有隐式结果，必须填写白名单 effects；effect_mode=rule/ability/stack 控制来源，不得为了修复把正常 effects 清空。legacy_tabletop 仅可显式用于用户确实要求的传统桌游机制，不能套到会议、医疗、战斗等场景。consume_ability 由引擎处理，不得重复填写。禁止脚本、条件表达式和未支持操作，不要退回自然语言规则冒充可执行字段。"""
     control = CURRENT_BUILD.get()
     history = (control.recovery.get("semantic", {}).get("history", [])[-3:] if control else [])
+    repair_context = package.to_dict()
+    mechanical_only = bool(issues) and all(re.match(
+        r"^(?:规则/能力|规则|能力|结束规则|节点|手动阶段|投票阶段|角色阶段|环境事件阶段|阶段)",
+        issue) for issue in issues)
+    if mechanical_only:
+        # Personality prose is not an execution dependency. Keep the exact
+        # runtime interfaces, cast/role bindings, resources and goals; do not
+        # invite a second authoring pass over complete character dossiers.
+        keys = {"id", "name", "role", "faction", "initial_location", "resources",
+                "abilities", "goals", "known_fact_ids"}
+        repair_context["characters"] = [
+            {key: value for key, value in character.items() if key in keys}
+            for character in repair_context["characters"]
+        ]
     payload = _invoke_json(
-        repair_prompt + "\n\n" + RUNTIME_GENERATION_GUIDANCE,
+        repair_prompt + "\n\n" + RUNTIME_GENERATION_GUIDANCE + (
+            "\n本次仅修执行接口。人物只展示已有运行字段，其他档案仍在原设定中完整保留；"
+            "不得补写或修改未展示的人物字段。优先连接已有行动效果与对应结束条件，"
+            "能改一处引用就不要另造角色专属状态、重做节点或写满全部默认字段。"
+            if mechanical_only else ""),
         "【用户原始输入】\n"
         f"{user_prompt}\n\n"
         "【不可修改的约束账本】\n"
@@ -958,13 +1095,21 @@ path 使用 JSON Pointer，数字为从 0 开始的数组索引。仅可修改 /
         f"{json.dumps(issues, ensure_ascii=False)}\n\n"
         "【先前修复结果（不要重复无进展方案）】\n"
         f"{json.dumps(history, ensure_ascii=False)}\n\n"
+        "【实际已有数组地址——ID 不是下标，不得使用范围外的子路径】\n"
+        + "\n".join(_repair_array_inventory({
+            "world": {key: repair_context["world"][key] for key in
+                      ("rules", "phase_specs", "termination_rules", "beat_specs")},
+            "characters": [{"id": item["id"], "abilities": item.get("abilities", [])}
+                           for item in repair_context["characters"]],
+        })) + "\n\n"
         "【待修复结果】\n"
-        f"{json.dumps(package.to_dict(), ensure_ascii=False, separators=(',', ':'))}",
+        f"{json.dumps(repair_context, ensure_ascii=False, separators=(',', ':'))}",
         temperature=0.2,
         max_tokens=config_int("scenario", "repair_max_tokens", 4096, minimum=512, maximum=10000),
-        validate_payload=lambda candidate: apply_scenario_patch(package, candidate),
+        validate_payload=lambda candidate: apply_scenario_patch(package, candidate, allow_noop=True),
+        repair_shape="field_patch",
     )
-    result = apply_scenario_patch(package, payload)
+    result = apply_scenario_patch(package, payload, allow_noop=True)
     control = CURRENT_BUILD.get()
     if control:
         control.progress(patched_paths=[item["path"] for item in payload["changes"]])
