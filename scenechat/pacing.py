@@ -199,11 +199,9 @@ def update_arc_after_message(state: SimulationState, message: Message, *, previo
             })
             previous.add(beat_id)
 
-    meaningful = bool(message.authoritative and message.kind != "narration" and (
-        message.intent.get("meaningful_state_change", False)
-        or (not message.intent.get("generation_fallback")
-            and message.intent.get("obligation_resolution") in {"satisfied", "withdrawn"})
-    ))
+    # An answer closes a conversational duty, not the story's causal obstacle.
+    meaningful = bool(message.authoritative and not message.intent.get("generation_fallback")
+                      and message.intent.get("causal_progress_operations"))
     if message.kind == "intervention" or any(item.applied_at_turn == message.turn for item in state.interventions):
         state.arc_state.plan_adjusted_at_turn = message.turn
     if resolved_now or meaningful:

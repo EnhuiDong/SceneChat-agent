@@ -162,12 +162,18 @@ def validate_world_structure(world):
                         and not (isinstance(effect.value, str) and effect.value in EFFECT_PLACEHOLDERS)
                         and type(effect.value) is not type(state[effect.key])):
                     issues.append(f"规则/能力 {rule.id} 的实体状态值类型不匹配")
-    for beat in world.beat_specs:
+    for beat_index, beat in enumerate(world.beat_specs):
         if beat.completion_mode == "state" and not beat.completion_conditions:
             issues.append(f"节点 {beat.id} 必须声明 completion_conditions")
-        for condition in beat.completion_conditions:
+        for condition_index, condition in enumerate(beat.completion_conditions):
             if not isinstance(condition, dict) or condition.get("kind") not in BEAT_STATE_CONDITIONS:
-                issues.append(f"节点 {beat.id} 使用不支持的完成条件；若无可声明的状态结果，请使用 narrative 与已提交事件证据")
+                actual = condition.get('kind') if isinstance(condition, dict) else type(condition).__name__
+                issues.append(f"节点 {beat.id} 使用不支持的完成条件 {actual}，"
+                              f"位置 /world/beat_specs/{beat_index}/completion_conditions/{condition_index}；"
+                              "节点仅支持 world_equals/entity_equals/agent_location/goal_equals。"
+                              "全员到达请分别声明每位人物的 agent_location 条件；"
+                              "若改用 narrative，须同时清空该节点 completion_conditions 为 []，只改 completion_mode 不消除错误。"
+                              "仅修复该节点，不删除行动 requires 或改变资源/完成标准")
     # Diagnose an ordinary conversation action hidden by an unconditional
     # special effect. Never rewrite priority (it is also an authorization
     # boundary), and do not infer executable conditions from descriptions.
@@ -201,7 +207,8 @@ def validate_world_structure(world):
 
 def visible_entities(state, actor):
     viewer = ViewerContext(name=actor.name, role=actor.role, location=actor.current_location)
-    return {key: {"kind": spec.get("kind"), "state": state.entity_states.get(key, {})}
+    from .entity_tracking import presented_entity
+    return {key: presented_entity(state, key, spec)
             for key, spec in getattr(state.world_spec, "entities", {}).items()
             if can_access(spec.get("visibility"), viewer)}
 
@@ -315,6 +322,29 @@ def action_context(state, actor):
     return "\n".join(lines) or "- 无额外场景行动"
 
 
+def _rule_fully_shadowed(package, rule):
+    """Prove exact-scope V2 shadowing, without guessing target availability.
+
+    A failed prerequisite on the winning rule does not enable a lower rule.
+    Different scopes and incomplete casts remain conservative. V1 permits an
+    explicit rule ID and must retain its older selection semantics.
+    """
+    world = package.world
+    if world.execution_version != 2:
+        return False
+    routes = [(actor, phase) for actor in package.characters for phase in world.phase_specs
+              if not phase.event_only and matches_role(actor.role, phase.actor_roles)
+              and matches_role(actor.role, rule.allowed_roles)
+              and (not rule.phases or phase.name in rule.phases)
+              and (not phase.allowed_action_types or rule.action_type in phase.allowed_action_types)]
+    return bool(routes) and all(any(
+        other.action_type == rule.action_type and other.target_scope == rule.target_scope
+        and other.priority > rule.priority
+        and (not other.phases or phase.name in other.phases)
+        and matches_role(actor.role, other.allowed_roles)
+        for other in world.rules) for actor, phase in routes)
+
+
 def _potential_execution_effects(package):
     """Exclude inert sources, without claiming to prove all semantic reachability.
 
@@ -324,6 +354,7 @@ def _potential_execution_effects(package):
     """
     world = package.world
     effects = [effect for rule in world.rules if rule.effect_mode in {"rule", "stack"}
+               and not _rule_fully_shadowed(package, rule)
                for effect in rule.effects]
     for character in package.characters:
         for ability in character.abilities:
@@ -449,6 +480,13 @@ def validate_mechanics(package):
         return rule.kind == "faction_eliminated" or any(needs_elimination(child) for child in rule.conditions)
 
     effects = _potential_execution_effects(package)
+    for index, rule in enumerate(world.rules):
+        if rule.effects and rule.effect_mode in {"rule", "stack"} and _rule_fully_shadowed(package, rule):
+            issues.append(f"/world/rules/{index} 规则 {rule.id} 的效果被更高 priority 同目标范围规则完全遮蔽；"
+                          "requires 失败不会回退到此规则，指定较低 rule_id 也不能绕过。"
+                          "若表达不同人物的独立选择，请使用不重叠的执行角色标签、不同 action_type，"
+                          "或同一 ability 规则下各自仅更新本人状态的能力；不能只调整优先级冒充修复。"
+                          "若高优先级是权限/禁止守卫，须保留约束；移除不可达的旧来源或建立真正获准的路径，不改角色范围绕过守卫")
     if any(needs_elimination(rule) for rule in world.termination_rules):
         can_eliminate = any(
             effect.op == "set_agent_status" and effect.key in {"alive", "active"}
@@ -554,15 +592,19 @@ def validate_mechanics(package):
             phases_overlap = not left.phases or not right.phases or bool(set(left.phases) & set(right.phases))
             roles_overlap = any(matches_role(c.role, left.allowed_roles) and matches_role(c.role, right.allowed_roles) for c in package.characters)
             if left.action_type == right.action_type and left.priority == right.priority and phases_overlap and roles_overlap:
-                issues.append(f"规则 {left.id}/{right.id} 匹配冲突，请设置不同 priority，禁止依赖列表顺序")
-    for beat in world.beat_specs:
+                issues.append(f"规则 {left.id}/{right.id} 匹配冲突，禁止依赖列表顺序；"
+                              "独立选择应使用不同 action_type 或不重叠的角色标签，"
+                              "真正同一动作的覆盖规则才设置不同 priority；调整 priority 后须确认低优先级效果仍有可达路径")
+    for beat_index, beat in enumerate(world.beat_specs):
         if beat.completion_mode not in {"state", "narrative"}:
             issues.append(f"节点 {beat.id} completion_mode 仅支持 state/narrative")
         if beat.completion_mode == "state" and not beat.completion_conditions:
             issues.append(f"节点 {beat.id} 必须声明 completion_conditions")
         for condition in beat.completion_conditions:
             if not isinstance(condition, dict) or condition.get("kind") not in {"world_equals", "entity_equals", "agent_location", "goal_equals"}:
-                issues.append(f"节点 {beat.id} 使用不支持的完成条件")
+                issues.append(f"节点 {beat.id} 使用不支持的完成条件；"
+                              f"请修复 /world/beat_specs/{beat_index}/completion_conditions；"
+                              "若改用 narrative，须同时清空 completion_conditions 为 []")
                 continue
             kind = condition["kind"]
             target = condition.get("target")

@@ -567,6 +567,19 @@ def state_from_dict(
         for item in data.get("history") or []
         if isinstance(item, dict)
     ]
+    # Legacy checkpoints have no at-event observer receipt. Recover only
+    # recorded direct perceptions, never grant past knowledge by today's place.
+    witnessed = {}
+    for agent in state.agents.values():
+        direct_ids = {item.event_id for item in agent.memories if item.source == 'direct_observation'}
+        direct_ids.update(item.get('event_id') for item in agent.memory_archive
+                          if isinstance(item, dict) and item.get('source') == 'direct_observation')
+        witnessed[agent.name] = direct_ids
+    for message in state.history:
+        if message.observed_by is None:
+            message.observed_by = [agent.name for agent in state.agents.values()
+                                   if message.event_id in witnessed[agent.name]
+                                   or message.as_observation_for(agent.name) in agent.observations]
     state.turn_count = int(data.get("turn_count", len(state.history)))
     state.agent_turn_count = int(data.get("agent_turn_count", 0))
     state.narration_count = int(data.get("narration_count", 0))

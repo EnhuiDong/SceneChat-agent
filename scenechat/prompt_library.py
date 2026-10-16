@@ -3,9 +3,9 @@ from functools import lru_cache
 from pathlib import Path
 
 
-@lru_cache(maxsize=8)
+@lru_cache(maxsize=16)
 def prompt_contract(name):
-    if name not in {"actor", "dialogue", "performance", "characters", "narrator", "scenario", "scene_actor", "execution_design"}:
+    if name not in {"actor", "dialogue", "performance", "characters", "narrator", "scenario", "scene_actor", "execution_design", "life_actor", "life_exchange"}:
         raise ValueError("Unknown prompt contract")
     return (Path(__file__).parent / "prompts" / f"{name}.md").read_text(encoding="utf-8")
 
@@ -182,9 +182,11 @@ def narrator_facts(state):
     # These operations are public only when the source event is public. Never
     # expose arbitrary world/resource fields or private knowledge patches.
     public_ops = {"record_vote", "clear_votes", "set_phase", "move_agent", "set_agent_status"}
-    public_entities = {key: state.entity_states.get(key, {})
+    from .entity_tracking import presented_entity
+    public_entity_views = {key: presented_entity(state, key, spec)
                        for key, spec in getattr(state.world_spec, 'entities', {}).items()
                        if isinstance(spec, dict) and can_access(spec.get('visibility'), public)}
+    public_entities = {key: view['state'] for key, view in public_entity_views.items()}
 
     def effect_visible(op):
         if op.get('op') in public_ops:
@@ -225,6 +227,9 @@ def narrator_facts(state):
     return json.dumps({
         "phase": state.current_phase,
         "public_entity_states_now": public_entities,
+        "untracked_entity_opening_states": {key: view['untracked_opening_state']
+                    for key, view in public_entity_views.items() if view.get('untracked_opening_state')},
+        "entity_tracking_instruction": "未接入执行追踪的物品键仅为开场记录，不能推翻后续普通动作；不从文字自动判定规则完成。",
         "state_instruction": "这些是当前已提交状态；开场位置、准备动作和台词主张不能把它们重置。",
         "public_vote_readback": vote_readback,
         "cast": [a.name for a in state.agents.values()],

@@ -50,6 +50,7 @@
     "narrator_mode": "periodic",
     "intent_field_order": "speech_first",
     "action_grounding": "off",
+    "scene_progression": "opportunities",
     "performance_max_tokens": 500,
     "input_budget_bytes": 96000,
     "context_section_bytes": 6000,

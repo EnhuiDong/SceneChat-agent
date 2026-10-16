@@ -103,13 +103,15 @@ def _private_profile_lines(agent: AgentState) -> list[str]:
 
 
 def _known_parts(agent: AgentState) -> list[str]:
+    from .epistemic_projection import project_nonknowledge
     profile_lines = [
-        line for line in agent.profile.splitlines()
+        line for line in project_nonknowledge(agent.profile).splitlines()
         if "不知道" not in line and "未知" not in line
     ]
     return [
         part for part in (
-            [*profile_lines, *agent.observations, *agent.private_memory]
+            [*profile_lines, *agent.observations,
+             *(project_nonknowledge(item) for item in agent.private_memory)]
         + list(agent.known_facts.values())
         + [item.content for item in agent.belief_records if item.active]
         ) if str(part).strip()

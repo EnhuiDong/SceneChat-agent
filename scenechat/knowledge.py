@@ -27,10 +27,12 @@ def build_knowledge_documents(
 ):
     """Build documents with metadata that enforces experiment and role boundaries."""
     from llama_index.core.schema import Document
+    from .world_context import split_world_context
+    public_world, withheld_world = split_world_context(worldview, characters, facts)
 
     documents = [
         Document(
-            text=worldview,
+            text=public_world,
             metadata={
                 "experiment_id": experiment_id,
                 "doc_type": "world",
@@ -39,6 +41,11 @@ def build_knowledge_documents(
             },
         )
     ]
+    if withheld_world:
+        documents.append(Document(text=withheld_world, metadata={
+            "experiment_id": experiment_id, "doc_type": "world_author_notes",
+            "visibility": "director_only", "access_key": "director",
+        }))
     if director_notes.strip():
         documents.append(
             Document(
@@ -73,9 +80,16 @@ def build_knowledge_documents(
     for profile in split_character_profiles(characters):
         name = _character_name(profile)
         if name:
+            from .epistemic_projection import project_nonknowledge
+            actor_profile = project_nonknowledge(profile)
+            if actor_profile != profile:
+                documents.append(Document(text=profile, metadata={
+                    "experiment_id": experiment_id, "doc_type": "character_author_notes",
+                    "character_name": name, "visibility": "director_only", "access_key": "director",
+                }))
             documents.append(
                 Document(
-                    text=profile,
+                    text=actor_profile,
                     metadata={
                         "experiment_id": experiment_id,
                         "doc_type": "character",

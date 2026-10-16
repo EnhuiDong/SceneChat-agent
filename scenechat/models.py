@@ -175,6 +175,7 @@ class Message:
     intent: Dict[str, Any] = field(default_factory=dict)
     public_changes: List[Dict[str, Any]] = field(default_factory=list)
     director_changes: List[Dict[str, Any]] = field(default_factory=list)
+    observed_by: List[str] | None = None
 
     def as_observation(self) -> str:
         if self.intent.get("generation_fallback"):
@@ -867,9 +868,14 @@ class SimulationState:
         from .change_log import snapshot, differences
         before_changes = snapshot(self)
         phase_before = self.current_phase
+        if msg.observed_by is None:
+            msg.observed_by = [agent.name for agent in self.agents.values()
+                               if self._agent_can_observe(agent, msg)]
         if msg.authoritative:
             from .mechanics import patch_changes_state
             msg.intent["meaningful_state_change"] = patch_changes_state(self, msg.state_patch)
+            from .progression import changed_operations
+            msg.intent["causal_progress_operations"] = changed_operations(self, msg.state_patch)
         self.history.append(msg)
         self.turn_count += 1
         if msg.kind in {"narration", "intervention"}:
@@ -1394,7 +1400,22 @@ class SimulationState:
         initialize_arc(self, reset_horizon=True)
         self.bump_revision()
 
+    def shares_observation_space(self, left: str, right: str) -> bool:
+        """Explicit mutual visibility/hearing, never inferred from place names.
+
+        This changes public perception only. It does not relax scope filters,
+        participants, movement, same_location action targets or rule costs.
+        """
+        if left == right:
+            return True
+        return any(isinstance(group, list) and len(group) >= 2
+                   and all(isinstance(place, str) and place in self.locations for place in group)
+                   and left in group and right in group
+                   for group in getattr(self.world_spec, 'observation_groups', []))
+
     def _agent_can_observe(self, agent: AgentState, msg: Message) -> bool:
+        if msg.observed_by is not None:
+            return isinstance(msg.observed_by, list) and agent.name in msg.observed_by
         if agent.name in msg.individual_observations:
             return True
         viewer = ViewerContext(
@@ -1406,7 +1427,7 @@ class SimulationState:
             return False
         if msg.participants and agent.name not in msg.participants:
             return False
-        if msg.location and msg.location != agent.current_location:
+        if msg.location and not self.shares_observation_space(msg.location, agent.current_location):
             return False
         return True
 

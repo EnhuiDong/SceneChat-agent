@@ -71,7 +71,7 @@ WORLD_JSON_INSTRUCTION = """在遵守上方所有世界设计规则的同时，�
 {
   "title": "贴合题材的名称",
   "opening_scene": "可直接开始推演的一段具体开场，不得使用与用户题材无关的默认地点",
-  "public_world_markdown": "只包含所有在场角色都可知道的公共环境、规则和背景的 Markdown。严禁写入隐藏身份、秘密任务、仅某些身份知道的机制或导演计划",
+  "public_world_markdown": "只包含所有在场角色都可知道的公共环境、规则和背景的 Markdown。严禁写入隐藏身份、秘密任务、仅某些身份知道的机制、导演计划，以及未公开的真实愿望、内心顾虑和对关系的私下判断。人物没有秘密身份也不表示他人知道其真实内心；只能写已公开背景和可观察的外在行为",
   "director_notes_markdown": "只供导演使用的隐藏机制、秘密真相、角色差异化信息规则和剧情约束 Markdown",
   "public_rules": ["必须持续执行的公共规则"],
   "execution_version": 2,
@@ -81,6 +81,7 @@ WORLD_JSON_INSTRUCTION = """在遵守上方所有世界设计规则的同时，�
   "phases": ["若题材有回合/昼夜/会议等阶段，按顺序列出；自由场景可只写自由推进"],
   "initial_state": {"公共状态变量名": "初始值"},
   "locations": ["推演中允许存在的地点"],
+  "observation_groups": [],
   "relationship_dimensions": [
     {"id":"cooperation","label":"合作倾向","low_label":"对抗","high_label":"协作","description":"本场景中这一关系维度的含义"}
   ],
@@ -133,6 +134,7 @@ beat_specs 必须与 target_beats 一一对应并使用稳定 ID。用户明确�
 all_eligible_acted、all_active_voted、phase_advanced 是阶段推进方式或观察信号，不是 beat 的 completion_conditions.kind；若无上述四种可声明状态结果，节点须使用 narrative 并列出实际角色行动的核验信号。
 
 特别注意：公共世界会直接成为所有角色的知识。任何并非所有角色都知道的信息只能进入 director_notes_markdown 或带精确非 public scope 的 facts。桌游、审判、比赛等规则题材必须给出可执行 phase_specs、rules 与 termination_rules；自由谈话可以保持精简。天亮公布、结算、广播等没有角色行动的阶段必须设置 scheduler=event_first、advance_when=after_event、event_only=true，并给出 next_phase；唯一例外是有适用结构化结束规则的终局阶段，可以不设 next_phase。
+一条原子事实不能把共同可观察的经历与某人的私下解释捆在一起：共同事件按真实知情者分配，某人对它的内心感受、猜测或失落另列本人范围，不能因为双方参与过同一件事就共享彼此真实内心。已明确公开或已实际告知的心理事实仍按其真实知情范围处理。
 
 relationship_dimensions 应选择 2–5 个对本场景真正有用、含义互不重复的主观关系维度，必须兼容题材而不是默认套用猜疑游戏：战斗可使用敌对/协作、威胁判断、敬重或服从；职场可使用合作、可靠判断、影响力；家庭或情感场景可使用亲密、信赖、依赖或边界感。不要把战斗胜负、生命值、距离等客观状态伪装成关系维度。若题材没有特殊需要，可使用 cooperation、confidence、regard 三个通用维度。"""
 
@@ -142,6 +144,7 @@ RUNTIME_GENERATION_GUIDANCE = """
 set_phase 使用 value 存放目标阶段原文，例如 {"op":"set_phase","value":"秘密投票"}；target 不是目标阶段字段。不得写 value=null 再把阶段填入 target。
 increment_world 仅以 amount 作为整数增量，减少用 amount=-1；value 不参与计算，不能写 value=-1、amount=1 来表示减少。普通道具的归属、已收拾等若要进入结构化状态，必须有对应动作 effects 更新它；不需要追踪的装饰信息留在背景文本，不声明永远停在开场的可变状态来误导人物。
 结构化协议必须逐字段遵循：effects 是数组，每项操作的 op/key/target/value/amount 均在同一层，禁止嵌套 params、arguments、path 或自造操作（例如 check_condition_and_set）。set_agent_status 只允许 key=alive/active 和布尔 value；其他人物数值放 resources。实体结构必须是 {"实体ID":{"kind":"object或proposal","state":{"状态键":初始值}}}，不得把 state 改叫 properties。地点在 locations、opening_scene 与人物 initial_location 中使用一致的原文名称，不要混用英文 ID 和中文名。
+locations 默认是隔离感知的地点。同一开放房间里的桌边、水槽、书架、工位通常只作为开场站位，不分别建成让交谈者听不见彼此的地点。locations 只有一个地点时 observation_groups 必须是 []，不要生成单成员组。确需分区执行位置时，以 observation_groups 声明同时能互相看见和听见的地点，例如 [["铺内工位","铺内水槽"]]；每组至少两项，全部引用 locations 原文，不得引用仅在开场叙述中出现的站位。仅共享公共言行，不共享私有事实或越过参与者/范围限制。隔墙、封闭车内外、远处、只能通过通讯听见的空间不放一组；没有明确共同感知空间就用空数组。不能把全地图合为一组，不能为满足剧情而假设人物互相感知。
 V2 提案表决的最小操作示例（仅在用户要求此机制时使用，不能强加给其他场景）：先声明 entities={"proposal-A":{"kind":"proposal","state":{"passed":false}}}，对应 rule.action_type=vote、target_scope=proposal、effect_mode=rule、effects=[{"op":"record_vote","target":"$target"},{"op":"settle_votes","target":"$target","key":"passed","amount":2}]。两人投票通过的结束规则为 {"id":"end","kind":"entity_equals","target":"proposal-A","key":"passed","value":true,"description":"提案通过"}。不得增加未经支持的条件脚本或把 passed 当成角色状态。
 运行可达性与人物命名约束：
 - actor_roles/allowed_roles 为空数组表示所有可行动角色；非空时必须与实际 CharacterSpec.role 一致，禁止虚构 all_active 职业或名单外的 host。规则 action_type 必须在其阶段 allowed_action_types 中。

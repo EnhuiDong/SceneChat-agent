@@ -44,12 +44,13 @@ def config_int(
 
 SIMULATION_MODES = {
     "actor_generation_mode": ("single_pass", "performance_first"),
-    "actor_prompt_style": ("classic", "scene_first"),
+    "actor_prompt_style": ("classic", "scene_first", "life_scene"),
     "scene_continuity_mode": ("off", "evidence_log"),
     "conversation_recall": ("off", "linked"),
     "narrator_mode": ("periodic", "actor_led"),
     "intent_field_order": ("speech_first", "action_first"),
     "action_grounding": ("off", "rules"),
+    "scene_progression": ("off", "opportunities"),
 }
 
 

@@ -6,6 +6,7 @@ from .models import AgentState, SimulationState
 from .visibility import ViewerContext, can_access
 from .memory import recall
 from .authoring_policy import render_policy
+from .epistemic_projection import project_nonknowledge
 
 
 def _actor_profile(profile: str) -> str:
@@ -51,13 +52,13 @@ class AgentView:
         sections = (
             ("作者的补写权限——不表示人物已经知道这些事", self.authoring_constraints),
             ("开场处境——后续可见事件可以改变它，不是每轮重置的现状", self.scene),
-            ("你这个人——完整设定，只有你知道自己的秘密", profile),
+            ("你这个人——完整设定，只有你知道自己的秘密；档案内的开场站位、持物、正在做的事不是每轮现状", profile),
             ("你完整的目标与顾虑", self.goals),
             ("你已有的核心信念——可能为空，不用另造信条", self.core_beliefs),
             ("当前确已发生的状态——愿望不能覆盖它", self.authority),
             ("你确知的信息", self.known_facts),
             ("你自己的判断——可能错误，不是世界事实", self.beliefs),
-            ("在场其他人的公开资料", optional(self.colocated_public_profiles, budget)),
+            ("在场其他人的公开背景与开场外在画像——最新姿势和言行以可见事件为准", optional(self.colocated_public_profiles, budget)),
             ("你与他们的关系", optional(self.relationships, budget)),
             ("你能用的能力和资源", self.abilities),
             ("你原有的表达方式", self.voice_profile),
@@ -274,7 +275,7 @@ def build_agent_view(
         f"### {other.name}\n{other.public_profile}\n状态："
         f"{'可行动' if other.eligible else '已离场或不可行动'}"
         for other in state.agents.values()
-        if other.name != agent.name and other.current_location == agent.current_location
+        if other.name != agent.name and state.shares_observation_space(other.current_location, agent.current_location)
     ]
     facts = "\n".join(
         f"- [{fact_id}] {content}" for fact_id, content in agent.known_facts.items() if content
@@ -311,7 +312,7 @@ def build_agent_view(
         scene=state.scene,
         phase=state.current_phase,
         authority=state.state_summary_for(agent),
-        private_profile=agent.profile,
+        private_profile=project_nonknowledge(agent.profile),
         goals=goals,
         core_beliefs=core_beliefs,
         abilities=_ability_summary(agent),
@@ -321,13 +322,14 @@ def build_agent_view(
         beliefs=beliefs,
         active_threads=active_threads,
         observations=observations,
-        private_memory=agent.recent_private_memory(6),
+        private_memory=('\n'.join(project_nonknowledge(item) for item in agent.private_memory[-6:])
+                        or '暂无额外私人记忆。'),
         story_memory=recall(agent, focus_agents, represented_observations=represented,
                             excluded_event_ids=excluded_events),
         voice_profile=_voice_summary(agent),
         short_term_state=_short_term_summary(state, agent),
         response_obligations=_response_obligations(agent),
-        retrieved_background=retrieved_background,
+        retrieved_background=project_nonknowledge(retrieved_background),
         authoring_constraints=render_policy(state.world_spec),
     )
 

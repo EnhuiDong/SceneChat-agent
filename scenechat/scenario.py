@@ -516,6 +516,7 @@ class WorldSpec:
     audience_policy: str = "limited"
     reveal_policy: str = "preserve_suspense"
     performance_policies: list[str] = field(default_factory=list)
+    observation_groups: list[list[str]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.beat_specs and self.target_beats:
@@ -528,6 +529,24 @@ class WorldSpec:
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> "WorldSpec":
+        groups = data.get('observation_groups', [])
+        locations = _string_list(data.get('locations'))
+        if not isinstance(groups, list):
+            raise ValueError('observation_groups 必须是二维数组；单一地点不需要分组，使用 []')
+        normalized_groups = []
+        for index, group in enumerate(groups):
+            if (not isinstance(group, list) or not group
+                    or any(not isinstance(place, str) or place not in locations for place in group)
+                    or len(set(group)) != len(group)):
+                raise ValueError(
+                    f'observation_groups[{index}]={group!r} 无效；只能引用 locations={locations!r} '
+                    '中的原文且不含重复。不要新建未声明地点；单一地点使用 []')
+            # A valid singleton adds no perception permissions: same-location
+            # observation already exists. Normalize this redundant annotation
+            # instead of spending a model repair on a semantic no-op.
+            if len(group) >= 2:
+                normalized_groups.append(list(group))
+        groups = normalized_groups
         if data.get('execution_version', 1) != 2 and any(
             isinstance(rule, dict) and rule.get('requires') for rule in data.get('rules') or []
         ):
@@ -598,6 +617,7 @@ class WorldSpec:
             beat_specs=beat_specs,
             covered_constraint_ids=_string_list(data.get("covered_constraint_ids")),
             locations=_string_list(data.get("locations")),
+            observation_groups=[list(group) for group in groups],
             facts=[
                 FactSpec.from_mapping(item, index)
                 for index, item in enumerate(data.get("facts") or [], start=1)
