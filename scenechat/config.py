@@ -44,13 +44,14 @@ def config_int(
 
 SIMULATION_MODES = {
     "actor_generation_mode": ("single_pass", "performance_first"),
-    "actor_prompt_style": ("classic", "scene_first", "life_scene"),
+    "actor_prompt_style": ("classic", "scene_first", "life_scene", "interaction_first"),
     "scene_continuity_mode": ("off", "evidence_log"),
     "conversation_recall": ("off", "linked"),
     "narrator_mode": ("periodic", "actor_led"),
     "intent_field_order": ("speech_first", "action_first"),
     "action_grounding": ("off", "rules"),
     "scene_progression": ("off", "opportunities"),
+    "interaction_memory": ("off", "evidence"),
 }
 
 
@@ -62,3 +63,7 @@ def validate_simulation_modes():
             raise SceneChatError("model_configuration_invalid",
                                  f"simulation.{key} 必须为 {' 或 '.join(choices)}。",
                                  stage="preflight", status_code=503)
+    if config_value('scenario', 'character_authoring_mode', 'integrated') not in {'integrated', 'portrait_bind'}:
+        raise SceneChatError('model_configuration_invalid',
+                             'scenario.character_authoring_mode 必须为 integrated 或 portrait_bind。',
+                             stage='preflight', status_code=503)

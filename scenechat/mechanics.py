@@ -63,6 +63,12 @@ def _entity_termination_issues(world):
     issues = []
 
     def check(rule, path, root_id):
+        if rule.kind == 'agent_status_equals' and (not rule.target or rule.key not in {'active','alive'}
+                                                   or type(rule.value) is not bool):
+            issues.append(f'结束规则 {root_id} 的 {path} 人物状态条件要求 target=人物姓名、key=active/alive、value=布尔值')
+        if rule.kind == 'agent_location' and (not rule.target or (rule.location or rule.value) not in world.locations
+                or rule.location and rule.value not in (None, '', rule.location) or rule.key not in {'', 'location'}):
+            issues.append(f'结束规则 {root_id} 的 {path} 人物位置条件要求 target=人物姓名、location=已声明地点；value 只兼容同一地点')
         if rule.kind == "entity_equals":
             entity = world.entities.get(rule.target, {})
             fields = entity.get("state", {}) if isinstance(entity, dict) else {}
@@ -73,7 +79,7 @@ def _entity_termination_issues(world):
                     f"kind=entity_equals, target={rule.target}, key={rule.key}, value={rule.value!r}。"
                     "target 必须是 world.entities 中的真实物品/提案 ID，不是人物姓名或 CharacterSpec.id；"
                     f"现有实体={list(world.entities)}，该实体状态键={list(fields) if isinstance(fields, dict) else []}。"
-                    "不能只把人物姓名改成人物 id；人物位置用 all_active_at_location 等支持的条件。"
+                    "不能只把人物姓名改成人物 id；人物 active/alive 使用 agent_status_equals，位置使用 all_active_at_location。"
                     "仅系统自行补出的、没有执行机制的失败分支可移除；用户明确要求的条件必须保留并连接真实机制"
                 )
         for index, child in enumerate(rule.conditions):
@@ -345,6 +351,37 @@ def _rule_fully_shadowed(package, rule):
         for other in world.rules) for actor, phase in routes)
 
 
+def _ability_execution_effects(package, character, ability):
+    """Potential effects from this exact owner/source, excluding inert abilities."""
+    if ability.uses == 0:
+        return []
+    world = package.world
+    phases = [phase for phase in world.phase_specs
+              if not phase.event_only and matches_role(character.role, phase.actor_roles)
+              and (not ability.phases or phase.name in ability.phases)
+              and (not phase.allowed_action_types or ability.action_type in phase.allowed_action_types
+                   or (ability.action_type == "act" and any(
+                       rule.action_type in phase.allowed_action_types
+                       and (not rule.phases or phase.name in rule.phases)
+                       and matches_role(character.role, rule.allowed_roles)
+                       and rule.effect_mode in {"ability", "stack"} for rule in world.rules)))]
+    active = not world.phase_specs
+    for phase in phases:
+        if ability.action_type == "act":
+            active = True  # Generic act abilities can serve a special action.
+            continue
+        rules = [rule for rule in world.rules if rule.action_type == ability.action_type
+                 and (not rule.phases or phase.name in rule.phases)
+                 and matches_role(character.role, rule.allowed_roles)]
+        if not rules or any(rule.target_scope != ability.target_scope for rule in rules):
+            active = True
+        elif max(rules, key=lambda rule: rule.priority).effect_mode in {"ability", "stack"}:
+            active = True
+    if not phases and world.phase_specs:
+        return []
+    return [effect for effect in ability.effects if active or effect.op == "consume_resource"]
+
+
 def _potential_execution_effects(package):
     """Exclude inert sources, without claiming to prove all semantic reachability.
 
@@ -358,35 +395,7 @@ def _potential_execution_effects(package):
                for effect in rule.effects]
     for character in package.characters:
         for ability in character.abilities:
-            if ability.uses == 0:
-                continue
-            phases = [phase for phase in world.phase_specs
-                      if not phase.event_only and matches_role(character.role, phase.actor_roles)
-                      and (not ability.phases or phase.name in ability.phases)
-                      and (not phase.allowed_action_types or ability.action_type in phase.allowed_action_types
-                           or (ability.action_type == "act" and any(
-                               rule.action_type in phase.allowed_action_types
-                               and (not rule.phases or phase.name in rule.phases)
-                               and matches_role(character.role, rule.allowed_roles)
-                               and rule.effect_mode in {"ability", "stack"} for rule in world.rules)))]
-            # Legacy/incomplete fixtures without phase specs remain an
-            # overapproximation; other validators diagnose missing phases.
-            active = not world.phase_specs
-            for phase in phases:
-                if ability.action_type == "act":
-                    # Resolver accepts a generic act ability for a declared
-                    # special action. Preserve this legacy capability route.
-                    active = True
-                    continue
-                rules = [rule for rule in world.rules if rule.action_type == ability.action_type
-                         and (not rule.phases or phase.name in rule.phases)
-                         and matches_role(character.role, rule.allowed_roles)]
-                if not rules or any(rule.target_scope != ability.target_scope for rule in rules):
-                    active = True
-                elif max(rules, key=lambda rule: rule.priority).effect_mode in {"ability", "stack"}:
-                    active = True
-            if phases or not world.phase_specs:
-                effects.extend(effect for effect in ability.effects if active or effect.op == "consume_resource")
+            effects.extend(_ability_execution_effects(package, character, ability))
     return effects
 
 
@@ -531,6 +540,10 @@ def validate_mechanics(package):
             if not isinstance(initial, dict):
                 return False
             return rule.key in initial and type(initial[rule.key]) is type(rule.value) and initial[rule.key] == rule.value
+        if rule.kind == 'agent_status_equals':
+            return rule.target in {c.name for c in package.characters} and rule.key in {'active','alive'} and rule.value is True
+        if rule.kind == 'agent_location':
+            return any(c.name == rule.target and c.initial_location == (rule.location or rule.value) for c in package.characters)
         return False
 
     def has_live_dependency(rule):
@@ -555,6 +568,67 @@ def validate_mechanics(package):
             field = world.state_schema.get(rule.key)
             return any(effect.op in {"set_world", "increment_world"} and effect.key == rule.key
                        for effect in effects) or bool(field and "director" in field.mutable_by)
+        if kind == 'agent_location':
+            destination = rule.location or rule.value
+            if rule.target not in {c.name for c in package.characters} or destination not in world.locations:
+                return False
+
+            def can_move(effects, scope, holders):
+                for effect in effects:
+                    if effect.op != 'move_agent' or not (
+                            effect.value == destination or effect.value == '$value'
+                            or effect.value == '$target' and scope == 'location'):
+                        continue
+                    if effect.target == rule.target and holders:
+                        return True
+                    if effect.target == '$actor' and any(c.name == rule.target for c in holders):
+                        return True
+                    if effect.target == '$target' and holders and (
+                            scope in {'character','any_active','same_location'}
+                            or scope == 'self' and any(c.name == rule.target for c in holders)):
+                        return True
+                return False
+
+            for source in world.rules:
+                if source.effect_mode not in {'rule','stack'} or _rule_fully_shadowed(package, source):
+                    continue
+                holders = [c for phase in world.phase_specs for c in rule_actors(package, source, phase)]
+                if can_move(source.effects, source.target_scope, holders):
+                    return True
+            return any(can_move(_ability_execution_effects(package, owner, ability), ability.target_scope, [owner])
+                       for owner in package.characters for ability in owner.abilities)
+        if kind == 'agent_status_equals':
+            target = next((c for c in package.characters if c.name == rule.target), None)
+            if target is None or rule.key not in {'active','alive'} or type(rule.value) is not bool:
+                return False
+            for source in world.rules:
+                if source.effect_mode not in {'rule','stack'} or _rule_fully_shadowed(package, source):
+                    continue
+                holders = [c for phase in world.phase_specs for c in rule_actors(package, source, phase)]
+                for effect in source.effects:
+                    if effect not in effects or effect.op != 'set_agent_status' or effect.key != rule.key or effect.value is not rule.value:
+                        continue
+                    if effect.target == target.name and holders:
+                        return True
+                    if effect.target == '$actor' and any(c.name == target.name for c in holders):
+                        return True
+                    if effect.target == '$target' and holders and (
+                            source.target_scope in {'character', 'any_active', 'same_location'}
+                            or source.target_scope == 'self' and any(c.name == target.name for c in holders)):
+                        return True
+            for owner in package.characters:
+                for ability in owner.abilities:
+                    for effect in _ability_execution_effects(package, owner, ability):
+                        if (effect.op != 'set_agent_status' or effect.key != rule.key
+                                or effect.value is not rule.value):
+                            continue
+                        if effect.target == target.name or effect.target == '$actor' and owner.name == target.name:
+                            return True
+                        if effect.target == '$target' and (
+                                ability.target_scope in {'character', 'any_active', 'same_location'}
+                                or ability.target_scope == 'self' and owner.name == target.name):
+                            return True
+            return False
         if kind in {"faction_eliminated", "faction_parity"}:
             return any(effect.op == "set_agent_status" and effect.key in {"alive", "active"}
                        for effect in effects) or any(

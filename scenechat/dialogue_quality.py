@@ -393,10 +393,18 @@ def inspect_narration_event(
         not re.match(r"\s*(?:传来|响起|飘来|散发|涌来)", camera_text[match.end():])
         for match in re.finditer(offscreen_pattern, camera_text)
     )
-    if visibility == "public" and (labelled_camera or offscreen_viewpoint):
+    # A flashback/inner monologue is not something every present actor heard.
+    # Restrict to explicit declarative mind access, not inferred expressions,
+    # spoken quotes, or any occurrence of the word "remember" in the text.
+    subjects = "|".join(re.escape(name) for name in (*state.agents, "他", "她", "它"))
+    private_mind = re.search(
+        rf'(?:^|[。！？!?；;\n，,])\s*(?:{subjects})(?:当时|此刻|这时)?'
+        r'(?:心里(?:想|念着|盘算)|内心(?:想|希望)|暗自(?:想|决定)|'
+        r'记得那个|回忆起|想起了当年|当时想|默默想着)', camera_text)
+    if visibility == "public" and (labelled_camera or offscreen_viewpoint or private_mind):
         issues.append(DialogueQualityIssue(
             "public_private_camera",
-            "public 旁白含读者专属镜头；删除在场角色无法观察的插入，保留可见后果。不能把包内屏幕或幕后信息当作全员知识。",
+            "public 旁白含读者专属镜头或未说出口的回忆/内心；删除在场角色无法观察的插入，保留可见后果。不能把私密心理、包内屏幕或幕后信息当作全员知识。",
             hard=True,
         ))
     recent = [

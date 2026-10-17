@@ -15,7 +15,7 @@ def parse_requirements(raw):
     if not isinstance(raw, list) or len(raw) > 32:
         raise ValueError('requires 必须是最多 32 项类型化前提数组')
     for item in raw:
-        if not isinstance(item, dict) or item.get('kind') not in FIELDS:
+        if not isinstance(item, dict) or not isinstance(item.get('kind'), str) or item['kind'] not in FIELDS:
             raise ValueError('requires 仅支持 world_equals/entity_equals/agent_location/all_active_at_location')
         if set(item) != FIELDS[item['kind']]:
             raise ValueError('requires 字段不完整或包含表达式/脚本/未知字段')
@@ -33,28 +33,48 @@ def validate_requirements(world, spec):
     issues = []
     for index, item in enumerate(items):
         kind = item['kind']
-        valid = True
+        reasons = []
         if kind == 'world_equals':
-            valid = item['key'] in world.state_schema and item['key'] in world.initial_state
-            if valid:
-                valid = (type(item['value']) is type(world.initial_state[item['key']])
-                         and world.state_schema[item['key']].accepts_value(item['value']))
+            key = item['key']
+            field = world.state_schema.get(key)
+            if field is None:
+                reasons.append(f'/world/state_schema/{key} 未声明；需引用真实字段或补全一致的状态声明')
+            if key not in world.initial_state:
+                reasons.append(f'/world/initial_state/{key} 缺少初始值'
+                               + (f'（schema 类型 {field.value_type}）' if field else '')
+                               + '；保留真实前提，按开场设定补值，不以删前提或改成另一条件掩盖缺失')
+            else:
+                expected_type = type(world.initial_state[key])
+                if type(item['value']) is not expected_type:
+                    reasons.append(f'value 类型 {type(item["value"]).__name__} 与初始字段类型 '
+                                   f'{expected_type.__name__} 不一致，不转换真假/数值为字符串')
+            if field is not None and not field.accepts_value(item['value']):
+                reasons.append(f'value 不满足字段 {key} 的 {field.value_type} schema/allowed_values')
         elif kind == 'entity_equals':
-            entities = ([world.entities.get(item['target'])] if item['target'] != '$target' else
-                        [e for e in world.entities.values() if isinstance(e, dict) and e.get('kind') == spec.target_scope])
-            valid = bool(entities) and all(isinstance(e, dict) and isinstance(e.get('state'), dict)
-                                         and item['key'] in e['state']
-                                         and type(item['value']) is type(e['state'][item['key']]) for e in entities)
+            entities = ([(item['target'], world.entities.get(item['target']))] if item['target'] != '$target' else
+                        [(name,e) for name,e in world.entities.items() if isinstance(e, dict) and e.get('kind') == spec.target_scope])
+            if not entities:
+                reasons.append(f'$target 无 {spec.target_scope} 范围内的声明实体')
+            for name, entity in entities:
+                if not isinstance(entity, dict) or not isinstance(entity.get('state'), dict) or item['key'] not in entity['state']:
+                    reasons.append(f'/world/entities/{name}/state/{item["key"]} 未声明；人物位置不能冒充实体字段')
+                elif type(item['value']) is not type(entity['state'][item['key']]):
+                    reasons.append(f'value 类型 {type(item["value"]).__name__} 与实体 {name} 字段 '
+                                   f'{item["key"]} 的 {type(entity["state"][item["key"]]).__name__} 不一致')
         elif kind == 'agent_location':
             # Only this actor or this action's character target. No arbitrary
             # character lookup whose presence is unknown at world-generation.
-            valid = item['target'] in {'$actor', '$target'} and item['value'] in world.locations
-            if item['target'] == '$target':
-                valid = valid and spec.target_scope in {'self', 'same_location', 'any_active', 'character'}
+            if item['target'] not in {'$actor', '$target'}:
+                reasons.append('行动前提人物 target 只支持 $actor 或人物目标 $target，不支持在这里填固定人物姓名')
+            if item['value'] not in world.locations:
+                reasons.append('value 必须是 /world/locations 中的地点原文')
+            if item['target'] == '$target' and spec.target_scope not in {'self', 'same_location', 'any_active', 'character'}:
+                reasons.append(f'$target 需要人物目标范围，当前 target_scope={spec.target_scope}')
         else:
-            valid = item['location'] in world.locations
-        if not valid:
-            issues.append(f'规则 {spec.id} requires/{index} 引用、目标范围或值类型无效')
+            if item['location'] not in world.locations:
+                reasons.append('location 必须是 /world/locations 中的地点原文')
+        if reasons:
+            issues.append(f'规则 {spec.id} requires/{index} 无效：' + '；'.join(reasons[:8]))
     return issues
 
 

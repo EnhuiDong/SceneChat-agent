@@ -12,7 +12,7 @@ from .errors import SceneChatError
 
 # Bump only when stalled structured or semantic checkpoints gain a genuinely
 # new repair policy. Older failed builds may then receive one bounded retry epoch.
-REPAIR_POLICY_VERSION = 8
+REPAIR_POLICY_VERSION = 11
 
 
 def upgraded_repair_available(row):
@@ -128,6 +128,24 @@ def repair_local_fields(package):
                 changes.append({"path": f"/world/rules/{index}/effects/{effect_index}/value",
                                 "value": effect.target})
     names = {character.name for character in package.characters if character.name}
+    def actor_status_condition(rule, path):
+        # This is an exact typed namespace correction, not an inferred ending:
+        # an existing real actor's active/alive is not an entity/world field.
+        world_collision = rule.kind == 'world_equals' and rule.key in package.world.state_schema
+        entity_collision = rule.kind == 'entity_equals' and rule.target in package.world.entities
+        if (rule.kind == 'agent_location_equals' and rule.target in names
+                and (rule.location or rule.value) in package.world.locations
+                and (not rule.location or rule.value in (None, '', rule.location))
+                and rule.key in {'', 'location'}):
+            changes.append({'path':path + '/kind', 'value':'agent_location'})
+        if (rule.kind in {'world_equals','entity_equals'} and rule.target in names
+                and rule.key in {'active','alive'} and type(rule.value) is bool
+                and not world_collision and not entity_collision):
+            changes.append({'path':path + '/kind', 'value':'agent_status_equals'})
+        for child_index, child in enumerate(rule.conditions):
+            actor_status_condition(child, path + f'/conditions/{child_index}')
+    for index, terminal in enumerate(package.world.termination_rules):
+        actor_status_condition(terminal, f'/world/termination_rules/{index}')
     aliases = {
         character.id: character.name for character in package.characters
         if character.id and character.name and character.id != character.name

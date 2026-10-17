@@ -869,6 +869,7 @@ class SimulationState:
         before_changes = snapshot(self)
         phase_before = self.current_phase
         if msg.observed_by is None:
+            self._project_public_arrivals(msg)
             msg.observed_by = [agent.name for agent in self.agents.values()
                                if self._agent_can_observe(agent, msg)]
         if msg.authoritative:
@@ -1400,6 +1401,32 @@ class SimulationState:
         initialize_arc(self, reset_horizon=True)
         self.bump_revision()
 
+    def _project_public_arrivals(self, msg: Message) -> None:
+        """Destination witnesses see arrival, never the remote source speech.
+
+        Movement is already resolver-authoritative. A recipient-specific
+        observation contains only that public movement, not the rest of the
+        original patch, travel history or another location's conversation.
+        """
+        if not msg.authoritative or msg.visibility != 'public':
+            return
+        for observer in self.agents.values():
+            if self._agent_can_observe(observer, msg):
+                continue
+            viewer = ViewerContext(name=observer.name, role=observer.role, location=observer.current_location)
+            if not can_access(msg.scopes, viewer) or msg.participants and observer.name not in msg.participants:
+                continue
+            arrivals = []
+            for op in msg.state_patch:
+                name, destination = op.get('target'), op.get('value')
+                if (op.get('op') == 'move_agent' and name in self.agents
+                        and name != observer.name and destination in self.locations
+                        and self.agents[name].current_location != destination
+                        and self.shares_observation_space(destination, observer.current_location)):
+                    arrivals.append(f'{name}已进入{destination}')
+            if arrivals:
+                msg.individual_observations[observer.name] = f'[{msg.turn}] 你看见' + '；'.join(arrivals) + '。'
+
     def shares_observation_space(self, left: str, right: str) -> bool:
         """Explicit mutual visibility/hearing, never inferred from place names.
 
@@ -1601,6 +1628,16 @@ class SimulationState:
         if kind == "entity_equals":
             entity = self.entity_states.get(getattr(rule, "target", ""), {})
             return rule.key in entity and entity[rule.key] == rule.value
+        if kind == 'agent_status_equals':
+            actor = self.agents.get(getattr(rule, 'target', ''))
+            return (actor is not None and rule.key in {'active','alive'} and type(rule.value) is bool
+                    and getattr(actor, rule.key) is rule.value)
+        if kind == 'agent_location':
+            actor = self.agents.get(rule.target)
+            destination = rule.location or rule.value
+            return (actor is not None and isinstance(destination, str) and destination in self.locations
+                    and (not rule.location or rule.value in (None, '', rule.location))
+                    and rule.key in {'', 'location'} and actor.current_location == destination)
         if kind == "all_goals_completed":
             return bool(alive) and all(
                 agent.goal_status

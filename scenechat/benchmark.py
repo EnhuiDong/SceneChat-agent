@@ -32,11 +32,14 @@ def public_run_metadata():
     # Explicit allowlist: never serialize .env, endpoint URLs or arbitrary config.
     keys = {"simulation": ("actor_generation_mode", "actor_prompt_style", "scene_continuity_mode", "conversation_recall", "narrator_mode", "intent_field_order", "action_grounding", "performance_max_tokens", "input_budget_bytes", "context_section_bytes", "intent_max_tokens", "narration_max_tokens", "max_turns", "parse_retries", "quality_retries", "transport_retries", "operation_timeout_seconds", "max_requests_per_operation", "consecutive_fallback_limit", "fallback_window_size", "fallback_window_limit"),
             "llm": ("max_retries", "request_timeout_seconds", "json_mode", "enable_thinking")}
-    keys["simulation"] += ("scene_progression",)
+    keys["simulation"] += ("scene_progression", "interaction_memory")
+    keys['scenario'] = ('character_authoring_mode',)
     root = Path(__file__).parent
     digest = hashlib.sha256()
     digest.update((root / "progression.py").read_bytes())
     digest.update((root / "entity_tracking.py").read_bytes())
+    for name in ("json_surface.py", "epistemic_projection.py", "world_context.py", "life_attention.py", "scenario.py", "models.py", "persistence.py", "scenario_patch.py", "interaction_memory.py", "cast_authoring.py", "action_requirements.py"):
+        digest.update((root / name).read_bytes())
     for name in ("simulation.py", "chat_prompt.py", "dialogue_format.py", "continuity.py", "conversation_recall.py", "action_grounding.py", "config.py", "preflight.py", "providers.py", "openai_compat.py", "context.py", "character_parser.py", "memory.py", "generation.py", "mechanics.py", "recovery.py", "telemetry.py", "prompt_library.py", "narrative_grounding.py", "dialogue_quality.py", "evaluation.py", "runtime.py", "pacing.py", "scheduler.py", "agenda.py"):
         digest.update((root / name).read_bytes())
     digest.update((root.parent / "Character.py").read_bytes())

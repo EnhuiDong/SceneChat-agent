@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import ast
 import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable
@@ -26,7 +25,7 @@ def resolve_faction(reference: str, factions: Iterable[str]) -> str:
     return matches[0] if len(matches) == 1 else ""
 VALID_TERMINATION_KINDS = {
     "faction_eliminated", "faction_parity", "world_equals", "entity_equals",
-    "all_goals_completed", "all_active_at_location", "all_of", "any_of", "manual",
+    "all_goals_completed", "all_active_at_location", "agent_status_equals", "agent_location", "all_of", "any_of", "manual",
 }
 VALID_SCHEDULERS = {
     "round_robin",
@@ -134,23 +133,11 @@ def extract_json_object(raw: str) -> dict[str, Any]:
         # Common provider drift: JavaScript comments, trailing commas, or
         # unquoted simple property names. This is deliberately conservative;
         # semantic repair remains the model retry's responsibility.
-        repaired = re.sub(r"/\*.*?\*/|//[^\r\n]*", "", candidate, flags=re.DOTALL)
-        repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
-        repaired = re.sub(
-            r'([,{]\s*)([A-Za-z_\u4e00-\u9fff][\w\-\u4e00-\u9fff]*)(\s*:)',
-            r'\1"\2"\3',
-            repaired,
-        )
+        from .json_surface import decode_surface
         try:
-            payload, _ = json.JSONDecoder().raw_decode(repaired)
-        except json.JSONDecodeError:
-            python_literal = re.sub(r"\btrue\b", "True", repaired)
-            python_literal = re.sub(r"\bfalse\b", "False", python_literal)
-            python_literal = re.sub(r"\bnull\b", "None", python_literal)
-            try:
-                payload = ast.literal_eval(python_literal)
-            except (SyntaxError, ValueError) as exc:
-                raise original_error from exc
+            payload = decode_surface(candidate)
+        except (SyntaxError, ValueError, TypeError) as exc:
+            raise original_error from exc
     if not isinstance(payload, dict):
         raise ValueError("模型响应顶层必须是 JSON 对象")
     return payload
@@ -1178,6 +1165,8 @@ def validate_scenario_package(package: ScenarioPackage, *, user_prompt: str | No
         if len(set(ability_ids)) != len(ability_ids):
             issues.append(f"角色“{character.name or character.id}”存在重复能力 ID")
         for ability in character.abilities:
+            if ability.uses is not None and ability.uses < 0:
+                issues.append(f'角色“{character.name}”能力“{ability.id}”的 uses 不能为负数；不限次数必须用 null，0 表示不可再用，不能用 -1 冒充无限')
             unknown_phases = set(ability.phases) - set(package.world.phases)
             if unknown_phases:
                 issues.append(
@@ -1271,6 +1260,14 @@ def validate_scenario_package(package: ScenarioPackage, *, user_prompt: str | No
                     issues.append(f"结束规则“{rule.id}”将自己的阵营列为对立阵营“{opponent}”")
         if rule.kind == "world_equals" and rule.key not in package.world.initial_state:
             issues.append(f"结束规则“{rule.id}”引用未知世界状态“{rule.key}”")
+        if rule.kind == 'agent_status_equals' and (
+                rule.target not in names or rule.key not in {'active','alive'} or type(rule.value) is not bool):
+            issues.append(f'结束规则“{rule.id}”的人物状态条件无效：target 必须是真实姓名，key 为 active/alive，value 为布尔值')
+        if rule.kind == 'agent_location' and (
+                rule.target not in names or (rule.location or rule.value) not in package.world.locations
+                or rule.location and rule.value not in (None, '', rule.location)
+                or rule.key not in {'', 'location'}):
+            issues.append(f'结束规则“{rule.id}”的人物位置条件无效：target 为真实姓名，location 为已声明地点；value 只兼容同一地点，不能冲突或使用表达式')
         if (
             rule.kind == "all_active_at_location"
             and package.world.locations

@@ -65,6 +65,7 @@ class Intent:
     claim_updates: list[dict[str, Any]] = field(default_factory=list)
     rule_id: str = ""
     continuity_notes: list[dict[str, str]] = field(default_factory=list)
+    interaction_updates: list[dict[str, str]] = field(default_factory=list)
 
     @classmethod
     def from_mapping(cls, actor: str, data: dict[str, Any]) -> "Intent":
@@ -90,6 +91,7 @@ class Intent:
             actor=actor,
             rule_id=str(data.get("rule_id") or "").strip(),
             continuity_notes=validated_notes(data.get("continuity_notes"), data.get("action")),
+            interaction_updates=data.get('interaction_updates') if isinstance(data.get('interaction_updates'), list) else [],
             action_type=str(data.get("action_type") or "speak").strip(),
             action=str(data.get("action") or "观察局势").strip(),
             speech=str(data.get("speech") or "").strip(),
@@ -467,6 +469,9 @@ class IntentResolver:
         intent.mentioned_agents = mentioned[:6]
 
         source = intent.short_term_state
+        from .interaction_memory import enabled, validated_updates
+        intent.interaction_updates = validated_updates(state, actor, intent.interaction_updates,
+            before_turn=state.turn_count + 1) if enabled() else []
         emotion_source = source.get("emotion") if isinstance(source.get("emotion"), dict) else {}
         label = str(emotion_source.get("label") or "").strip()[:80]
         try:

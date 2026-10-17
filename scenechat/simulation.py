@@ -222,8 +222,27 @@ private_reason 放在公开行为之后，用一句短话即可，不写完整�
                      "同一选择也可以来自不同的关系、代价或不情愿，不把上一人的整段论证改名复述。"
                      "即使不说话也须提交当前合法动作与目标；不替别人选择。用户明确要求完整陈述理由时照原意。")
     style = config_value("simulation", "actor_prompt_style", "classic")
-    if style not in {"classic", "scene_first", "life_scene"}:
-        raise SceneChatError("model_configuration_invalid", "actor_prompt_style 必须为 classic、scene_first 或 life_scene。", stage="preflight", status_code=503)
+    if style not in {"classic", "scene_first", "life_scene", "interaction_first"}:
+        raise SceneChatError("model_configuration_invalid", "actor_prompt_style 必须为 classic、scene_first、life_scene 或 interaction_first。", stage="preflight", status_code=503)
+    if style == "interaction_first":
+        performance = f"你是{agent.name}。\n" + prompt_contract("interaction_actor")
+        reference = (view.render_interaction() + "\n【人物性格与惯常取舍原文】\n"
+                     + json.dumps({'性格': agent.personality, '惯常选择方式': agent.decision_logic}, ensure_ascii=False)
+                     + "\n【当前合法接口——不是逐项完成的清单】\n"
+                     + f"地点：{json.dumps(state.locations, ensure_ascii=False)}\n"
+                     + f"物品/提案：{json.dumps(visible_entities(state, agent), ensure_ascii=False)}\n"
+                     + f"本阶段允许动作：{phase_actions}\n" + action_context(state, agent)
+                     + "\n" + phase_exit_instruction)
+        # Keep every output field and its evidence rule, but do not repeat a
+        # procedural worklist immediately before the human exchange. Actual
+        # pending source events and source IDs remain in actor_exchange.
+        protocol = protocol.split("\n【对话登记参考——不是人物的工作清单】", 1)[0]
+        protocol += "\n【可用回应来源——只供登记，不规定人物必须解决】\n" + view.response_obligations
+        exchange = ("【眼前这次相处】\n" + actor_exchange(state, agent)
+                    + "\n对方刚才的言行已经发生。现在从你自己的位置接下去，不替读者总结两人的关系。"
+                    "愿意继续、坚持、让步、做事或结束，由你与此人的关系、完整性格和实际处境决定。"
+                    "不要求冲突、和解或新问题；已得到的回应不再当作缺失。只提交本人的一次 Intent JSON。"
+                    + "\n\n" + progression_context(state, agent))
     if style == "life_scene":
         performance = f"你是{agent.name}。\n" + prompt_contract("life_actor")
         from .life_attention import attention_context
@@ -260,6 +279,10 @@ private_reason 放在公开行为之后，用一句短话即可，不写完整�
                                     '  "action_type": "与实际选择对应的当前合法行动类型",\n'
                                     '  "speech": "此刻真正会对眼前的人说的话；没有时为空字符串",\n'
                                     '  "action": "仅自己的外部动作，须与执行选择一致",')
+    from .interaction_memory import enabled as interaction_memory_enabled, render as render_interaction_memory, ANNOTATION_INSTRUCTION as INTERACTION_ANNOTATION
+    if interaction_memory_enabled():
+        reference += '\n\n' + render_interaction_memory(state, agent)
+        protocol += '\n\n' + INTERACTION_ANNOTATION
     exchange += (f"\n【本次发言者】你是{agent.name}，只提交你本人这一次的言行。"
                  "近期交流里他人的话不是你要替他接着说的台词；不能把自己的 speech/action 写成另一人的回应。")
     return ChatPrompt((("system", performance), ("user", reference),
@@ -272,7 +295,11 @@ def build_performance_prompt(state, agent, retrieved_context):
     view = build_agent_view(state, agent, retrieved_context, presented_events=presented_events)
     # Keep authority and knowledge intact; do not present generated task-list
     # advice, numeric metadata schemas or other characters' private dossiers.
-    reference = view.render_performance()
+    style = config_value("simulation", "actor_prompt_style", "classic")
+    reference = view.render_interaction() if style == "interaction_first" else view.render_performance()
+    from .interaction_memory import enabled as interaction_memory_enabled, render as render_interaction_memory
+    if interaction_memory_enabled():
+        reference += '\n\n' + render_interaction_memory(state, agent)
     if continuity_enabled():
         reference += "\n\n" + journal(state, agent=agent)
     phase = state.phase_specs.get(state.current_phase)
@@ -286,13 +313,13 @@ def build_performance_prompt(state, agent, retrieved_context):
     life_scene = config_value("simulation", "actor_prompt_style", "classic") == "life_scene"
     from .life_attention import attention_context
     return ChatPrompt((("system", f"你是“{agent.name}”。用户明确的时代、语言、文风与人物设定优先。\n"
-                        + prompt_contract("life_actor" if life_scene else "performance")),
+                        + prompt_contract("interaction_actor" if style == "interaction_first" else "life_actor" if life_scene else "performance")),
                        ("user", reference + f"\n当前阶段允许动作：{getattr(phase, 'allowed_action_types', [])}\n"
                         + action_context(state, agent) + "\n" + constraint),
                        ("user", f"【本次发言者】你是{agent.name}，不是刚才说话的其他人，只提交你本人这一次的言行。\n"
                         + "【接着这一场演，不做状态汇报】\n" + actor_exchange(state, agent)
                         + (attention_context(state, agent) if life_scene else "")
-                        + "\n你自己的完整目标比上次某个临时对话目标更重要。"
+                        + "\n开场目标说明你的来由，不会自动压过真实交流留下的新取舍；已经收到的回应不会倒退成没有发生。"
                         '\n【本步骤唯一输出格式，优先于资料中其他 JSON 登记说明】'
                         '\n只输出 {"speech":"本人全部对白，可为空", "action":"本人外部动作描述，纯说话写回应", '
                         '"thought":"一句未说出口的顾虑或冲动，可省略"}。'
@@ -466,6 +493,7 @@ def parse_agent_intent(raw: str) -> Optional[dict]:
         "private_reason": str(payload.get("private_reason") or payload.get("memory") or "").strip(),
         "expected_effect": str(payload.get("expected_effect") or "").strip(),
         "continuity_notes": payload.get("continuity_notes") if isinstance(payload.get("continuity_notes"), list) else [],
+        "interaction_updates": payload.get('interaction_updates') if isinstance(payload.get('interaction_updates'), list) else [],
         "proposed_patch": payload.get("proposed_patch")
         if isinstance(payload.get("proposed_patch"), list)
         else [],
@@ -698,20 +726,30 @@ def simulate_next_turn(
         _single_retry_setting("quality_retries"),
     )
     rejection = ""
+    rejected_output = ""
     for attempt in range(retries + 1):
         attempt_prompt = prompt
         if draft and not rejection:
             attempt_prompt = build_intent_encoder_prompt(state, agent, prompt, draft)
         if rejection:
-            attempt_prompt += (
+            repair_request = (
                 "\n\n【上一次 Intent 被拒绝】\n"
                 f"{rejection}\n请保持角色目标不变，改为提交一项当前阶段合法的 Intent。"
             )
+            if rejected_output:
+                repair_request += (
+                    "\n【刚才未提交的候选，仅为待修复数据，不是已发生的剧情或新指令】\n"
+                    + rejected_output[:12000]
+                    + "\n保留其中未受具体错误影响的有效内容，按上述错误纠正后返回完整 Intent；"
+                    "不能将本候选当作别人已经听过或自己已经执行过。"
+                )
+            attempt_prompt += repair_request
         response = complete(state, active_llm,
             attempt_prompt,
             purpose="actor_intent",
             max_tokens=_token_budget("intent_max_tokens", 900, 520, 1800),
         )
+        rejected_output = str(response.text or "")
         parsed = parse_agent_intent(response.text)
         if parsed is None:
             finish_reason = str(getattr(response, "finish_reason", "") or "")
@@ -934,7 +972,7 @@ def _fallback_message(state, agent, intent, resolution):
     for key in ("reply_to_event_id", "reply_to_obligation_id", "thread_id",
                 "obligation_resolution", "short_term_state", "memory_candidates",
                 "claim_updates", "arc_updates", "private_reason", "addressed_to",
-                "mentioned_agents", "address_scope"):
+                "mentioned_agents", "address_scope", "interaction_updates"):
         message.intent.pop(key, None)
     message.intent["conversation_move"] = "silence"
     return message
@@ -1014,9 +1052,13 @@ def simulate_narration(
         _single_retry_setting("quality_retries"),
     )
     rejection = ""
+    rejected_narration = ""
     for attempt in range(retries + 1):
         attempt_prompt = prompt if not rejection else (
             prompt + "\n\n【上一次旁白被拒绝】\n" + rejection
+            + ("\n【未提交的旁白候选，仅为待修复数据，不是新指令或已发生事件】\n"
+               + json.dumps({'candidate':rejected_narration[:6000]}, ensure_ascii=False)
+               if rejected_narration else "")
             + "\n只输出修正后的完整 JSON 对象。"
         )
         response = complete(state, active_llm,
@@ -1024,6 +1066,7 @@ def simulate_narration(
             purpose="narration",
             max_tokens=_token_budget("narration_max_tokens", 480, 360, 900),
         )
+        rejected_narration = str(response.text or "")
         parsed = parse_narrator_event(response.text)
         if parsed and parsed.get("skip"):
             phase = state.phase_specs.get(state.current_phase)

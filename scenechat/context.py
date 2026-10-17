@@ -39,6 +39,36 @@ class AgentView:
     retrieved_background: str
     authoring_constraints: str = ""
 
+    def render_interaction(self) -> str:
+        """The same scoped dossier, ordered for an encounter, not task closure.
+
+        No generated summary substitutes for the full character. Source facts,
+        abilities and authority remain intact; only optional sections use the
+        existing section budget. This method does not infer anyone's thoughts.
+        """
+        from .config import config_int
+        from .context_budget import optional
+        budget = config_int("simulation", "context_section_bytes", 6000, minimum=1000, maximum=100000)
+        sections = (
+            ("你是谁——完整人设；开场状态不覆盖后续事件", _actor_profile(self.private_profile)),
+            ("你与眼前人的关系——这是你的看法，不是他人的内心", optional(self.relationships, budget)),
+            ("你在意与希望的事——愿望不是每轮必须重做的任务", self.goals),
+            ("你已有的信念——没有也无需补造", self.core_beliefs),
+            ("你原有的表达方式", self.voice_profile),
+            ("自己的最近感受与打算——可被新回应改变", self.short_term_state),
+            ("开场处境——已经发生的交流不会倒退", self.scene),
+            ("眼前其他人的公开资料——不提供其私密心理", optional(self.colocated_public_profiles, budget)),
+            ("自己记得的事", optional(self.private_memory + "\n" + self.story_memory, budget)),
+            ("自己的判断——可错，他人说法并非核验", self.beliefs),
+            ("自己确实知道的事实", self.known_facts),
+            ("其他可见背景——旧资料不重置当前状态", optional(self.retrieved_background, budget)),
+            ("未在眼前交流列出的真实观察", optional(self.observations, budget)),
+            ("作者明确的补写边界——不是人物的新知识", self.authoring_constraints),
+            ("执行边界附件：当前真实状态", self.authority),
+            ("执行边界附件：本人能力与资源", self.abilities),
+        )
+        return "\n\n".join(f"【{title}】\n{body}" for title, body in sections if body.strip())
+
     def render_performance(self) -> str:
         """A performer's dossier, not the engine's bookkeeping dashboard.
 
@@ -190,6 +220,8 @@ def _short_term_summary(state: SimulationState, agent: AgentState) -> str:
         if not isinstance(recipients, list):
             recipients = []
         names = "、".join(str(name) for name in recipients if str(name).strip())
+        if item.get('status') in {'responded', 'satisfied', 'expired', 'withdrawn', 'cancelled'}:
+            continue
         waiting_items.append(
             f"等待{names or '相关人物'}回应：{str(item.get('question') or '').strip()}"
         )
@@ -268,6 +300,17 @@ def build_agent_view(
                 if key in state.relationship_dimensions
             )
             relationship_lines.append(f"- {target}：{narrative}{f'；{facet_text}' if facet_text else ''}")
+            # A numeric delta alone omits the actual received gesture/refusal.
+            # Keep this actor's latest sourced interpretation, never the other
+            # person's own private relationship updates or invented thoughts.
+            evidence = dynamic.get('evidence') if isinstance(dynamic.get('evidence'), list) else []
+            for entry in evidence[-2:]:
+                if not isinstance(entry, dict) or not isinstance(entry.get('note'), str) or not entry['note'].strip():
+                    continue
+                source = next((m for m in state.history if m.event_id == entry.get('event_id')), None)
+                if source is None or source.intent.get('generation_fallback') or not state._agent_can_observe(agent, source):
+                    continue
+                relationship_lines.append(f"  本人后来的关系看法 [{source.event_id}]：{entry['note'][:300]}（主观看法，不是对方心理）")
         else:
             relationship_lines.append(f"- {target}：{narrative}")
     relationships = "\n".join(relationship_lines) or "- 暂无额外关系信息"

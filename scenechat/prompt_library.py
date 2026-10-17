@@ -5,7 +5,7 @@ from pathlib import Path
 
 @lru_cache(maxsize=16)
 def prompt_contract(name):
-    if name not in {"actor", "dialogue", "performance", "characters", "narrator", "scenario", "scene_actor", "execution_design", "life_actor", "life_exchange"}:
+    if name not in {"actor", "dialogue", "performance", "characters", "narrator", "scenario", "scene_actor", "execution_design", "life_actor", "life_exchange", "interaction_actor", "cast_portrait"}:
         raise ValueError("Unknown prompt contract")
     return (Path(__file__).parent / "prompts" / f"{name}.md").read_text(encoding="utf-8")
 

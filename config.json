@@ -32,6 +32,7 @@
     "max_retries": 1
   },
   "scenario": {
+    "character_authoring_mode": "integrated",
     "json_repair_retries": 2,
     "semantic_repair_retries": 2,
     "semantic_total_attempts": 6,
@@ -47,6 +48,7 @@
     "actor_prompt_style": "classic",
     "scene_continuity_mode": "off",
     "conversation_recall": "linked",
+    "interaction_memory": "off",
     "narrator_mode": "periodic",
     "intent_field_order": "speech_first",
     "action_grounding": "off",
